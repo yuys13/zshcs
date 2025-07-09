@@ -16,7 +16,7 @@ impl LanguageServer for Backend {
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
             capabilities: ServerCapabilities {
-                // 今回は特に機能を提供しないため、デフォルトのまま
+                // No specific features are provided this time, so keep it as default
                 ..ServerCapabilities::default()
             },
         })
