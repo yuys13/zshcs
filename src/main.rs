@@ -51,7 +51,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // use futures::future::FutureExt; // 未使用だったのでコメントアウト
+    // use futures::future::FutureExt; // Commented out because it was unused
     use serde::{de::DeserializeOwned, Serialize};
     use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
