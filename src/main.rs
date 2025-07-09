@@ -27,7 +27,10 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "server initialized!")
             .await;
         self.client
-            .log_message(MessageType::INFO, format!("Server version: {}", env!("CARGO_PKG_VERSION")))
+            .log_message(
+                MessageType::INFO,
+                format!("Server version: {}", env!("CARGO_PKG_VERSION")),
+            )
             .await;
     }
 
@@ -49,21 +52,22 @@ async fn main() {
 mod tests {
     use super::*;
     // use futures::future::FutureExt; // 未使用だったのでコメントアウト
+    use serde::{de::DeserializeOwned, Serialize};
+    use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tower_lsp::jsonrpc::{
-        Id, Request as JsonRpcRequest, Response as JsonRpcResponse,
+        Id,
+        Request as JsonRpcRequest,
+        Response as JsonRpcResponse,
         // Notification as JsonRpcNotification, // Removed due to persistent import issues
         // Error as JsonRpcError // Marked as unused for now
     };
     use tower_lsp::lsp_types::{
         notification::{Initialized, LogMessage, Notification as LspNotificationTrait},
         request::{Initialize, Request as LspRequestTrait},
-        ClientCapabilities, InitializeParams, InitializedParams, LogMessageParams, MessageType,
-        InitializeResult,
-    };
-    use serde::{Serialize, de::DeserializeOwned};
-    use serde_json::Value; // Keep for JsonRpcResponse parts
-
+        ClientCapabilities, InitializeParams, InitializeResult, InitializedParams,
+        LogMessageParams, MessageType,
+    }; // Keep for JsonRpcResponse parts
 
     async fn read_message(stream: &mut DuplexStream) -> Option<String> {
         // let mut len_buf = [0u8; 20]; // Unused variable
@@ -83,7 +87,8 @@ mod tests {
                 }
                 break;
             }
-            if header_buf.len() > 2048 { // Prevent infinite loop on malformed headers
+            if header_buf.len() > 2048 {
+                // Prevent infinite loop on malformed headers
                 return None;
             }
         }
@@ -144,27 +149,43 @@ mod tests {
                     continue;
                 }
                 let response: JsonRpcResponse = serde_json::from_str(&response_json).unwrap();
-                let (response_id_val, option_result_val): (Id, Option<std::result::Result<Value, tower_lsp::jsonrpc::Error>>) = response.into_parts();
+                let (response_id_val, result_val): (
+                    Id,
+                    std::result::Result<Value, tower_lsp::jsonrpc::Error>,
+                ) = response.into_parts(); // Correctly expect Result directly
 
-                match response_id_val {
-                    Id::Number(response_id_num) if response_id_num == id => {
-                        match option_result_val {
-                            Some(Ok(value)) => return serde_json::from_value(value).map_err(|_| tower_lsp::jsonrpc::Error::internal_error()),
-                            Some(Err(err)) => return Err(err),
-                            None => return Err(tower_lsp::jsonrpc::Error::internal_error("Response missing result".to_string())),
+                let response_id_matches = match &response_id_val {
+                    // Borrow response_id_val here
+                    Id::Number(response_id_num) => response_id_num == &id, // Compare with borrowed id
+                    Id::String(response_id_s) => response_id_s == &id.to_string(), // Compare with borrowed id.to_string()
+                    Id::Null => false,
+                };
+
+                if response_id_matches {
+                    match result_val {
+                        // Now using result_val directly
+                        Ok(value) => {
+                            return serde_json::from_value(value).map_err(|e| {
+                                let mut error = tower_lsp::jsonrpc::Error::parse_error();
+                                error.message = format!("Failed to deserialize response: {}", e).into();
+                                // Storing original error message or part of it in `data`
+                                error.data = Some(serde_json::json!({ "deserialization_error_details": e.to_string() }));
+                                error
+                            });
+                        }
+                        Err(err) => {
+                            // This 'err' is from response.into_parts() if the response indicates a JSON-RPC error
+                            // (e.g. method not found, invalid params on server side by spec).
+                            return Err(err);
                         }
                     }
-                    Id::String(response_id_str) if response_id_str == id.to_string() => {
-                        match option_result_val {
-                            Some(Ok(value)) => return serde_json::from_value(value).map_err(|_| tower_lsp::jsonrpc::Error::internal_error()),
-                            Some(Err(err)) => return Err(err),
-                            None => return Err(tower_lsp::jsonrpc::Error::internal_error("Response missing result".to_string())),
-                        }
-                    }
-                    _ => {
-                        eprintln!("Received response with unexpected ID: {:?}", response_id_val);
-                        continue;
-                    }
+                } else {
+                    eprintln!(
+                        "Received response with unexpected ID: {:?}, expected: {}",
+                        response_id_val,
+                        id // Use response_id_val for full ID info
+                    );
+                    continue;
                 }
             }
         }
@@ -180,7 +201,9 @@ mod tests {
                 "params": params_value
             });
             let notification_json = serde_json::to_string(&notification_value).unwrap();
-            write_message(self.stream, &notification_json).await.unwrap();
+            write_message(self.stream, &notification_json)
+                .await
+                .unwrap();
         }
 
         async fn read_notification<N: LspNotificationTrait>(&mut self) -> Option<N::Params>
@@ -199,13 +222,24 @@ mod tests {
                         // this logic might need adjustment. For now, assume params are present if method matches.
                         // If N::Params can be deserialized from `null` or missing params, it will work.
                         // Otherwise, if params are required, and not present, from_value will fail and return None.
-                        if N::METHOD == "initialized" { // Initialized has empty params, which can be `null` or absent
-                             if value.get("params").is_none() || value.get("params").unwrap().is_null() {
-                                // Attempt to deserialize from null if N::Params is () or similar
-                                return serde_json::from_value(Value::Null).ok();
-                             }
+                        // The "initialized" notification is special as its `params` field can be either `null` or entirely absent.
+                        // When `params` is absent, `value.get("params")` is `None`.
+                        // When `params` is `null`, `value.get("params").unwrap().is_null()` is `true`.
+                        // In both cases, if `N::Params` can be deserialized from `Value::Null` (e.g., if `N::Params` is `()`),
+                        // we attempt to do so. This handles the flexibility of the "initialized" notification's parameters.
+                        if N::METHOD == "initialized"
+                            && (value.get("params").is_none()
+                                || value.get("params").unwrap().is_null())
+                        {
+                            return serde_json::from_value(Value::Null).ok();
                         }
-                        return None; // Params not found or not the expected structure
+                        // If params are present but not deserializable to N::Params, or if method doesn't match,
+                        // or if it's "initialized" but params are present and not null but still not deserializable,
+                        // this will lead to returning None or continuing the loop.
+                        // For notifications other than "initialized" with specific param requirements,
+                        // if params are missing or null, serde_json::from_value(params_value.clone()).ok()
+                        // would typically result in None if N::Params cannot be deserialized from null/missing.
+                        return None; // Params not found, not the expected structure, or deserialization failed
                     }
                 }
             }
@@ -226,7 +260,6 @@ mod tests {
         (client_stream, server_handle)
     }
 
-
     #[tokio::test]
     async fn test_initialize() {
         let (mut client_stream, _server_handle) = setup_server();
@@ -239,9 +272,15 @@ mod tests {
             ..Default::default()
         };
 
-        let result = test_client.send_request::<Initialize>(initialize_params).await.unwrap();
+        let result = test_client
+            .send_request::<Initialize>(initialize_params)
+            .await
+            .unwrap();
 
-        assert_eq!(result.server_info.as_ref().unwrap().name, "zshcs-language-server");
+        assert_eq!(
+            result.server_info.as_ref().unwrap().name,
+            "zshcs-language-server"
+        );
         assert!(result.capabilities.text_document_sync.is_none());
     }
 
@@ -257,32 +296,65 @@ mod tests {
             capabilities: ClientCapabilities::default(),
             ..Default::default()
         };
-        let _init_result: InitializeResult = test_client.send_request::<Initialize>(initialize_params).await.unwrap();
+        let _init_result: InitializeResult = test_client
+            .send_request::<Initialize>(initialize_params)
+            .await
+            .unwrap();
 
         // Send initialized notification
         let initialized_params = InitializedParams {};
-        test_client.send_notification::<Initialized>(initialized_params).await;
+        test_client
+            .send_notification::<Initialized>(initialized_params)
+            .await;
 
         // Check for log message from server
         // The TestClient needs to be adapted to read notifications, or we need a separate reader
         // For simplicity, we'll assume the server processes it and might log.
         // A more robust test would listen for the logMessage notification.
         // We will try to read the log message from the server.
-        let log_message_params: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+        // let log_message_params: Option<LogMessageParams> =
+        //     test_client.read_notification::<LogMessage>().await; // This line is redundant and unused.
 
-        assert!(log_message_params.is_some(), "Did not receive log message after initialized");
-        let log_message = log_message_params.unwrap();
-        assert_eq!(log_message.typ, MessageType::INFO);
-        assert!(log_message.message.contains("server initialized!") || log_message.message.contains("Server version:"));
+        let log_message_params1: Option<LogMessageParams> =
+            test_client.read_notification::<LogMessage>().await;
+        assert!(
+            log_message_params1.is_some(),
+            "Did not receive the first log message after initialized"
+        );
+        let log_message1 = log_message_params1.unwrap();
+        assert_eq!(log_message1.typ, MessageType::INFO);
 
-        // We expect two log messages
-        let log_message_params2: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-        assert!(log_message_params2.is_some(), "Did not receive the second log message");
+        let log_message_params2: Option<LogMessageParams> =
+            test_client.read_notification::<LogMessage>().await;
+        assert!(
+            log_message_params2.is_some(),
+            "Did not receive the second log message after initialized"
+        );
         let log_message2 = log_message_params2.unwrap();
         assert_eq!(log_message2.typ, MessageType::INFO);
-        assert!(log_message2.message.contains("server initialized!") || log_message2.message.contains("Server version:"));
 
-        // Ensure the two messages are different
-        assert_ne!(log_message.message, log_message2.message);
+        // Determine which message is which, as the order is not guaranteed
+        let (initialized_msg, version_msg) = if log_message1.message.contains("server initialized!")
+        {
+            (log_message1, log_message2)
+        } else {
+            (log_message2, log_message1)
+        };
+
+        assert!(
+            initialized_msg.message.contains("server initialized!"),
+            "Expected 'server initialized!' log message, got: {}",
+            initialized_msg.message
+        );
+        assert!(
+            version_msg.message.contains("Server version:"),
+            "Expected 'Server version:' log message, got: {}",
+            version_msg.message
+        );
+        assert!(
+            version_msg.message.contains(env!("CARGO_PKG_VERSION")),
+            "Server version message does not contain the correct version. Got: {}",
+            version_msg.message
+        );
     }
 }

@@ -1,7 +1,7 @@
 [package]
 name = "zshcs"
 version = "0.1.0"
-edition = "2021" # tower-lspの依存関係との互換性のために2021に変更
+edition = "2021" # Changed to 2021 for compatibility with tower-lsp dependencies
 
 [dependencies]
 tower-lsp = "0.20.0"
