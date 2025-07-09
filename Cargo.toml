@@ -1,6 +1,12 @@
 [package]
 name = "zshcs"
 version = "0.1.0"
-edition = "2024"
+edition = "2021" # tower-lspの依存関係との互換性のために2021に変更
 
 [dependencies]
+tower-lsp = "0.20.0"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] } # serdeを追加し、derive featureを有効化
+serde_json = "1.0" # テストコードでJSON RPCメッセージを作成するために追加
+lsp-types = "0.94" # テストコードで型を参照するために追加
+futures = "0.3" # テストでの非同期処理のために追加
