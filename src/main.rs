@@ -104,7 +104,7 @@ mod tests {
 
     async fn write_message(stream: &mut DuplexStream, message: &str) -> std::io::Result<()> {
         let message_len = message.len();
-        let header = format!("Content-Length: {}\r\n\r\n", message_len);
+        let header = format!("Content-Length: {message_len}\r\n\r\n");
         stream.write_all(header.as_bytes()).await?;
         stream.write_all(message.as_bytes()).await?;
         stream.flush().await?;
@@ -145,7 +145,7 @@ mod tests {
             loop {
                 let response_json = read_message(self.stream).await.unwrap();
                 if response_json.contains("\"method\"") && !response_json.contains("\"id\"") {
-                    eprintln!("Skipping notification: {}", response_json);
+                    eprintln!("Skipping notification: {response_json}");
                     continue;
                 }
                 let response: JsonRpcResponse = serde_json::from_str(&response_json).unwrap();
@@ -167,7 +167,7 @@ mod tests {
                         Ok(value) => {
                             return serde_json::from_value(value).map_err(|e| {
                                 let mut error = tower_lsp::jsonrpc::Error::parse_error();
-                                error.message = format!("Failed to deserialize response: {}", e).into();
+                                error.message = format!("Failed to deserialize response: {e}").into();
                                 // Storing original error message or part of it in `data`
                                 error.data = Some(serde_json::json!({ "deserialization_error_details": e.to_string() }));
                                 error
@@ -181,9 +181,7 @@ mod tests {
                     }
                 } else {
                     eprintln!(
-                        "Received response with unexpected ID: {:?}, expected: {}",
-                        response_id_val,
-                        id // Use response_id_val for full ID info
+                        "Received response with unexpected ID: {response_id_val:?}, expected: {id}"
                     );
                     continue;
                 }
