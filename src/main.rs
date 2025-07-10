@@ -61,7 +61,7 @@ impl LanguageServer for Backend {
         self.document_map.insert(uri.clone(), text);
         self.document_versions.insert(uri.clone(), version);
         self.client
-            .log_message(MessageType::INFO, format!("textDocument/didOpen: {}", uri))
+            .log_message(MessageType::INFO, format!("textDocument/didOpen: {uri}"))
             .await;
     }
 
@@ -81,7 +81,7 @@ impl LanguageServer for Backend {
                 self.client
                     .log_message(
                         MessageType::INFO,
-                        format!("textDocument/didChange (full): {}", uri),
+                        format!("textDocument/didChange (full): {uri}"),
                     )
                     .await;
             }
@@ -113,14 +113,14 @@ impl LanguageServer for Backend {
                         self.client
                             .log_message(
                                 MessageType::INFO,
-                                format!("textDocument/didChange (simplified incremental, replaced with last change): {}", uri),
+                                format!("textDocument/didChange (simplified incremental, replaced with last change): {uri}"),
                             )
                             .await;
                     } else {
                         self.client
                             .log_message(
                                 MessageType::INFO,
-                                format!("textDocument/didChange (incremental, multiple changes, not fully processed): {}", uri),
+                                format!("textDocument/didChange (incremental, multiple changes, not fully processed): {uri}"),
                             )
                             .await;
                     }
@@ -133,8 +133,7 @@ impl LanguageServer for Backend {
                         .log_message(
                             MessageType::INFO,
                             format!(
-                                "textDocument/didChange (last change is full update): {}",
-                                uri
+                                "textDocument/didChange (last change is full update): {uri}"
                             ),
                         )
                         .await;
@@ -669,7 +668,7 @@ mod tests {
             msg.contains("textDocument/didChange (simplified incremental, replaced with last change): file:///test_incremental.zsh") ||
             msg.contains("textDocument/didChange (last change is full update): file:///test_incremental.zsh") || // if range was None
             msg.contains("textDocument/didChange (incremental, multiple changes, not fully processed): file:///test_incremental.zsh"),
-            "Log message '{}' does not match expected for incremental change.", msg
+            "Log message '{msg}' does not match expected for incremental change."
         );
 
         // Ideally, we would verify the document content here.
