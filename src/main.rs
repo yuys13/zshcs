@@ -81,8 +81,8 @@ mod tests {
             if header_buf.ends_with(b"\r\n\r\n") {
                 let headers = String::from_utf8_lossy(&header_buf);
                 for line in headers.lines() {
-                    if line.starts_with("Content-Length: ") {
-                        content_length = line["Content-Length: ".len()..].trim().parse().ok()?;
+                    if let Some(stripped_line) = line.strip_prefix("Content-Length: ") {
+                        content_length = stripped_line.trim().parse().ok()?;
                     }
                 }
                 break;
@@ -104,7 +104,7 @@ mod tests {
 
     async fn write_message(stream: &mut DuplexStream, message: &str) -> std::io::Result<()> {
         let message_len = message.len();
-        let header = format!("Content-Length: {}\r\n\r\n", message_len);
+        let header = format!("Content-Length: {message_len}\r\n\r\n");
         stream.write_all(header.as_bytes()).await?;
         stream.write_all(message.as_bytes()).await?;
         stream.flush().await?;
@@ -137,7 +137,7 @@ mod tests {
             let id = self.next_request_id();
             let request = JsonRpcRequest::build(R::METHOD)
                 .params(serde_json::to_value(params).unwrap())
-                .id(id.clone()) // send i64 id
+                .id(id) // send i64 id
                 .finish();
             let request_json = serde_json::to_string(&request).unwrap();
             write_message(self.stream, &request_json).await.unwrap();
@@ -145,7 +145,7 @@ mod tests {
             loop {
                 let response_json = read_message(self.stream).await.unwrap();
                 if response_json.contains("\"method\"") && !response_json.contains("\"id\"") {
-                    eprintln!("Skipping notification: {}", response_json);
+                    eprintln!("Skipping notification: {response_json}");
                     continue;
                 }
                 let response: JsonRpcResponse = serde_json::from_str(&response_json).unwrap();
@@ -167,7 +167,7 @@ mod tests {
                         Ok(value) => {
                             return serde_json::from_value(value).map_err(|e| {
                                 let mut error = tower_lsp::jsonrpc::Error::parse_error();
-                                error.message = format!("Failed to deserialize response: {}", e).into();
+                                error.message = format!("Failed to deserialize response: {e}").into();
                                 // Storing original error message or part of it in `data`
                                 error.data = Some(serde_json::json!({ "deserialization_error_details": e.to_string() }));
                                 error
@@ -181,9 +181,7 @@ mod tests {
                     }
                 } else {
                     eprintln!(
-                        "Received response with unexpected ID: {:?}, expected: {}",
-                        response_id_val,
-                        id // Use response_id_val for full ID info
+                        "Received response with unexpected ID: {response_id_val:?}, expected: {id}"
                     );
                     continue;
                 }
