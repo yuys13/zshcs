@@ -28,7 +28,7 @@ Before submitting your changes, please ensure that all checks pass locally.
     ```
 2.  **Run Clippy (Linter):**
     ```bash
-    cargo clippy -- -D warnings
+    cargo clippy --no-deps --all-targets -- -D warnings
     ```
 3.  **Build the project:**
     ```bash
