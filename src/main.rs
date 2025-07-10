@@ -81,8 +81,8 @@ mod tests {
             if header_buf.ends_with(b"\r\n\r\n") {
                 let headers = String::from_utf8_lossy(&header_buf);
                 for line in headers.lines() {
-                    if line.starts_with("Content-Length: ") {
-                        content_length = line["Content-Length: ".len()..].trim().parse().ok()?;
+                    if let Some(stripped_line) = line.strip_prefix("Content-Length: ") {
+                        content_length = stripped_line.trim().parse().ok()?;
                     }
                 }
                 break;
@@ -137,7 +137,7 @@ mod tests {
             let id = self.next_request_id();
             let request = JsonRpcRequest::build(R::METHOD)
                 .params(serde_json::to_value(params).unwrap())
-                .id(id.clone()) // send i64 id
+                .id(id) // send i64 id
                 .finish();
             let request_json = serde_json::to_string(&request).unwrap();
             write_message(self.stream, &request_json).await.unwrap();
