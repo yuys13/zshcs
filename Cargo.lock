@@ -1008,6 +1008,7 @@ dependencies = [
 name = "zshcs"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "futures",
  "lsp-types 0.97.0",
  "serde",
