@@ -132,9 +132,7 @@ impl LanguageServer for Backend {
                     self.client
                         .log_message(
                             MessageType::INFO,
-                            format!(
-                                "textDocument/didChange (last change is full update): {uri}"
-                            ),
+                            format!("textDocument/didChange (last change is full update): {uri}"),
                         )
                         .await;
                 }
