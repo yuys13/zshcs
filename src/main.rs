@@ -156,7 +156,7 @@ async fn main() {
 mod tests {
     use super::*;
     // use futures::future::FutureExt; // Commented out because it was unused
-    use serde::{de::DeserializeOwned, Serialize};
+    use serde::{Serialize, de::DeserializeOwned};
     use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tower_lsp::jsonrpc::{
@@ -167,15 +167,15 @@ mod tests {
         // Error as JsonRpcError // Marked as unused for now
     };
     use tower_lsp::lsp_types::{
+        ClientCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+        InitializeParams, InitializeResult, InitializedParams, LogMessageParams, MessageType,
+        TextDocumentContentChangeEvent, TextDocumentItem, TextDocumentSyncKind, Url,
+        VersionedTextDocumentIdentifier,
         notification::{
             DidChangeTextDocument, DidOpenTextDocument, Initialized, LogMessage,
             Notification as LspNotificationTrait,
         },
         request::{Initialize, Request as LspRequestTrait},
-        ClientCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-        InitializeParams, InitializeResult, InitializedParams, LogMessageParams, MessageType,
-        TextDocumentContentChangeEvent, TextDocumentItem, TextDocumentSyncKind, Url,
-        VersionedTextDocumentIdentifier,
     }; // Keep for JsonRpcResponse parts // For sharing DashMap across async tasks if needed, though Client is Clone
 
     async fn read_message(stream: &mut DuplexStream) -> Option<String> {
@@ -518,10 +518,12 @@ mod tests {
             "No log message received after didOpen"
         );
         assert_eq!(log_message.as_ref().unwrap().typ, MessageType::INFO);
-        assert!(log_message
-            .unwrap()
-            .message
-            .contains("textDocument/didOpen: file:///test.zsh"));
+        assert!(
+            log_message
+                .unwrap()
+                .message
+                .contains("textDocument/didOpen: file:///test.zsh")
+        );
     }
 
     #[tokio::test]
@@ -582,10 +584,12 @@ mod tests {
             "No log message received after didChange"
         );
         assert_eq!(log_message.as_ref().unwrap().typ, MessageType::INFO);
-        assert!(log_message
-            .unwrap()
-            .message
-            .contains("textDocument/didChange (full): file:///test_change.zsh"));
+        assert!(
+            log_message
+                .unwrap()
+                .message
+                .contains("textDocument/didChange (full): file:///test_change.zsh")
+        );
 
         // Future: Add a way to query server for document content to verify it's updated
         // For now, logging confirms the method was called and processed the URI.
