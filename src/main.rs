@@ -319,35 +319,34 @@ mod tests {
         {
             loop {
                 let message_json = read_message(self.stream).await?;
-                if let Ok(value) = serde_json::from_str::<Value>(&message_json) {
-                    if value.get("method").and_then(Value::as_str) == Some(N::METHOD) {
-                        if let Some(params_value) = value.get("params") {
-                            return serde_json::from_value(params_value.clone()).ok();
-                        }
-                        // If params are expected but not present (e.g. for notifications that must have params)
-                        // or if the notification has no params and N::Params is some ZST like `()`,
-                        // this logic might need adjustment. For now, assume params are present if method matches.
-                        // If N::Params can be deserialized from `null` or missing params, it will work.
-                        // Otherwise, if params are required, and not present, from_value will fail and return None.
-                        // The "initialized" notification is special as its `params` field can be either `null` or entirely absent.
-                        // When `params` is absent, `value.get("params")` is `None`.
-                        // When `params` is `null`, `value.get("params").unwrap().is_null()` is `true`.
-                        // In both cases, if `N::Params` can be deserialized from `Value::Null` (e.g., if `N::Params` is `()`),
-                        // we attempt to do so. This handles the flexibility of the "initialized" notification's parameters.
-                        if N::METHOD == "initialized"
-                            && (value.get("params").is_none()
-                                || value.get("params").unwrap().is_null())
-                        {
-                            return serde_json::from_value(Value::Null).ok();
-                        }
-                        // If params are present but not deserializable to N::Params, or if method doesn't match,
-                        // or if it's "initialized" but params are present and not null but still not deserializable,
-                        // this will lead to returning None or continuing the loop.
-                        // For notifications other than "initialized" with specific param requirements,
-                        // if params are missing or null, serde_json::from_value(params_value.clone()).ok()
-                        // would typically result in None if N::Params cannot be deserialized from null/missing.
-                        return None; // Params not found, not the expected structure, or deserialization failed
+                if let Ok(value) = serde_json::from_str::<Value>(&message_json)
+                    && value.get("method").and_then(Value::as_str) == Some(N::METHOD)
+                {
+                    if let Some(params_value) = value.get("params") {
+                        return serde_json::from_value(params_value.clone()).ok();
                     }
+                    // If params are expected but not present (e.g. for notifications that must have params)
+                    // or if the notification has no params and N::Params is some ZST like `()`,
+                    // this logic might need adjustment. For now, assume params are present if method matches.
+                    // If N::Params can be deserialized from `null` or missing params, it will work.
+                    // Otherwise, if params are required, and not present, from_value will fail and return None.
+                    // The "initialized" notification is special as its `params` field can be either `null` or entirely absent.
+                    // When `params` is absent, `value.get("params")` is `None`.
+                    // When `params` is `null`, `value.get("params").unwrap().is_null()` is `true`.
+                    // In both cases, if `N::Params` can be deserialized from `Value::Null` (e.g., if `N::Params` is `()`),
+                    // we attempt to do so. This handles the flexibility of the "initialized" notification's parameters.
+                    if N::METHOD == "initialized"
+                        && (value.get("params").is_none() || value.get("params").unwrap().is_null())
+                    {
+                        return serde_json::from_value(Value::Null).ok();
+                    }
+                    // If params are present but not deserializable to N::Params, or if method doesn't match,
+                    // or if it's "initialized" but params are present and not null but still not deserializable,
+                    // this will lead to returning None or continuing the loop.
+                    // For notifications other than "initialized" with specific param requirements,
+                    // if params are missing or null, serde_json::from_value(params_value.clone()).ok()
+                    // would typically result in None if N::Params cannot be deserialized from null/missing.
+                    return None; // Params not found, not the expected structure, or deserialization failed
                 }
             }
         }
