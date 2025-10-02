@@ -123,15 +123,16 @@ impl LanguageServer for Backend {
                 let mut content = doc.value().clone();
                 // Apply changes in reverse order to avoid invalidating ranges.
                 for change in params.content_changes.iter().rev() {
-                    if let Some(range) = change.range {
-                        if let (Some(start_offset), Some(end_offset)) = (
-                            Self::position_to_byte_offset(&content, range.start),
-                            Self::position_to_byte_offset(&content, range.end),
-                        ) {
-                            if end_offset >= start_offset {
-                                content.replace_range(start_offset..end_offset, &change.text);
-                            }
+                    if let Some((start_offset, end_offset)) = change.range.and_then(|range| {
+                        let start = Self::position_to_byte_offset(&content, range.start)?;
+                        let end = Self::position_to_byte_offset(&content, range.end)?;
+                        if start <= end {
+                            Some((start, end))
+                        } else {
+                            None
                         }
+                    }) {
+                        content.replace_range(start_offset..end_offset, &change.text);
                     }
                 }
                 *doc = content; // Update the document in the map
@@ -147,13 +148,14 @@ impl LanguageServer for Backend {
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
-        if params.command == "zshcs/getDocumentContent" {
-            if let Some(uri_val) = params.arguments.get(0) {
-                if let Ok(uri) = serde_json::from_value::<Url>(uri_val.clone()) {
-                    let content = self.document_map.get(&uri).map(|doc| doc.value().clone());
-                    return Ok(Some(serde_json::to_value(content).unwrap()));
-                }
-            }
+        if params.command == "zshcs/getDocumentContent"
+            && let Some(uri) = params
+                .arguments
+                .first()
+                .and_then(|v| serde_json::from_value::<Url>(v.clone()).ok())
+        {
+            let content = self.document_map.get(&uri).map(|doc| doc.value().clone());
+            return Ok(Some(serde_json::to_value(content).unwrap()));
         }
         Ok(None)
     }
