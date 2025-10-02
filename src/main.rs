@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use serde_json::Value;
 use std::sync::Arc;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -19,6 +20,35 @@ impl Backend {
             document_versions: Arc::new(DashMap::new()),
         }
     }
+
+    fn position_to_byte_offset(text: &str, position: Position) -> Option<usize> {
+        let mut line_offset = 0;
+        for _ in 0..position.line {
+            line_offset = text[line_offset..].find('\n')? + line_offset + 1;
+        }
+
+        let line_text = &text[line_offset..].lines().next().unwrap_or("");
+        let utf16_offset = position.character as usize;
+        let mut byte_offset = 0;
+        let mut utf16_count = 0;
+
+        for (i, c) in line_text.char_indices() {
+            if utf16_count >= utf16_offset {
+                byte_offset = i;
+                break;
+            }
+            utf16_count += c.len_utf16();
+            if utf16_count >= utf16_offset {
+                byte_offset = i + c.len_utf8();
+                break;
+            }
+        }
+        if utf16_count < utf16_offset {
+            byte_offset = line_text.len();
+        }
+
+        Some(line_offset + byte_offset)
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -33,6 +63,10 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL, // Support Incremental sync
                 )),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec!["zshcs/getDocumentContent".to_string()],
+                    ..Default::default()
+                }),
                 ..ServerCapabilities::default()
             },
         })
@@ -69,77 +103,61 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
 
-        // For incremental sync, apply changes.
-        // For this example, we'll still overwrite the whole document with the last change's text
-        // if it's a full text change, or simply log if it's incremental.
-        // A proper incremental update would involve applying each change to the existing document.
-        if params.content_changes.iter().all(|c| c.range.is_none()) {
-            // This looks like a full update based on the current simple check
-            if let Some(change) = params.content_changes.last() {
-                self.document_map.insert(uri.clone(), change.text.clone());
-                self.document_versions.insert(uri.clone(), version);
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("textDocument/didChange (full): {uri}"),
-                    )
-                    .await;
-            }
-        } else {
-            // This is likely an incremental update or a mix.
-            // A real implementation would apply changes sequentially.
-            // For now, we'll just update to the text of the last change if present,
-            // or log that it was incremental.
-            // This simplification means we are not truly handling incremental updates yet.
-            if let Some(last_change) = params.content_changes.last() {
-                // If the last change has a range, it's definitely incremental.
-                // If it doesn't have a range, it could be a full sync from a client
-                // that sends incremental changes but sometimes sends a full one.
-                // For simplicity in this step, we'll treat any change with a range as incremental
-                // and if the last change has no range, we'll assume it's a full update for this version.
-                if last_change.range.is_some() {
-                    // Proper incremental update logic is needed here.
-                    // For now, just log and update with the last change's text if it's the only one.
-                    // This is a placeholder for actual incremental update logic.
-                    if params.content_changes.len() == 1 {
-                        // A single change with a range: this is complex to handle without parsing/diffing.
-                        // For now, we'll log and effectively not change the content unless it's the *only* change.
-                        // This part needs significant improvement for correct incremental handling.
-                        // Let's assume for this simplified example, we are just logging the attempt.
-                        // And if it's a single change, we will replace the whole document with its text.
-                        // This is NOT how incremental changes should be handled.
-                        self.document_map
-                            .insert(uri.clone(), last_change.text.clone());
-                        self.client
-                            .log_message(
-                                MessageType::INFO,
-                                format!("textDocument/didChange (simplified incremental, replaced with last change): {uri}"),
-                            )
-                            .await;
-                    } else {
-                        self.client
-                            .log_message(
-                                MessageType::INFO,
-                                format!("textDocument/didChange (incremental, multiple changes, not fully processed): {uri}"),
-                            )
-                            .await;
-                    }
-                } else {
-                    // Last change has no range, assume it's a full update for this version
-                    self.document_map
-                        .insert(uri.clone(), last_change.text.clone());
-                    self.document_versions.insert(uri.clone(), version);
-                    self.client
-                        .log_message(
-                            MessageType::INFO,
-                            format!("textDocument/didChange (last change is full update): {uri}"),
-                        )
-                        .await;
-                }
-            }
-            // Update version regardless of how content was handled
+        let is_full_change =
+            params.content_changes.len() == 1 && params.content_changes[0].range.is_none();
+
+        if is_full_change {
+            // Full document sync
+            let text = params.content_changes[0].text.clone();
+            self.document_map.insert(uri.clone(), text);
             self.document_versions.insert(uri.clone(), version);
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("textDocument/didChange (full): {uri}"),
+                )
+                .await;
+        } else {
+            // Incremental sync
+            if let Some(mut doc) = self.document_map.get_mut(&uri) {
+                let mut content = doc.value().clone();
+                // Apply changes in reverse order to avoid invalidating ranges.
+                for change in params.content_changes.iter().rev() {
+                    if let Some((start_offset, end_offset)) = change.range.and_then(|range| {
+                        let start = Self::position_to_byte_offset(&content, range.start)?;
+                        let end = Self::position_to_byte_offset(&content, range.end)?;
+                        if start <= end {
+                            Some((start, end))
+                        } else {
+                            None
+                        }
+                    }) {
+                        content.replace_range(start_offset..end_offset, &change.text);
+                    }
+                }
+                *doc = content; // Update the document in the map
+            }
+            self.document_versions.insert(uri.clone(), version);
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("textDocument/didChange (incremental): {uri}"),
+                )
+                .await;
         }
+    }
+
+    async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
+        if params.command == "zshcs/getDocumentContent"
+            && let Some(uri) = params
+                .arguments
+                .first()
+                .and_then(|v| serde_json::from_value::<Url>(v.clone()).ok())
+        {
+            let content = self.document_map.get(&uri).map(|doc| doc.value().clone());
+            return Ok(Some(serde_json::to_value(content).unwrap()));
+        }
+        Ok(None)
     }
 }
 
@@ -601,7 +619,15 @@ mod tests {
 
         // Initialize and open document
         let initialize_params = InitializeParams {
-            capabilities: ClientCapabilities::default(),
+            capabilities: ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    execute_command: Some(ExecuteCommandClientCapabilities {
+                        dynamic_registration: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         test_client
@@ -629,9 +655,8 @@ mod tests {
             .await;
         let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
-        // Send didChange notification (incremental sync)
-        // This change replaces "line2" with "new line2"
-        let did_change_params = DidChangeTextDocumentParams {
+        // 1. Send first incremental change: replace "line2" with "new line2"
+        let first_change_params = DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier {
                 uri: doc_uri.clone(),
                 version: 2,
@@ -647,33 +672,58 @@ mod tests {
                         character: 5,
                     }, // "line2"
                 }),
-                range_length: Some(5), // length of "line2"
                 text: "new line2".to_string(),
+                range_length: None,
             }],
         };
         test_client
-            .send_notification::<DidChangeTextDocument>(did_change_params)
+            .send_notification::<DidChangeTextDocument>(first_change_params)
             .await;
+        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
-        // Verify server logged the change (specific message for incremental if implemented, or generic otherwise)
-        let log_message: Option<LogMessageParams> =
-            test_client.read_notification::<LogMessage>().await;
-        assert!(
-            log_message.is_some(),
-            "No log message received after incremental didChange"
-        );
-        let msg = log_message.unwrap().message;
-        // The current simplified did_change logs a generic message or "simplified incremental"
-        // We'll check for either to pass this test initially.
-        assert!(
-            msg.contains("textDocument/didChange (simplified incremental, replaced with last change): file:///test_incremental.zsh") ||
-            msg.contains("textDocument/didChange (last change is full update): file:///test_incremental.zsh") || // if range was None
-            msg.contains("textDocument/didChange (incremental, multiple changes, not fully processed): file:///test_incremental.zsh"),
-            "Log message '{msg}' does not match expected for incremental change."
-        );
+        // 2. Send second incremental change: insert " more" at the end of the new line 2
+        let second_change_params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: doc_uri.clone(),
+                version: 3,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: 1,
+                        character: 9,
+                    }, // end of "new line2"
+                    end: Position {
+                        line: 1,
+                        character: 9,
+                    },
+                }),
+                text: " more".to_string(),
+                range_length: None,
+            }],
+        };
+        test_client
+            .send_notification::<DidChangeTextDocument>(second_change_params)
+            .await;
+        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
-        // Ideally, we would verify the document content here.
-        // For now, we rely on the log message indicating the type of change processed.
-        // The actual content after this simplified incremental update would be "new line2".
+        // Verify the final content of the document using the custom command
+        let params = ExecuteCommandParams {
+            command: "zshcs/getDocumentContent".to_string(),
+            arguments: vec![serde_json::to_value(&doc_uri).unwrap()],
+            ..Default::default()
+        };
+        let result = test_client
+            .send_request::<request::ExecuteCommand>(params)
+            .await
+            .unwrap();
+        let content: Option<String> = serde_json::from_value(result.unwrap()).unwrap();
+
+        let expected_text = "line1\nnew line2 more\nline3".to_string();
+        assert_eq!(
+            content,
+            Some(expected_text),
+            "Incremental changes were not applied correctly."
+        );
     }
 }
