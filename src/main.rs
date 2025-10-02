@@ -103,8 +103,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
 
-        let is_full_change = params.content_changes.len() == 1
-            && params.content_changes[0].range.is_none();
+        let is_full_change =
+            params.content_changes.len() == 1 && params.content_changes[0].range.is_none();
 
         if is_full_change {
             // Full document sync
@@ -661,8 +661,14 @@ mod tests {
             },
             content_changes: vec![TextDocumentContentChangeEvent {
                 range: Some(Range {
-                    start: Position { line: 1, character: 0 },
-                    end: Position { line: 1, character: 5 }, // "line2"
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 5,
+                    }, // "line2"
                 }),
                 text: "new line2".to_string(),
                 range_length: None,
@@ -681,8 +687,14 @@ mod tests {
             },
             content_changes: vec![TextDocumentContentChangeEvent {
                 range: Some(Range {
-                    start: Position { line: 1, character: 9 }, // end of "new line2"
-                    end: Position { line: 1, character: 9 },
+                    start: Position {
+                        line: 1,
+                        character: 9,
+                    }, // end of "new line2"
+                    end: Position {
+                        line: 1,
+                        character: 9,
+                    },
                 }),
                 text: " more".to_string(),
                 range_length: None,
@@ -706,6 +718,10 @@ mod tests {
         let content: Option<String> = serde_json::from_value(result.unwrap()).unwrap();
 
         let expected_text = "line1\nnew line2 more\nline3".to_string();
-        assert_eq!(content, Some(expected_text), "Incremental changes were not applied correctly.");
+        assert_eq!(
+            content,
+            Some(expected_text),
+            "Incremental changes were not applied correctly."
+        );
     }
 }
