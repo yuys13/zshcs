@@ -1,9 +1,15 @@
 use dashmap::DashMap;
 use serde_json::Value;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 use std::sync::Arc;
+use tempfile::NamedTempFile;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+
+const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
 
 #[derive(Debug)]
 struct Backend {
@@ -154,13 +160,93 @@ impl LanguageServer for Backend {
         }
     }
 
-    async fn completion(&self, _: CompletionParams) -> Result<Option<CompletionResponse>> {
-        Ok(Some(CompletionResponse::Array(vec![CompletionItem {
-            label: "hello".to_string(),
-            kind: Some(CompletionItemKind::TEXT),
-            insert_text: Some("hello".to_string()),
-            ..Default::default()
-        }])))
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        let doc = self.document_map.get(&uri);
+        if doc.is_none() {
+            return Ok(None);
+        }
+        let text = doc.unwrap();
+
+        let offset = Self::position_to_byte_offset(&text, position);
+        if offset.is_none() {
+            return Ok(None);
+        }
+        let offset = offset.unwrap();
+
+        // Find start of line
+        let line_start = text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let prefix = &text[line_start..offset];
+
+        // Create temp file for capture.zsh
+        let mut temp_file = NamedTempFile::new().map_err(|e| tower_lsp::jsonrpc::Error {
+            code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+            message: format!("Failed to create temp file: {}", e).into(),
+            data: None,
+        })?;
+
+        write!(temp_file, "{}", CAPTURE_ZSH).map_err(|e| tower_lsp::jsonrpc::Error {
+            code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+            message: format!("Failed to write to temp file: {}", e).into(),
+            data: None,
+        })?;
+
+        // Make executable
+        let mut perms = temp_file.as_file().metadata().unwrap().permissions();
+        perms.set_mode(0o755);
+        temp_file.as_file().set_permissions(perms).unwrap();
+
+        let temp_path = temp_file.path().to_path_buf();
+
+        // Run capture.zsh
+        let output = Command::new(&temp_path).arg(prefix).output();
+
+        match output {
+            Ok(output) => {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("capture.zsh failed: {}", stderr),
+                        )
+                        .await;
+                    return Ok(None);
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut items = Vec::new();
+                for line in stdout.lines() {
+                    // Parse line: "candidate -- description" or "candidate"
+                    let parts: Vec<&str> = line.splitn(2, " -- ").collect();
+                    let label = parts[0].to_string();
+                    let detail = if parts.len() > 1 {
+                        Some(parts[1].to_string())
+                    } else {
+                        None
+                    };
+
+                    items.push(CompletionItem {
+                        label: label.clone(),
+                        kind: Some(CompletionItemKind::TEXT),
+                        insert_text: Some(label),
+                        detail,
+                        ..Default::default()
+                    });
+                }
+                Ok(Some(CompletionResponse::Array(items)))
+            }
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed to execute capture.zsh: {}", e),
+                    )
+                    .await;
+                Ok(None)
+            }
+        }
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
@@ -768,12 +854,27 @@ mod tests {
         let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
         let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
+        // Open document
+        let doc_uri = Url::parse("file:///test.zsh").unwrap();
+        let did_open_params = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: doc_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: "git s".to_string(),
+            },
+        };
+        test_client
+            .send_notification::<DidOpenTextDocument>(did_open_params)
+            .await;
+        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await; // didOpen log
+
         let completion_params = CompletionParams {
             text_document_position: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
-                    uri: Url::parse("file:///test.zsh").unwrap(),
+                    uri: doc_uri.clone(),
                 },
-                position: Position::new(0, 0),
+                position: Position::new(0, 5), // After "git s"
             },
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
@@ -789,18 +890,15 @@ mod tests {
         let response = response.expect("Expected completion response");
         match response {
             CompletionResponse::Array(items) => {
-                assert_eq!(items.len(), 1);
-                let item = &items[0];
-                assert_eq!(item.label, "hello");
-                assert_eq!(item.kind, Some(CompletionItemKind::TEXT));
-                assert_eq!(item.insert_text, Some("hello".to_string()));
+                assert!(!items.is_empty());
+                // Check if "status" is in items
+                let has_status = items.iter().any(|item| item.label == "status");
+                assert!(has_status, "Expected 'status' in completion items");
             }
             CompletionResponse::List(list) => {
-                assert_eq!(list.items.len(), 1);
-                let item = &list.items[0];
-                assert_eq!(item.label, "hello");
-                assert_eq!(item.kind, Some(CompletionItemKind::TEXT));
-                assert_eq!(item.insert_text, Some("hello".to_string()));
+                assert!(!list.items.is_empty());
+                let has_status = list.items.iter().any(|item| item.label == "status");
+                assert!(has_status, "Expected 'status' in completion items");
             }
         }
     }
