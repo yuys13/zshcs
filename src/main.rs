@@ -63,6 +63,13 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL, // Support Incremental sync
                 )),
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(false),
+                    trigger_characters: None,
+                    work_done_progress_options: Default::default(),
+                    all_commit_characters: None,
+                    ..Default::default()
+                }),
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: vec!["zshcs/getDocumentContent".to_string()],
                     ..Default::default()
@@ -145,6 +152,15 @@ impl LanguageServer for Backend {
                 )
                 .await;
         }
+    }
+
+    async fn completion(&self, _: CompletionParams) -> Result<Option<CompletionResponse>> {
+        Ok(Some(CompletionResponse::Array(vec![CompletionItem {
+            label: "hello".to_string(),
+            kind: Some(CompletionItemKind::TEXT),
+            insert_text: Some("hello".to_string()),
+            ..Default::default()
+        }])))
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
@@ -410,6 +426,10 @@ mod tests {
             Some(TextDocumentSyncCapability::Kind(
                 TextDocumentSyncKind::INCREMENTAL
             ))
+        );
+        assert!(
+            result.capabilities.completion_provider.is_some(),
+            "Server should support completion"
         );
     }
 
@@ -725,5 +745,63 @@ mod tests {
             Some(expected_text),
             "Incremental changes were not applied correctly."
         );
+    }
+
+    #[tokio::test]
+    async fn test_completion() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        // Initialize
+        let initialize_params = InitializeParams {
+            capabilities: ClientCapabilities::default(),
+            ..Default::default()
+        };
+        test_client
+            .send_request::<Initialize>(initialize_params)
+            .await
+            .unwrap();
+        test_client
+            .send_notification::<Initialized>(InitializedParams {})
+            .await;
+        // Consume log messages
+        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+        let completion_params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: Url::parse("file:///test.zsh").unwrap(),
+                },
+                position: Position::new(0, 0),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+
+        let response = test_client
+            .send_request::<tower_lsp::lsp_types::request::Completion>(completion_params)
+            .await
+            .unwrap();
+
+        // Assertions
+        let response = response.expect("Expected completion response");
+        match response {
+            CompletionResponse::Array(items) => {
+                assert_eq!(items.len(), 1);
+                let item = &items[0];
+                assert_eq!(item.label, "hello");
+                assert_eq!(item.kind, Some(CompletionItemKind::TEXT));
+                assert_eq!(item.insert_text, Some("hello".to_string()));
+            }
+            CompletionResponse::List(list) => {
+                assert_eq!(list.items.len(), 1);
+                let item = &list.items[0];
+                assert_eq!(item.label, "hello");
+                assert_eq!(item.kind, Some(CompletionItemKind::TEXT));
+                assert_eq!(item.insert_text, Some("hello".to_string()));
+            }
+        }
     }
 }
