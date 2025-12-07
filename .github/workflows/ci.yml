@@ -43,5 +43,9 @@ jobs:
     - name: Build
       run: cargo build
 
+    - name: Install dependencies for tests
+      run: | 
+        sudo apt-get install -y --no-install-recommends zsh
+
     - name: Run tests
       run: cargo test
