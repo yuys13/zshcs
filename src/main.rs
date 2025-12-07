@@ -198,7 +198,8 @@ impl LanguageServer for Backend {
         perms.set_mode(0o755);
         temp_file.as_file().set_permissions(perms).unwrap();
 
-        let temp_path = temp_file.path().to_path_buf();
+        // Close the file handle but keep the file on disk
+        let temp_path = temp_file.into_temp_path();
 
         // Run capture.zsh
         let output = Command::new(&temp_path).arg(prefix).output();
