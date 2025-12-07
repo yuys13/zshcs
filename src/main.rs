@@ -194,9 +194,24 @@ impl LanguageServer for Backend {
         })?;
 
         // Make executable
-        let mut perms = temp_file.as_file().metadata().unwrap().permissions();
+        let mut perms = temp_file
+            .as_file()
+            .metadata()
+            .map_err(|e| tower_lsp::jsonrpc::Error {
+                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+                message: format!("Failed to get temp file metadata: {}", e).into(),
+                data: None,
+            })?
+            .permissions();
         perms.set_mode(0o755);
-        temp_file.as_file().set_permissions(perms).unwrap();
+        temp_file
+            .as_file()
+            .set_permissions(perms)
+            .map_err(|e| tower_lsp::jsonrpc::Error {
+                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+                message: format!("Failed to set temp file permissions: {}", e).into(),
+                data: None,
+            })?;
 
         // Close the file handle but keep the file on disk
         let temp_path = temp_file.into_temp_path();
