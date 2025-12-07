@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use serde_json::Value;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
+
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tower_lsp::jsonrpc::Result;
@@ -202,10 +202,18 @@ impl LanguageServer for Backend {
         let temp_path = temp_file.into_temp_path();
 
         // Run capture.zsh
-        let output = Command::new(&temp_path).arg(prefix).output();
+        // Use tokio::try_join! or separate tasks if reading stderr/stdout simultaneously is needed for large outputs,
+        // but for simple cases verify if Output capture is enough.
+        // Using tokio::time::timeout to prevent hanging.
+        use tokio::time::{Duration, timeout};
+        let command_future = tokio::process::Command::new(&temp_path)
+            .arg(prefix)
+            .output();
 
-        match output {
-            Ok(output) => {
+        let output_result = timeout(Duration::from_millis(3000), command_future).await;
+
+        match output_result {
+            Ok(Ok(output)) => {
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     self.client
@@ -238,12 +246,18 @@ impl LanguageServer for Backend {
                 }
                 Ok(Some(CompletionResponse::Array(items)))
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 self.client
                     .log_message(
                         MessageType::ERROR,
                         format!("Failed to execute capture.zsh: {}", e),
                     )
+                    .await;
+                Ok(None)
+            }
+            Err(_) => {
+                self.client
+                    .log_message(MessageType::ERROR, "capture.zsh timed out".to_string())
                     .await;
                 Ok(None)
             }
