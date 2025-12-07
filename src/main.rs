@@ -1,9 +1,15 @@
 use dashmap::DashMap;
 use serde_json::Value;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+
 use std::sync::Arc;
+use tempfile::NamedTempFile;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+
+const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
 
 #[derive(Debug)]
 struct Backend {
@@ -63,6 +69,13 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL, // Support Incremental sync
                 )),
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(false),
+                    trigger_characters: None,
+                    work_done_progress_options: Default::default(),
+                    all_commit_characters: None,
+                    ..Default::default()
+                }),
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: vec!["zshcs/getDocumentContent".to_string()],
                     ..Default::default()
@@ -144,6 +157,125 @@ impl LanguageServer for Backend {
                     format!("textDocument/didChange (incremental): {uri}"),
                 )
                 .await;
+        }
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        let doc = self.document_map.get(&uri);
+        if doc.is_none() {
+            return Ok(None);
+        }
+        let text = doc.unwrap();
+
+        let offset = Self::position_to_byte_offset(&text, position);
+        if offset.is_none() {
+            return Ok(None);
+        }
+        let offset = offset.unwrap();
+
+        // Find start of line
+        let line_start = text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let prefix = &text[line_start..offset];
+
+        // Create temp file for capture.zsh
+        let mut temp_file = NamedTempFile::new().map_err(|e| tower_lsp::jsonrpc::Error {
+            code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+            message: format!("Failed to create temp file: {}", e).into(),
+            data: None,
+        })?;
+
+        write!(temp_file, "{}", CAPTURE_ZSH).map_err(|e| tower_lsp::jsonrpc::Error {
+            code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+            message: format!("Failed to write to temp file: {}", e).into(),
+            data: None,
+        })?;
+
+        // Make executable
+        let mut perms = temp_file
+            .as_file()
+            .metadata()
+            .map_err(|e| tower_lsp::jsonrpc::Error {
+                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+                message: format!("Failed to get temp file metadata: {}", e).into(),
+                data: None,
+            })?
+            .permissions();
+        perms.set_mode(0o755);
+        temp_file
+            .as_file()
+            .set_permissions(perms)
+            .map_err(|e| tower_lsp::jsonrpc::Error {
+                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+                message: format!("Failed to set temp file permissions: {}", e).into(),
+                data: None,
+            })?;
+
+        // Close the file handle but keep the file on disk
+        let temp_path = temp_file.into_temp_path();
+
+        // Run capture.zsh
+        // Use tokio::try_join! or separate tasks if reading stderr/stdout simultaneously is needed for large outputs,
+        // but for simple cases verify if Output capture is enough.
+        // Using tokio::time::timeout to prevent hanging.
+        use tokio::time::{Duration, timeout};
+        let command_future = tokio::process::Command::new(&temp_path)
+            .arg(prefix)
+            .output();
+
+        let output_result = timeout(Duration::from_millis(3000), command_future).await;
+
+        match output_result {
+            Ok(Ok(output)) => {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("capture.zsh failed: {}", stderr),
+                        )
+                        .await;
+                    return Ok(None);
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut items = Vec::new();
+                for line in stdout.lines() {
+                    // Parse line: "candidate -- description" or "candidate"
+                    let parts: Vec<&str> = line.splitn(2, " -- ").collect();
+                    let label = parts[0].to_string();
+                    let detail = if parts.len() > 1 {
+                        Some(parts[1].to_string())
+                    } else {
+                        None
+                    };
+
+                    items.push(CompletionItem {
+                        label: label.clone(),
+                        kind: Some(CompletionItemKind::TEXT),
+                        insert_text: Some(label),
+                        detail,
+                        ..Default::default()
+                    });
+                }
+                Ok(Some(CompletionResponse::Array(items)))
+            }
+            Ok(Err(e)) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed to execute capture.zsh: {}", e),
+                    )
+                    .await;
+                Ok(None)
+            }
+            Err(_) => {
+                self.client
+                    .log_message(MessageType::ERROR, "capture.zsh timed out".to_string())
+                    .await;
+                Ok(None)
+            }
         }
     }
 
@@ -410,6 +542,10 @@ mod tests {
             Some(TextDocumentSyncCapability::Kind(
                 TextDocumentSyncKind::INCREMENTAL
             ))
+        );
+        assert!(
+            result.capabilities.completion_provider.is_some(),
+            "Server should support completion"
         );
     }
 
@@ -725,5 +861,75 @@ mod tests {
             Some(expected_text),
             "Incremental changes were not applied correctly."
         );
+    }
+
+    #[tokio::test]
+    async fn test_completion() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        // Initialize
+        let initialize_params = InitializeParams {
+            capabilities: ClientCapabilities::default(),
+            ..Default::default()
+        };
+        test_client
+            .send_request::<Initialize>(initialize_params)
+            .await
+            .unwrap();
+        test_client
+            .send_notification::<Initialized>(InitializedParams {})
+            .await;
+        // Consume log messages
+        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+        // Open document
+        let doc_uri = Url::parse("file:///test.zsh").unwrap();
+        let did_open_params = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: doc_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: "git s".to_string(),
+            },
+        };
+        test_client
+            .send_notification::<DidOpenTextDocument>(did_open_params)
+            .await;
+        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await; // didOpen log
+
+        let completion_params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 5), // After "git s"
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+
+        let response = test_client
+            .send_request::<tower_lsp::lsp_types::request::Completion>(completion_params)
+            .await
+            .unwrap();
+
+        // Assertions
+        let response = response.expect("Expected completion response");
+        match response {
+            CompletionResponse::Array(items) => {
+                assert!(!items.is_empty());
+                // Check if "status" is in items
+                let has_status = items.iter().any(|item| item.label == "status");
+                assert!(has_status, "Expected 'status' in completion items");
+            }
+            CompletionResponse::List(list) => {
+                assert!(!list.items.is_empty());
+                let has_status = list.items.iter().any(|item| item.label == "status");
+                assert!(has_status, "Expected 'status' in completion items");
+            }
+        }
     }
 }
