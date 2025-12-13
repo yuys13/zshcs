@@ -72,13 +72,21 @@ compadd () {
     # be careful with namespacing here, we don''t want to mess with stuff that
     # should be passed to compadd!
     typeset -a __hits __dscr __tmp
+    integer i __d_idx=0
 
     # do we have a description parameter?
     # note we don''t use zparseopts here because of combined option parameters
     # with arguments like -default- confuse it.
-    if (( $@[(I)-d] )); then # kind of a hack, $+@[(r)-d] doesn''t work because of line noise overload
+    for (( i=1; i <= $#; i++ )); do
+        if [[ ${@[$i]} == -d ]]; then
+            __d_idx=$i
+            break
+        fi
+    done
+
+    if (( __d_idx )); then
         # next param after -d
-        __tmp=${@[$[${@[(i)-d]}+1]]}
+        __tmp=${@[$__d_idx+1]}
         # description can be given as an array parameter name, or inline () array
         if [[ $__tmp == \(* ]]; then
             eval "__dscr=$__tmp"
