@@ -116,48 +116,28 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
 
-        let is_full_change =
-            params.content_changes.len() == 1 && params.content_changes[0].range.is_none();
-
-        if is_full_change {
-            // Full document sync
-            let text = params.content_changes[0].text.clone();
-            self.document_map.insert(uri.clone(), text);
-            self.document_versions.insert(uri.clone(), version);
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!("textDocument/didChange (full): {uri}"),
-                )
-                .await;
-        } else {
-            // Incremental sync
-            if let Some(mut doc) = self.document_map.get_mut(&uri) {
-                let mut content = doc.value().clone();
-                // Apply changes in reverse order to avoid invalidating ranges.
-                for change in params.content_changes.iter().rev() {
-                    if let Some((start_offset, end_offset)) = change.range.and_then(|range| {
-                        let start = Self::position_to_byte_offset(&content, range.start)?;
-                        let end = Self::position_to_byte_offset(&content, range.end)?;
-                        if start <= end {
-                            Some((start, end))
-                        } else {
-                            None
-                        }
-                    }) {
+        for change in params.content_changes {
+            if let Some(range) = change.range {
+                // Incremental update
+                if let Some(mut doc) = self.document_map.get_mut(&uri) {
+                    let mut content = doc.value().clone();
+                    if let Some(start_offset) = Self::position_to_byte_offset(&content, range.start)
+                        && let Some(end_offset) = Self::position_to_byte_offset(&content, range.end)
+                        && start_offset <= end_offset
+                    {
                         content.replace_range(start_offset..end_offset, &change.text);
+                        *doc = content;
                     }
                 }
-                *doc = content; // Update the document in the map
+            } else {
+                // Full sync (range is None)
+                self.document_map.insert(uri.clone(), change.text);
             }
-            self.document_versions.insert(uri.clone(), version);
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!("textDocument/didChange (incremental): {uri}"),
-                )
-                .await;
         }
+        self.document_versions.insert(uri.clone(), version);
+        self.client
+            .log_message(MessageType::INFO, format!("textDocument/didChange: {uri}"))
+            .await;
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -741,7 +721,7 @@ mod tests {
             log_message
                 .unwrap()
                 .message
-                .contains("textDocument/didChange (full): file:///test_change.zsh")
+                .contains("textDocument/didChange: file:///test_change.zsh")
         );
 
         // Future: Add a way to query server for document content to verify it's updated
@@ -931,5 +911,139 @@ mod tests {
                 assert!(has_status, "Expected 'status' in completion items");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_did_change_ordering() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        // Initialize/Open using helper or manually (reusing pattern from other tests)
+        let initialize_params = InitializeParams::default();
+        test_client
+            .send_request::<Initialize>(initialize_params)
+            .await
+            .unwrap();
+        test_client
+            .send_notification::<Initialized>(InitializedParams {})
+            .await;
+        test_client.read_notification::<LogMessage>().await; // init
+        test_client.read_notification::<LogMessage>().await; // version
+
+        let doc_uri = Url::parse("file:///test_ordering.zsh").unwrap();
+        test_client
+            .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: "".to_string(),
+                },
+            })
+            .await;
+        test_client.read_notification::<LogMessage>().await; // didOpen
+
+        // Send two insertions in a single didChange
+        // [Insert "A" at 0, Insert "B" at 0]
+        // Step 1: Insert "A" at 0. Doc becomes "A".
+        // Step 2: Insert "B" at 0. Doc becomes "BA".
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: doc_uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![
+                TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 0), Position::new(0, 0))),
+                    range_length: None,
+                    text: "A".to_string(),
+                },
+                TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 0), Position::new(0, 0))),
+                    range_length: None,
+                    text: "B".to_string(),
+                },
+            ],
+        };
+        test_client
+            .send_notification::<DidChangeTextDocument>(params)
+            .await;
+        test_client.read_notification::<LogMessage>().await; // didChange
+
+        // Verify content
+        let res = test_client
+            .send_request::<request::ExecuteCommand>(ExecuteCommandParams {
+                command: "zshcs/getDocumentContent".to_string(),
+                arguments: vec![serde_json::to_value(&doc_uri).unwrap()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let content: Option<String> = serde_json::from_value(res.unwrap()).unwrap();
+        assert_eq!(content, Some("BA".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_did_change_mixed() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        test_client
+            .send_request::<Initialize>(InitializeParams::default())
+            .await
+            .unwrap();
+        test_client
+            .send_notification::<Initialized>(InitializedParams {})
+            .await;
+        test_client.read_notification::<LogMessage>().await;
+        test_client.read_notification::<LogMessage>().await;
+
+        let doc_uri = Url::parse("file:///test_mixed.zsh").unwrap();
+        test_client
+            .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: "Old".to_string(),
+                },
+            })
+            .await;
+        test_client.read_notification::<LogMessage>().await;
+
+        // Mixed changes: Full replace followed by incremental append
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: doc_uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![
+                TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "New".to_string(),
+                },
+                TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 3), Position::new(0, 3))),
+                    range_length: None,
+                    text: "!".to_string(),
+                },
+            ],
+        };
+        test_client
+            .send_notification::<DidChangeTextDocument>(params)
+            .await;
+        test_client.read_notification::<LogMessage>().await;
+
+        let res = test_client
+            .send_request::<request::ExecuteCommand>(ExecuteCommandParams {
+                command: "zshcs/getDocumentContent".to_string(),
+                arguments: vec![serde_json::to_value(&doc_uri).unwrap()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let content: Option<String> = serde_json::from_value(res.unwrap()).unwrap();
+        assert_eq!(content, Some("New!".to_string()));
     }
 }
