@@ -23,21 +23,8 @@ struct Backend {
 impl Backend {
     fn new(client: Client) -> Self {
         // Create temp file for capture.zsh once on startup
-        let (capture_zsh_path, temp_path) = (|| -> std::io::Result<_> {
-            let mut temp_file = NamedTempFile::new()?;
-            write!(temp_file, "{}", CAPTURE_ZSH)?;
-
-            // Make executable
-            let mut perms = temp_file.as_file().metadata()?.permissions();
-            perms.set_mode(0o755);
-            temp_file.as_file().set_permissions(perms)?;
-
-            // Close the file handle but keep the file on disk
-            let temp_path = temp_file.into_temp_path();
-            let capture_zsh_path = temp_path.to_path_buf();
-            Ok((capture_zsh_path, temp_path))
-        })()
-        .expect("Failed to create and prepare capture.zsh script");
+        let (capture_zsh_path, temp_path) =
+            Self::create_capture_script().expect("Failed to create and prepare capture.zsh script");
 
         Backend {
             client,
@@ -46,6 +33,21 @@ impl Backend {
             capture_zsh_path,
             _temp_path: temp_path,
         }
+    }
+
+    fn create_capture_script() -> std::io::Result<(std::path::PathBuf, tempfile::TempPath)> {
+        let mut temp_file = NamedTempFile::new()?;
+        write!(temp_file, "{}", CAPTURE_ZSH)?;
+
+        // Make executable
+        let mut perms = temp_file.as_file().metadata()?.permissions();
+        perms.set_mode(0o755);
+        temp_file.as_file().set_permissions(perms)?;
+
+        // Close the file handle but keep the file on disk
+        let temp_path = temp_file.into_temp_path();
+        let capture_zsh_path = temp_path.to_path_buf();
+        Ok((capture_zsh_path, temp_path))
     }
 
     fn position_to_byte_offset(text: &str, position: Position) -> Option<usize> {
