@@ -1,0 +1,18 @@
+name: Pinact Check
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  pinact-check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+    - uses: suzuki-shunsuke/pinact-action@d735505f3decf76fca3fdbb4c952e5b3eba0ffdd # v0.1.2
+      with:
+        skip_push: "true"
