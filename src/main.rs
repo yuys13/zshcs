@@ -119,15 +119,12 @@ impl LanguageServer for Backend {
         for change in params.content_changes {
             if let Some(range) = change.range {
                 // Incremental update
-                if let Some(mut doc) = self.document_map.get_mut(&uri) {
-                    let mut content = doc.value().clone();
-                    if let Some(start_offset) = Self::position_to_byte_offset(&content, range.start)
-                        && let Some(end_offset) = Self::position_to_byte_offset(&content, range.end)
-                        && start_offset <= end_offset
-                    {
-                        content.replace_range(start_offset..end_offset, &change.text);
-                        *doc = content;
-                    }
+                if let Some(mut doc) = self.document_map.get_mut(&uri)
+                    && let Some(start_offset) = Self::position_to_byte_offset(&doc, range.start)
+                    && let Some(end_offset) = Self::position_to_byte_offset(&doc, range.end)
+                    && start_offset <= end_offset
+                {
+                    doc.replace_range(start_offset..end_offset, &change.text);
                 }
             } else {
                 // Full sync (range is None)
@@ -480,6 +477,30 @@ mod tests {
                 }
             }
         }
+
+        async fn init_and_open(&mut self, file_uri: &Url, initial_text: &str) {
+            // Initialize
+            let initialize_params = InitializeParams::default();
+            self.send_request::<Initialize>(initialize_params)
+                .await
+                .unwrap();
+            self.send_notification::<Initialized>(InitializedParams {})
+                .await;
+            self.read_notification::<LogMessage>().await; // init
+            self.read_notification::<LogMessage>().await; // version
+
+            // Open document
+            self.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: file_uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: initial_text.to_string(),
+                },
+            })
+            .await;
+            self.read_notification::<LogMessage>().await; // didOpen
+        }
     }
 
     fn setup_server() -> (DuplexStream, tokio::task::JoinHandle<()>) {
@@ -664,34 +685,8 @@ mod tests {
         let (mut client_stream, _server_handle) = setup_server();
         let mut test_client = TestClient::new(&mut client_stream);
 
-        // Initialize and open document
-        let initialize_params = InitializeParams {
-            capabilities: ClientCapabilities::default(),
-            ..Default::default()
-        };
-        test_client
-            .send_request::<Initialize>(initialize_params)
-            .await
-            .unwrap();
-        test_client
-            .send_notification::<Initialized>(InitializedParams {})
-            .await;
-        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await; // initialized log
-        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await; // version log
-
         let doc_uri = Url::parse("file:///test_change.zsh").unwrap();
-        let did_open_params = DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "initial content".to_string(),
-            },
-        };
-        test_client
-            .send_notification::<DidOpenTextDocument>(did_open_params)
-            .await;
-        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await; // didOpen log
+        test_client.init_and_open(&doc_uri, "initial content").await;
 
         // Send didChange notification (full sync)
         let did_change_params = DidChangeTextDocumentParams {
@@ -733,43 +728,9 @@ mod tests {
         let (mut client_stream, _server_handle) = setup_server();
         let mut test_client = TestClient::new(&mut client_stream);
 
-        // Initialize and open document
-        let initialize_params = InitializeParams {
-            capabilities: ClientCapabilities {
-                workspace: Some(WorkspaceClientCapabilities {
-                    execute_command: Some(ExecuteCommandClientCapabilities {
-                        dynamic_registration: Some(true),
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        test_client
-            .send_request::<Initialize>(initialize_params)
-            .await
-            .unwrap();
-        test_client
-            .send_notification::<Initialized>(InitializedParams {})
-            .await;
-        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
         let doc_uri = Url::parse("file:///test_incremental.zsh").unwrap();
         let initial_text = "line1\nline2\nline3".to_string();
-        let did_open_params = DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: initial_text.clone(),
-            },
-        };
-        test_client
-            .send_notification::<DidOpenTextDocument>(did_open_params)
-            .await;
-        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+        test_client.init_and_open(&doc_uri, &initial_text).await;
 
         // 1. Send first incremental change: replace "line2" with "new line2"
         let first_change_params = DidChangeTextDocumentParams {
@@ -848,36 +809,8 @@ mod tests {
         let (mut client_stream, _server_handle) = setup_server();
         let mut test_client = TestClient::new(&mut client_stream);
 
-        // Initialize
-        let initialize_params = InitializeParams {
-            capabilities: ClientCapabilities::default(),
-            ..Default::default()
-        };
-        test_client
-            .send_request::<Initialize>(initialize_params)
-            .await
-            .unwrap();
-        test_client
-            .send_notification::<Initialized>(InitializedParams {})
-            .await;
-        // Consume log messages
-        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
-        // Open document
         let doc_uri = Url::parse("file:///test.zsh").unwrap();
-        let did_open_params = DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "git s".to_string(),
-            },
-        };
-        test_client
-            .send_notification::<DidOpenTextDocument>(did_open_params)
-            .await;
-        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await; // didOpen log
+        test_client.init_and_open(&doc_uri, "git s").await;
 
         let completion_params = CompletionParams {
             text_document_position: TextDocumentPositionParams {
@@ -918,30 +851,8 @@ mod tests {
         let (mut client_stream, _server_handle) = setup_server();
         let mut test_client = TestClient::new(&mut client_stream);
 
-        // Initialize/Open using helper or manually (reusing pattern from other tests)
-        let initialize_params = InitializeParams::default();
-        test_client
-            .send_request::<Initialize>(initialize_params)
-            .await
-            .unwrap();
-        test_client
-            .send_notification::<Initialized>(InitializedParams {})
-            .await;
-        test_client.read_notification::<LogMessage>().await; // init
-        test_client.read_notification::<LogMessage>().await; // version
-
         let doc_uri = Url::parse("file:///test_ordering.zsh").unwrap();
-        test_client
-            .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-                text_document: TextDocumentItem {
-                    uri: doc_uri.clone(),
-                    language_id: "zsh".to_string(),
-                    version: 1,
-                    text: "".to_string(),
-                },
-            })
-            .await;
-        test_client.read_notification::<LogMessage>().await; // didOpen
+        test_client.init_and_open(&doc_uri, "").await;
 
         // Send two insertions in a single didChange
         // [Insert "A" at 0, Insert "B" at 0]
@@ -988,28 +899,8 @@ mod tests {
         let (mut client_stream, _server_handle) = setup_server();
         let mut test_client = TestClient::new(&mut client_stream);
 
-        test_client
-            .send_request::<Initialize>(InitializeParams::default())
-            .await
-            .unwrap();
-        test_client
-            .send_notification::<Initialized>(InitializedParams {})
-            .await;
-        test_client.read_notification::<LogMessage>().await;
-        test_client.read_notification::<LogMessage>().await;
-
         let doc_uri = Url::parse("file:///test_mixed.zsh").unwrap();
-        test_client
-            .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-                text_document: TextDocumentItem {
-                    uri: doc_uri.clone(),
-                    language_id: "zsh".to_string(),
-                    version: 1,
-                    text: "Old".to_string(),
-                },
-            })
-            .await;
-        test_client.read_notification::<LogMessage>().await;
+        test_client.init_and_open(&doc_uri, "Old").await;
 
         // Mixed changes: Full replace followed by incremental append
         let params = DidChangeTextDocumentParams {
