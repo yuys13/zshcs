@@ -36,7 +36,7 @@ This is the core logic for providing authentic Zsh completions.
      file containing the `capture.zsh` script.
   2. The server determines the context (current line/cursor position) from the
      document.
-  3. It executes the temporary script using `zsh`.
+  3. It executes the temporary script as a subprocess.
 - **Mechanism**:
   - **`zpty`**: The script uses the `zsh/zpty` module to spawn a pseudo-terminal
     session. This allows it to simulate an interactive Zsh environment.
