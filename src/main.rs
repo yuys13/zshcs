@@ -119,12 +119,27 @@ impl LanguageServer for Backend {
         for change in params.content_changes {
             if let Some(range) = change.range {
                 // Incremental update
-                if let Some(mut doc) = self.document_map.get_mut(&uri)
-                    && let Some(start_offset) = Self::position_to_byte_offset(&doc, range.start)
-                    && let Some(end_offset) = Self::position_to_byte_offset(&doc, range.end)
-                    && start_offset <= end_offset
-                {
-                    doc.replace_range(start_offset..end_offset, &change.text);
+                if let Some(mut doc) = self.document_map.get_mut(&uri) {
+                    if let Some(start_offset) = Self::position_to_byte_offset(&doc, range.start)
+                        && let Some(end_offset) = Self::position_to_byte_offset(&doc, range.end)
+                        && start_offset <= end_offset
+                    {
+                        doc.replace_range(start_offset..end_offset, &change.text);
+                    } else {
+                        self.client
+                            .log_message(
+                                MessageType::WARNING,
+                                format!("Failed to apply incremental change: invalid range {range:?} for document {uri}"),
+                            )
+                            .await;
+                    }
+                } else {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("Failed to apply incremental change: document {uri} not found"),
+                        )
+                        .await;
                 }
             } else {
                 // Full sync (range is None)
