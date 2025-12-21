@@ -52,7 +52,7 @@ This is the core logic for providing authentic Zsh completions.
 2. **Server (Rust)**:
    - Extracts the relevant line or context from the in-memory document.
    - Writes `capture.zsh` to a temp file (executable).
-   - Spawns a subprocess: `zsh <temp_script> <prefix>`.
+   - Spawns a subprocess: `<temp_script> <prefix>`.
 3. **Subprocess (Zsh)**:
    - Initializes a clean Zsh environment.
    - Invokes Zsh completion system (`compinit`).
