@@ -21,6 +21,10 @@ The project consists of two main components:
 - **State Management**:
   - Maintains open documents in memory using `DashMap`.
   - Tracks document versions to handle out-of-order updates.
+- **Resource Lifecycle**:
+  - Manages the lifecycle of the embedded `capture.zsh` execution script,
+    ensuring it is created once at startup and cleaned up on shutdown.
+  - Uses `tempfile::TempPath` for automatic file deletion.
 - **Synchronization**: Supports `TextDocumentSyncKind::INCREMENTAL`.
   - `didChange` events update the in-memory document state by applying changes
     to the byte offsets calculated from LSP `Position` (line/character).
@@ -32,11 +36,11 @@ This is the core logic for providing authentic Zsh completions.
 - **Embedding**: The script content is embedded into the Rust binary at compile
   time using `include_str!("../bin/capture.zsh")`.
 - **Execution Flow**:
-  1. When a `completion` request is received, the server creates a temporary
-     file containing the `capture.zsh` script.
-  2. The server determines the context (current line/cursor position) from the
-     document.
-  3. It executes the temporary script as a subprocess.
+  1. When the server starts, it creates a temporary file containing the
+     `capture.zsh` script and keeps its path.
+  2. For each `completion` request, the server determines the context (current
+     line/cursor position) from the document.
+  3. It executes the existing temporary script as a subprocess.
 - **Mechanism**:
   - **`zpty`**: The script uses the `zsh/zpty` module to spawn a pseudo-terminal
     session. This allows it to simulate an interactive Zsh environment.
@@ -51,8 +55,8 @@ This is the core logic for providing authentic Zsh completions.
 1. **Client**: Sends `textDocument/completion` with cursor position.
 2. **Server (Rust)**:
    - Extracts the relevant line or context from the in-memory document.
-   - Writes `capture.zsh` to a temp file (executable).
-   - Spawns a subprocess: `<temp_script> <prefix>`.
+   - Spawns a subprocess using the pre-created `capture.zsh` temp file:
+     `<temp_script> <prefix>`.
 3. **Subprocess (Zsh)**:
    - Initializes a clean Zsh environment.
    - Invokes Zsh completion system (`compinit`).

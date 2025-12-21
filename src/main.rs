@@ -10,21 +10,42 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
+const ZSH_SCRIPT_PERMISSIONS: u32 = 0o755;
 
 #[derive(Debug)]
 struct Backend {
     client: Client,
     document_map: Arc<DashMap<Url, String>>,
     document_versions: Arc<DashMap<Url, i32>>,
+    _temp_path: tempfile::TempPath,
 }
 
 impl Backend {
     fn new(client: Client) -> Self {
+        // Create temp file for capture.zsh once on startup
+        let temp_path =
+            Self::create_capture_script().expect("Failed to create and prepare capture.zsh script");
+
         Backend {
             client,
             document_map: Arc::new(DashMap::new()),
             document_versions: Arc::new(DashMap::new()),
+            _temp_path: temp_path,
         }
+    }
+
+    fn create_capture_script() -> std::io::Result<tempfile::TempPath> {
+        let mut temp_file = NamedTempFile::new()?;
+        write!(temp_file, "{}", CAPTURE_ZSH)?;
+        temp_file.flush()?;
+
+        // Make executable
+        let mut perms = temp_file.as_file().metadata()?.permissions();
+        perms.set_mode(ZSH_SCRIPT_PERMISSIONS);
+        temp_file.as_file().set_permissions(perms)?;
+
+        // Return the temp path. It will be deleted when the TempPath is dropped (RAII).
+        Ok(temp_file.into_temp_path())
     }
 
     fn position_to_byte_offset(text: &str, position: Position) -> Option<usize> {
@@ -172,48 +193,12 @@ impl LanguageServer for Backend {
         let line_start = text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
         let prefix = &text[line_start..offset];
 
-        // Create temp file for capture.zsh
-        let mut temp_file = NamedTempFile::new().map_err(|e| tower_lsp::jsonrpc::Error {
-            code: tower_lsp::jsonrpc::ErrorCode::InternalError,
-            message: format!("Failed to create temp file: {}", e).into(),
-            data: None,
-        })?;
-
-        write!(temp_file, "{}", CAPTURE_ZSH).map_err(|e| tower_lsp::jsonrpc::Error {
-            code: tower_lsp::jsonrpc::ErrorCode::InternalError,
-            message: format!("Failed to write to temp file: {}", e).into(),
-            data: None,
-        })?;
-
-        // Make executable
-        let mut perms = temp_file
-            .as_file()
-            .metadata()
-            .map_err(|e| tower_lsp::jsonrpc::Error {
-                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
-                message: format!("Failed to get temp file metadata: {}", e).into(),
-                data: None,
-            })?
-            .permissions();
-        perms.set_mode(0o755);
-        temp_file
-            .as_file()
-            .set_permissions(perms)
-            .map_err(|e| tower_lsp::jsonrpc::Error {
-                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
-                message: format!("Failed to set temp file permissions: {}", e).into(),
-                data: None,
-            })?;
-
-        // Close the file handle but keep the file on disk
-        let temp_path = temp_file.into_temp_path();
-
         // Run capture.zsh
         // Use tokio::try_join! or separate tasks if reading stderr/stdout simultaneously is needed for large outputs,
         // but for simple cases verify if Output capture is enough.
         // Using tokio::time::timeout to prevent hanging.
         use tokio::time::{Duration, timeout};
-        let command_future = tokio::process::Command::new(&temp_path)
+        let command_future = tokio::process::Command::new(&self._temp_path)
             .arg(prefix)
             .kill_on_drop(true)
             .output();

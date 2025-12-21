@@ -29,7 +29,7 @@ Development (TDD) as described by Kent Beck. This involves the following cycle:
 - `src/main.rs`: The main entry point of the application. Contains LSP handlers
   and integration tests.
 - `bin/capture.zsh`: The Zsh script used to hook into Zsh's completion system
-  and capture candidates.
+  and capture candidates. Embedded and managed by the LSP server.
 - `docs/`: Contains project documentation, including architectural details.
 - `Cargo.toml`: The manifest file for this Rust project, containing metadata
   and dependencies.
