@@ -215,6 +215,7 @@ impl LanguageServer for Backend {
         use tokio::time::{Duration, timeout};
         let command_future = tokio::process::Command::new(&temp_path)
             .arg(prefix)
+            .kill_on_drop(true)
             .output();
 
         let output_result = timeout(Duration::from_millis(3000), command_future).await;
