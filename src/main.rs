@@ -37,13 +37,14 @@ impl Backend {
     fn create_capture_script() -> std::io::Result<tempfile::TempPath> {
         let mut temp_file = NamedTempFile::new()?;
         write!(temp_file, "{}", CAPTURE_ZSH)?;
+        temp_file.flush()?;
 
         // Make executable
         let mut perms = temp_file.as_file().metadata()?.permissions();
         perms.set_mode(ZSH_SCRIPT_PERMISSIONS);
         temp_file.as_file().set_permissions(perms)?;
 
-        // Close the file handle but keep the file on disk
+        // Return the temp path. It will be deleted when the TempPath is dropped (RAII).
         Ok(temp_file.into_temp_path())
     }
 
