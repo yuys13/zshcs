@@ -8,6 +8,13 @@ This project is an implementation of the Language Server Protocol (LSP) for zsh.
 The primary goal is to provide completion features. It is built using the
 `tower-lsp` crate.
 
+## Documentation
+
+For detailed information about the internal design, mechanics of the completion
+engine, and data flow, please refer to:
+
+- [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md)
+
 ## Development Methodology
 
 All new code should be written following the principles of Test-Driven
@@ -19,7 +26,11 @@ Development (TDD) as described by Kent Beck. This involves the following cycle:
 
 ## Project Structure
 
-- `src/main.rs`: The main entry point of the application.
+- `src/main.rs`: The main entry point of the application. Contains LSP handlers
+  and integration tests.
+- `bin/capture.zsh`: The Zsh script used to hook into Zsh's completion system
+  and capture candidates.
+- `docs/`: Contains project documentation, including architectural details.
 - `Cargo.toml`: The manifest file for this Rust project, containing metadata
   and dependencies.
 - `.github/`: Contains GitHub Actions workflows, such as the CI pipeline.
