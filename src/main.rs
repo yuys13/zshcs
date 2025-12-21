@@ -10,44 +10,41 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
+const ZSH_SCRIPT_PERMISSIONS: u32 = 0o755;
 
 #[derive(Debug)]
 struct Backend {
     client: Client,
     document_map: Arc<DashMap<Url, String>>,
     document_versions: Arc<DashMap<Url, i32>>,
-    capture_zsh_path: std::path::PathBuf,
     _temp_path: tempfile::TempPath,
 }
 
 impl Backend {
     fn new(client: Client) -> Self {
         // Create temp file for capture.zsh once on startup
-        let (capture_zsh_path, temp_path) =
+        let temp_path =
             Self::create_capture_script().expect("Failed to create and prepare capture.zsh script");
 
         Backend {
             client,
             document_map: Arc::new(DashMap::new()),
             document_versions: Arc::new(DashMap::new()),
-            capture_zsh_path,
             _temp_path: temp_path,
         }
     }
 
-    fn create_capture_script() -> std::io::Result<(std::path::PathBuf, tempfile::TempPath)> {
+    fn create_capture_script() -> std::io::Result<tempfile::TempPath> {
         let mut temp_file = NamedTempFile::new()?;
         write!(temp_file, "{}", CAPTURE_ZSH)?;
 
         // Make executable
         let mut perms = temp_file.as_file().metadata()?.permissions();
-        perms.set_mode(0o755);
+        perms.set_mode(ZSH_SCRIPT_PERMISSIONS);
         temp_file.as_file().set_permissions(perms)?;
 
         // Close the file handle but keep the file on disk
-        let temp_path = temp_file.into_temp_path();
-        let capture_zsh_path = temp_path.to_path_buf();
-        Ok((capture_zsh_path, temp_path))
+        Ok(temp_file.into_temp_path())
     }
 
     fn position_to_byte_offset(text: &str, position: Position) -> Option<usize> {
@@ -200,7 +197,7 @@ impl LanguageServer for Backend {
         // but for simple cases verify if Output capture is enough.
         // Using tokio::time::timeout to prevent hanging.
         use tokio::time::{Duration, timeout};
-        let command_future = tokio::process::Command::new(&self.capture_zsh_path)
+        let command_future = tokio::process::Command::new(&self._temp_path)
             .arg(prefix)
             .kill_on_drop(true)
             .output();
