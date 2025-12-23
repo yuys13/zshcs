@@ -140,25 +140,27 @@ impl LanguageServer for Backend {
         for change in params.content_changes {
             if let Some(range) = change.range {
                 // Incremental update
-                if let Some(mut doc) = self.document_map.get_mut(&uri) {
-                    if let Some(start_offset) = Self::position_to_byte_offset(&doc, range.start)
-                        && let Some(end_offset) = Self::position_to_byte_offset(&doc, range.end)
-                        && start_offset <= end_offset
-                    {
-                        doc.replace_range(start_offset..end_offset, &change.text);
+                let res = {
+                    if let Some(mut doc) = self.document_map.get_mut(&uri) {
+                        if let Some(start_offset) = Self::position_to_byte_offset(&doc, range.start)
+                            && let Some(end_offset) = Self::position_to_byte_offset(&doc, range.end)
+                            && start_offset <= end_offset
+                        {
+                            doc.replace_range(start_offset..end_offset, &change.text);
+                            Ok(())
+                        } else {
+                            Err(format!("invalid range {range:?}"))
+                        }
                     } else {
-                        self.client
-                            .log_message(
-                                MessageType::WARNING,
-                                format!("Failed to apply incremental change: invalid range {range:?} for document {uri}"),
-                            )
-                            .await;
+                        Err("document not found".to_string())
                     }
-                } else {
+                };
+
+                if let Err(e) = res {
                     self.client
                         .log_message(
                             MessageType::WARNING,
-                            format!("Failed to apply incremental change: document {uri} not found"),
+                            format!("Failed to apply incremental change: {e} for document {uri}"),
                         )
                         .await;
                 }
@@ -177,21 +179,23 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let doc = self.document_map.get(&uri);
-        if doc.is_none() {
-            return Ok(None);
-        }
-        let text = doc.unwrap();
+        let prefix = {
+            let doc = self.document_map.get(&uri);
+            if doc.is_none() {
+                return Ok(None);
+            }
+            let text = doc.unwrap();
 
-        let offset = Self::position_to_byte_offset(&text, position);
-        if offset.is_none() {
-            return Ok(None);
-        }
-        let offset = offset.unwrap();
+            let offset = Self::position_to_byte_offset(&text, position);
+            if offset.is_none() {
+                return Ok(None);
+            }
+            let offset = offset.unwrap();
 
-        // Find start of line
-        let line_start = text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let prefix = &text[line_start..offset];
+            // Find start of line
+            let line_start = text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            text[line_start..offset].to_string()
+        };
 
         // Run capture.zsh
         // Use tokio::try_join! or separate tasks if reading stderr/stdout simultaneously is needed for large outputs,
