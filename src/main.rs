@@ -147,6 +147,8 @@ impl LanguageServer for Backend {
                     {
                         doc.replace_range(start_offset..end_offset, &change.text);
                     } else {
+                        // Drop the lock before calling await
+                        drop(doc);
                         self.client
                             .log_message(
                                 MessageType::WARNING,
@@ -177,21 +179,23 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let doc = self.document_map.get(&uri);
-        if doc.is_none() {
-            return Ok(None);
-        }
-        let text = doc.unwrap();
+        let prefix = {
+            let doc = self.document_map.get(&uri);
+            if doc.is_none() {
+                return Ok(None);
+            }
+            let text = doc.unwrap();
 
-        let offset = Self::position_to_byte_offset(&text, position);
-        if offset.is_none() {
-            return Ok(None);
-        }
-        let offset = offset.unwrap();
+            let offset = Self::position_to_byte_offset(&text, position);
+            if offset.is_none() {
+                return Ok(None);
+            }
+            let offset = offset.unwrap();
 
-        // Find start of line
-        let line_start = text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let prefix = &text[line_start..offset];
+            // Find start of line
+            let line_start = text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            text[line_start..offset].to_string()
+        };
 
         // Run capture.zsh
         // Use tokio::try_join! or separate tasks if reading stderr/stdout simultaneously is needed for large outputs,
