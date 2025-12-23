@@ -140,27 +140,27 @@ impl LanguageServer for Backend {
         for change in params.content_changes {
             if let Some(range) = change.range {
                 // Incremental update
-                if let Some(mut doc) = self.document_map.get_mut(&uri) {
-                    if let Some(start_offset) = Self::position_to_byte_offset(&doc, range.start)
-                        && let Some(end_offset) = Self::position_to_byte_offset(&doc, range.end)
-                        && start_offset <= end_offset
-                    {
-                        doc.replace_range(start_offset..end_offset, &change.text);
+                let res = {
+                    if let Some(mut doc) = self.document_map.get_mut(&uri) {
+                        if let Some(start_offset) = Self::position_to_byte_offset(&doc, range.start)
+                            && let Some(end_offset) = Self::position_to_byte_offset(&doc, range.end)
+                            && start_offset <= end_offset
+                        {
+                            doc.replace_range(start_offset..end_offset, &change.text);
+                            Ok(())
+                        } else {
+                            Err(format!("invalid range {range:?}"))
+                        }
                     } else {
-                        // Drop the lock before calling await
-                        drop(doc);
-                        self.client
-                            .log_message(
-                                MessageType::WARNING,
-                                format!("Failed to apply incremental change: invalid range {range:?} for document {uri}"),
-                            )
-                            .await;
+                        Err("document not found".to_string())
                     }
-                } else {
+                };
+
+                if let Err(e) = res {
                     self.client
                         .log_message(
                             MessageType::WARNING,
-                            format!("Failed to apply incremental change: document {uri} not found"),
+                            format!("Failed to apply incremental change: {e} for document {uri}"),
                         )
                         .await;
                 }
