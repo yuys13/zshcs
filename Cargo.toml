@@ -11,4 +11,4 @@ serde_json = "1.0" # Added to create JSON RPC messages in test code
 lsp-types = "0.97" # Added to reference types in test code
 futures = "0.3" # Added for asynchronous processing in tests
 dashmap = "6.1.0"
-tempfile = "3.23.0"
+tempfile = "3.24.0"
