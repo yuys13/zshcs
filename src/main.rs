@@ -1112,4 +1112,95 @@ mod tests {
             assert!(metadata.permissions().mode() & 0o111 != 0, "Script should be executable");
         }
     }
+
+    #[tokio::test]
+    async fn test_completion_consecutive() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        let doc_uri = Url::parse("file:///consecutive.zsh").unwrap();
+        test_client.init_and_open(&doc_uri, "git ").await;
+
+        // 1. First completion
+        let res1 = test_client
+            .send_request::<request::Completion>(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: doc_uri.clone() },
+                    position: Position::new(0, 4),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        
+        let items1 = match res1 {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        assert!(items1.iter().any(|i| i.label == "status"));
+
+        // 2. Second completion (at the same position)
+        let res2 = test_client
+            .send_request::<request::Completion>(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: doc_uri.clone() },
+                    position: Position::new(0, 4),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        
+        let items2 = match res2 {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        assert!(items2.iter().any(|i| i.label == "status"));
+    }
+
+    #[tokio::test]
+    async fn test_completion_after_change() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        let doc_uri = Url::parse("file:///after_change.zsh").unwrap();
+        test_client.init_and_open(&doc_uri, "git ").await;
+
+        // Change document: append "sta"
+        test_client.send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 2),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 4), Position::new(0, 4))),
+                range_length: None,
+                text: "sta".to_string(),
+            }],
+        }).await;
+        test_client.read_notification::<LogMessage>().await; // didChange
+
+        let res = test_client
+            .send_request::<request::Completion>(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: doc_uri.clone() },
+                    position: Position::new(0, 7), // After "git sta"
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        
+        let items = match res {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        assert!(items.iter().any(|i| i.label == "status"));
+    }
 }
