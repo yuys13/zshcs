@@ -310,36 +310,48 @@ mod tests {
     }; // Keep for JsonRpcResponse parts // For sharing DashMap across async tasks if needed, though Client is Clone
 
     async fn read_message(stream: &mut DuplexStream) -> Option<String> {
-        // let mut len_buf = [0u8; 20]; // Unused variable
-        let mut content_length = 0;
+        let timeout_duration = std::time::Duration::from_secs(5);
 
-        // Read headers
-        let mut header_buf = Vec::new();
-        loop {
-            let byte = stream.read_u8().await.ok()?;
-            header_buf.push(byte);
-            if header_buf.ends_with(b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&header_buf);
-                for line in headers.lines() {
-                    if let Some(stripped_line) = line.strip_prefix("Content-Length: ") {
-                        content_length = stripped_line.trim().parse().ok()?;
+        let result = tokio::time::timeout(timeout_duration, async {
+            let mut content_length = 0;
+
+            // Read headers
+            let mut header_buf = Vec::new();
+            loop {
+                let byte = stream.read_u8().await.ok()?;
+                header_buf.push(byte);
+                if header_buf.ends_with(b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&header_buf);
+                    for line in headers.lines() {
+                        if let Some(stripped_line) = line.strip_prefix("Content-Length: ") {
+                            content_length = stripped_line.trim().parse().ok()?;
+                        }
                     }
+                    break;
                 }
-                break;
+                if header_buf.len() > 2048 {
+                    // Prevent infinite loop on malformed headers
+                    return None;
+                }
             }
-            if header_buf.len() > 2048 {
-                // Prevent infinite loop on malformed headers
+
+            if content_length == 0 {
                 return None;
             }
-        }
 
-        if content_length == 0 {
-            return None;
-        }
+            let mut content_buf = vec![0u8; content_length];
+            stream.read_exact(&mut content_buf).await.ok()?;
+            String::from_utf8(content_buf).ok()
+        })
+        .await;
 
-        let mut content_buf = vec![0u8; content_length];
-        stream.read_exact(&mut content_buf).await.ok()?;
-        String::from_utf8(content_buf).ok()
+        match result {
+            Ok(msg_opt) => msg_opt,
+            Err(_) => {
+                eprintln!("Timeout reading message from stream");
+                None
+            }
+        }
     }
 
     async fn write_message(stream: &mut DuplexStream, message: &str) -> std::io::Result<()> {
@@ -381,23 +393,29 @@ mod tests {
                 "method": R::METHOD,
                 "id": id
             });
-            if !params_value.is_null() {
-                request_value
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("params".to_string(), params_value);
+            if let Some(obj) = request_value
+                .as_object_mut()
+                .filter(|_| !params_value.is_null())
+            {
+                obj.insert("params".to_string(), params_value);
             }
 
-            let request_json = serde_json::to_string(&request_value).unwrap();
-            write_message(self.stream, &request_json).await.unwrap();
+            let request_json = serde_json::to_string(&request_value)
+                .map_err(|e| tower_lsp::jsonrpc::Error::invalid_params(e.to_string()))?;
+            write_message(self.stream, &request_json)
+                .await
+                .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
 
             loop {
-                let response_json = read_message(self.stream).await.unwrap();
+                let response_json = read_message(self.stream)
+                    .await
+                    .ok_or_else(tower_lsp::jsonrpc::Error::internal_error)?;
                 if response_json.contains("\"method\"") && !response_json.contains("\"id\"") {
                     eprintln!("Skipping notification: {response_json}");
                     continue;
                 }
-                let response: JsonRpcResponse = serde_json::from_str(&response_json).unwrap();
+                let response: JsonRpcResponse = serde_json::from_str(&response_json)
+                    .map_err(|_| tower_lsp::jsonrpc::Error::parse_error())?;
                 let (response_id_val, result_val): (
                     Id,
                     std::result::Result<Value, tower_lsp::jsonrpc::Error>,
@@ -447,10 +465,8 @@ mod tests {
                 "method": N::METHOD,
                 "params": params_value
             });
-            let notification_json = serde_json::to_string(&notification_value).unwrap();
-            write_message(self.stream, &notification_json)
-                .await
-                .unwrap();
+            let notification_json = serde_json::to_string(&notification_value).unwrap_or_default();
+            let _ = write_message(self.stream, &notification_json).await;
         }
 
         async fn read_notification<N: LspNotificationTrait>(&mut self) -> Option<N::Params>
@@ -475,8 +491,7 @@ mod tests {
                     // When `params` is `null`, `value.get("params").unwrap().is_null()` is `true`.
                     // In both cases, if `N::Params` can be deserialized from `Value::Null` (e.g., if `N::Params` is `()`),
                     // we attempt to do so. This handles the flexibility of the "initialized" notification's parameters.
-                    if N::METHOD == "initialized"
-                        && (value.get("params").is_none() || value.get("params").unwrap().is_null())
+                    if N::METHOD == "initialized" && value.get("params").is_none_or(|p| p.is_null())
                     {
                         return serde_json::from_value(Value::Null).ok();
                     }
