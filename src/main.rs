@@ -1203,4 +1203,38 @@ mod tests {
         };
         assert!(items.iter().any(|i| i.label == "status"));
     }
+
+    #[tokio::test]
+    async fn test_completion_with_description() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        let doc_uri = Url::parse("file:///description.zsh").unwrap();
+        // "ls -" usually shows options with descriptions like "--all -- do not ignore entries starting with ."
+        test_client.init_and_open(&doc_uri, "ls -").await;
+
+        let res = test_client
+            .send_request::<request::Completion>(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: doc_uri.clone() },
+                    position: Position::new(0, 5),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        
+        let items = match res {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        // Check for any item that has a detail (description)
+        // With "ls -", we expect options like "--all -- do not ignore entries starting with ."
+        let has_detail = items.iter().any(|i| i.detail.is_some());
+        assert!(has_detail, "Expected at least one completion item to have a description in detail field. Items: {items:?}");
+    }
 }
