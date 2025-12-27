@@ -293,7 +293,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tower_lsp::jsonrpc::{
         Id,
-        Request as JsonRpcRequest,
         Response as JsonRpcResponse,
         // Notification as JsonRpcNotification, // Removed due to persistent import issues
         // Error as JsonRpcError // Marked as unused for now
@@ -376,11 +375,20 @@ mod tests {
             R::Result: DeserializeOwned,
         {
             let id = self.next_request_id();
-            let request = JsonRpcRequest::build(R::METHOD)
-                .params(serde_json::to_value(params).unwrap())
-                .id(id) // send i64 id
-                .finish();
-            let request_json = serde_json::to_string(&request).unwrap();
+            let params_value = serde_json::to_value(params).unwrap();
+            let mut request_value = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": R::METHOD,
+                "id": id
+            });
+            if !params_value.is_null() {
+                request_value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("params".to_string(), params_value);
+            }
+
+            let request_json = serde_json::to_string(&request_value).unwrap();
             write_message(self.stream, &request_json).await.unwrap();
 
             loop {
@@ -941,5 +949,167 @@ mod tests {
             .unwrap();
         let content: Option<String> = serde_json::from_value(res.unwrap()).unwrap();
         assert_eq!(content, Some("New!".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_position_to_byte_offset_utf8_utf16() {
+        let text = "あa😊b";
+        // "あ" is 3 bytes, 1 utf16 code unit
+        // "a" is 1 byte, 1 utf16 code unit
+        // "😊" is 4 bytes, 2 utf16 code units (surrogate pair)
+        // "b" is 1 byte, 1 utf16 code unit
+
+        // End of "あ": char 1 -> byte 3
+        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 1)), Some(3));
+        // End of "a": char 2 -> byte 4
+        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 2)), Some(4));
+        // Middle of "😊" (first surrogate): char 3 -> byte 8 (end of emoji)
+        // Current implementation returns end of char if offset falls within it.
+        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 3)), Some(8));
+        // End of "😊": char 4 -> byte 8
+        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 4)), Some(8));
+        // End of "b": char 5 -> byte 9
+        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 5)), Some(9));
+    }
+
+    #[tokio::test]
+    async fn test_position_to_byte_offset_edge_cases() {
+        let text = "line1\nline2";
+        // Normal case
+        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 5)), Some(5));
+        // Next line
+        assert_eq!(Backend::position_to_byte_offset(text, Position::new(1, 0)), Some(6));
+        // Non-existent line
+        assert_eq!(Backend::position_to_byte_offset(text, Position::new(2, 0)), None);
+        // Position beyond line length (should return end of line)
+        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 100)), Some(5));
+        // Empty text
+        assert_eq!(Backend::position_to_byte_offset("", Position::new(0, 0)), Some(0));
+        assert_eq!(Backend::position_to_byte_offset("", Position::new(0, 1)), Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_edge_cases() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        // Server requires initialization
+        let initialize_params = InitializeParams::default();
+        test_client.send_request::<request::Initialize>(initialize_params).await.unwrap();
+        test_client.send_notification::<Initialized>(InitializedParams {}).await;
+
+        // Unknown command
+        let params = ExecuteCommandParams {
+            command: "unknown".to_string(),
+            ..Default::default()
+        };
+        let res = test_client.send_request::<request::ExecuteCommand>(params).await.unwrap();
+        assert!(res.is_none());
+
+        // Incorrect arguments
+        let params = ExecuteCommandParams {
+            command: "zshcs/getDocumentContent".to_string(),
+            arguments: vec![serde_json::json!(123)], // Not a URL
+            ..Default::default()
+        };
+        let res = test_client.send_request::<request::ExecuteCommand>(params).await.unwrap();
+        assert!(res.is_none());
+
+        // Document not found
+        let params = ExecuteCommandParams {
+            command: "zshcs/getDocumentContent".to_string(),
+            arguments: vec![serde_json::json!("file:///notfound.zsh")],
+            ..Default::default()
+        };
+        let res = test_client.send_request::<request::ExecuteCommand>(params).await.unwrap();
+        // The command returns Option<String>, so result should be Some(Value::Null) or similar
+        let content: Option<String> = serde_json::from_value(res.unwrap_or(Value::Null)).unwrap();
+        assert!(content.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_did_change_invalid_range() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        let doc_uri = Url::parse("file:///invalid_range.zsh").unwrap();
+        test_client.init_and_open(&doc_uri, "original").await;
+
+        // start > end range
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 2),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 5), Position::new(0, 2))),
+                range_length: None,
+                text: "X".to_string(),
+            }],
+        };
+        test_client.send_notification::<DidChangeTextDocument>(params).await;
+
+        // Should receive a warning log message instead of crashing
+        let log = test_client.read_notification::<LogMessage>().await.unwrap();
+        assert_eq!(log.typ, MessageType::WARNING);
+        assert!(log.message.contains("invalid range"));
+    }
+
+    #[tokio::test]
+    async fn test_did_change_document_not_found() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        let doc_uri = Url::parse("file:///not_opened.zsh").unwrap();
+        
+        // Server requires initialization
+        let initialize_params = InitializeParams::default();
+        test_client.send_request::<request::Initialize>(initialize_params).await.unwrap();
+        test_client.send_notification::<Initialized>(InitializedParams {}).await;
+        
+        // Skip initialization log messages
+        test_client.read_notification::<LogMessage>().await.unwrap(); // "server initialized!"
+        test_client.read_notification::<LogMessage>().await.unwrap(); // "Server version: ..."
+
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 1),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 0), Position::new(0, 0))),
+                range_length: None,
+                text: "X".to_string(),
+            }],
+        };
+        test_client.send_notification::<DidChangeTextDocument>(params).await;
+
+        let log = test_client.read_notification::<LogMessage>().await.unwrap();
+        assert_eq!(log.typ, MessageType::WARNING);
+        assert!(log.message.contains("document not found"));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        // Server requires initialization
+        let initialize_params = InitializeParams::default();
+        test_client.send_request::<request::Initialize>(initialize_params).await.unwrap();
+        test_client.send_notification::<Initialized>(InitializedParams {}).await;
+
+        // Shutdown expects no params, so we must use a request that doesn't send null if N::Params is ()
+        // tower_lsp's request::Shutdown has Params = ()
+        test_client.send_request::<request::Shutdown>(()).await.unwrap();
+        // Success means it responded with Ok(()) which is null in JSON-RPC
+    }
+
+    #[test]
+    fn test_create_capture_script() {
+        let temp_path = Backend::create_capture_script().expect("Failed to create script");
+        assert!(temp_path.exists());
+        let metadata = std::fs::metadata(&temp_path).unwrap();
+        assert!(metadata.is_file());
+        
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(metadata.permissions().mode() & 0o111 != 0, "Script should be executable");
+        }
     }
 }
