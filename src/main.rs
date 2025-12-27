@@ -960,32 +960,65 @@ mod tests {
         // "b" is 1 byte, 1 utf16 code unit
 
         // End of "あ": char 1 -> byte 3
-        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 1)), Some(3));
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 1)),
+            Some(3)
+        );
         // End of "a": char 2 -> byte 4
-        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 2)), Some(4));
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 2)),
+            Some(4)
+        );
         // Middle of "😊" (first surrogate): char 3 -> byte 8 (end of emoji)
         // Current implementation returns end of char if offset falls within it.
-        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 3)), Some(8));
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 3)),
+            Some(8)
+        );
         // End of "😊": char 4 -> byte 8
-        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 4)), Some(8));
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 4)),
+            Some(8)
+        );
         // End of "b": char 5 -> byte 9
-        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 5)), Some(9));
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 5)),
+            Some(9)
+        );
     }
 
     #[tokio::test]
     async fn test_position_to_byte_offset_edge_cases() {
         let text = "line1\nline2";
         // Normal case
-        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 5)), Some(5));
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 5)),
+            Some(5)
+        );
         // Next line
-        assert_eq!(Backend::position_to_byte_offset(text, Position::new(1, 0)), Some(6));
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(1, 0)),
+            Some(6)
+        );
         // Non-existent line
-        assert_eq!(Backend::position_to_byte_offset(text, Position::new(2, 0)), None);
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(2, 0)),
+            None
+        );
         // Position beyond line length (should return end of line)
-        assert_eq!(Backend::position_to_byte_offset(text, Position::new(0, 100)), Some(5));
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 100)),
+            Some(5)
+        );
         // Empty text
-        assert_eq!(Backend::position_to_byte_offset("", Position::new(0, 0)), Some(0));
-        assert_eq!(Backend::position_to_byte_offset("", Position::new(0, 1)), Some(0));
+        assert_eq!(
+            Backend::position_to_byte_offset("", Position::new(0, 0)),
+            Some(0)
+        );
+        assert_eq!(
+            Backend::position_to_byte_offset("", Position::new(0, 1)),
+            Some(0)
+        );
     }
 
     #[tokio::test]
@@ -995,15 +1028,23 @@ mod tests {
 
         // Server requires initialization
         let initialize_params = InitializeParams::default();
-        test_client.send_request::<request::Initialize>(initialize_params).await.unwrap();
-        test_client.send_notification::<Initialized>(InitializedParams {}).await;
+        test_client
+            .send_request::<request::Initialize>(initialize_params)
+            .await
+            .unwrap();
+        test_client
+            .send_notification::<Initialized>(InitializedParams {})
+            .await;
 
         // Unknown command
         let params = ExecuteCommandParams {
             command: "unknown".to_string(),
             ..Default::default()
         };
-        let res = test_client.send_request::<request::ExecuteCommand>(params).await.unwrap();
+        let res = test_client
+            .send_request::<request::ExecuteCommand>(params)
+            .await
+            .unwrap();
         assert!(res.is_none());
 
         // Incorrect arguments
@@ -1012,7 +1053,10 @@ mod tests {
             arguments: vec![serde_json::json!(123)], // Not a URL
             ..Default::default()
         };
-        let res = test_client.send_request::<request::ExecuteCommand>(params).await.unwrap();
+        let res = test_client
+            .send_request::<request::ExecuteCommand>(params)
+            .await
+            .unwrap();
         assert!(res.is_none());
 
         // Document not found
@@ -1021,7 +1065,10 @@ mod tests {
             arguments: vec![serde_json::json!("file:///notfound.zsh")],
             ..Default::default()
         };
-        let res = test_client.send_request::<request::ExecuteCommand>(params).await.unwrap();
+        let res = test_client
+            .send_request::<request::ExecuteCommand>(params)
+            .await
+            .unwrap();
         // The command returns Option<String>, so result should be Some(Value::Null) or similar
         let content: Option<String> = serde_json::from_value(res.unwrap_or(Value::Null)).unwrap();
         assert!(content.is_none());
@@ -1044,7 +1091,9 @@ mod tests {
                 text: "X".to_string(),
             }],
         };
-        test_client.send_notification::<DidChangeTextDocument>(params).await;
+        test_client
+            .send_notification::<DidChangeTextDocument>(params)
+            .await;
 
         // Should receive a warning log message instead of crashing
         let log = test_client.read_notification::<LogMessage>().await.unwrap();
@@ -1058,12 +1107,17 @@ mod tests {
         let mut test_client = TestClient::new(&mut client_stream);
 
         let doc_uri = Url::parse("file:///not_opened.zsh").unwrap();
-        
+
         // Server requires initialization
         let initialize_params = InitializeParams::default();
-        test_client.send_request::<request::Initialize>(initialize_params).await.unwrap();
-        test_client.send_notification::<Initialized>(InitializedParams {}).await;
-        
+        test_client
+            .send_request::<request::Initialize>(initialize_params)
+            .await
+            .unwrap();
+        test_client
+            .send_notification::<Initialized>(InitializedParams {})
+            .await;
+
         // Skip initialization log messages
         test_client.read_notification::<LogMessage>().await.unwrap(); // "server initialized!"
         test_client.read_notification::<LogMessage>().await.unwrap(); // "Server version: ..."
@@ -1076,7 +1130,9 @@ mod tests {
                 text: "X".to_string(),
             }],
         };
-        test_client.send_notification::<DidChangeTextDocument>(params).await;
+        test_client
+            .send_notification::<DidChangeTextDocument>(params)
+            .await;
 
         let log = test_client.read_notification::<LogMessage>().await.unwrap();
         assert_eq!(log.typ, MessageType::WARNING);
@@ -1090,12 +1146,20 @@ mod tests {
 
         // Server requires initialization
         let initialize_params = InitializeParams::default();
-        test_client.send_request::<request::Initialize>(initialize_params).await.unwrap();
-        test_client.send_notification::<Initialized>(InitializedParams {}).await;
+        test_client
+            .send_request::<request::Initialize>(initialize_params)
+            .await
+            .unwrap();
+        test_client
+            .send_notification::<Initialized>(InitializedParams {})
+            .await;
 
         // Shutdown expects no params, so we must use a request that doesn't send null if N::Params is ()
         // tower_lsp's request::Shutdown has Params = ()
-        test_client.send_request::<request::Shutdown>(()).await.unwrap();
+        test_client
+            .send_request::<request::Shutdown>(())
+            .await
+            .unwrap();
         // Success means it responded with Ok(()) which is null in JSON-RPC
     }
 
@@ -1105,11 +1169,14 @@ mod tests {
         assert!(temp_path.exists());
         let metadata = std::fs::metadata(&temp_path).unwrap();
         assert!(metadata.is_file());
-        
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert!(metadata.permissions().mode() & 0o111 != 0, "Script should be executable");
+            assert!(
+                metadata.permissions().mode() & 0o111 != 0,
+                "Script should be executable"
+            );
         }
     }
 
@@ -1125,7 +1192,9 @@ mod tests {
         let res1 = test_client
             .send_request::<request::Completion>(CompletionParams {
                 text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri: doc_uri.clone() },
+                    text_document: TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
                     position: Position::new(0, 4),
                 },
                 work_done_progress_params: Default::default(),
@@ -1135,7 +1204,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        
+
         let items1 = match res1 {
             CompletionResponse::Array(items) => items,
             CompletionResponse::List(list) => list.items,
@@ -1146,7 +1215,9 @@ mod tests {
         let res2 = test_client
             .send_request::<request::Completion>(CompletionParams {
                 text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri: doc_uri.clone() },
+                    text_document: TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
                     position: Position::new(0, 4),
                 },
                 work_done_progress_params: Default::default(),
@@ -1156,7 +1227,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        
+
         let items2 = match res2 {
             CompletionResponse::Array(items) => items,
             CompletionResponse::List(list) => list.items,
@@ -1173,20 +1244,24 @@ mod tests {
         test_client.init_and_open(&doc_uri, "git ").await;
 
         // Change document: append "sta"
-        test_client.send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
-            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 2),
-            content_changes: vec![TextDocumentContentChangeEvent {
-                range: Some(Range::new(Position::new(0, 4), Position::new(0, 4))),
-                range_length: None,
-                text: "sta".to_string(),
-            }],
-        }).await;
+        test_client
+            .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 2),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 4), Position::new(0, 4))),
+                    range_length: None,
+                    text: "sta".to_string(),
+                }],
+            })
+            .await;
         test_client.read_notification::<LogMessage>().await; // didChange
 
         let res = test_client
             .send_request::<request::Completion>(CompletionParams {
                 text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri: doc_uri.clone() },
+                    text_document: TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
                     position: Position::new(0, 7), // After "git sta"
                 },
                 work_done_progress_params: Default::default(),
@@ -1196,7 +1271,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        
+
         let items = match res {
             CompletionResponse::Array(items) => items,
             CompletionResponse::List(list) => list.items,
@@ -1216,7 +1291,9 @@ mod tests {
         let res = test_client
             .send_request::<request::Completion>(CompletionParams {
                 text_document_position: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri: doc_uri.clone() },
+                    text_document: TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
                     position: Position::new(0, 5),
                 },
                 work_done_progress_params: Default::default(),
@@ -1226,7 +1303,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        
+
         let items = match res {
             CompletionResponse::Array(items) => items,
             CompletionResponse::List(list) => list.items,
@@ -1235,6 +1312,9 @@ mod tests {
         // Check for any item that has a detail (description)
         // With "ls -", we expect options like "--all -- do not ignore entries starting with ."
         let has_detail = items.iter().any(|i| i.detail.is_some());
-        assert!(has_detail, "Expected at least one completion item to have a description in detail field. Items: {items:?}");
+        assert!(
+            has_detail,
+            "Expected at least one completion item to have a description in detail field. Items: {items:?}"
+        );
     }
 }
