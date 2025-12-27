@@ -807,7 +807,9 @@ mod tests {
             .send_request::<request::ExecuteCommand>(params)
             .await
             .unwrap();
-        let content: Option<String> = serde_json::from_value(result.unwrap()).unwrap();
+        let content: Option<String> = result
+            .and_then(|v| serde_json::from_value(v).ok())
+            .flatten();
 
         let expected_text = "line1\nnew line2 more\nline3".to_string();
         assert_eq!(
@@ -844,19 +846,10 @@ mod tests {
 
         // Assertions
         let response = response.expect("Expected completion response");
-        match response {
-            CompletionResponse::Array(items) => {
-                assert!(!items.is_empty());
-                // Check if "status" is in items
-                let has_status = items.iter().any(|item| item.label == "status");
-                assert!(has_status, "Expected 'status' in completion items");
-            }
-            CompletionResponse::List(list) => {
-                assert!(!list.items.is_empty());
-                let has_status = list.items.iter().any(|item| item.label == "status");
-                assert!(has_status, "Expected 'status' in completion items");
-            }
-        }
+        let items = get_completion_items(response);
+        assert!(!items.is_empty());
+        let has_status = items.iter().any(|item| item.label == "status");
+        assert!(has_status, "Expected 'status' in completion items");
     }
 
     #[tokio::test]
@@ -903,7 +896,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let content: Option<String> = serde_json::from_value(res.unwrap()).unwrap();
+        let content: Option<String> = res.and_then(|v| serde_json::from_value(v).ok()).flatten();
         assert_eq!(content, Some("BA".to_string()));
     }
 
@@ -947,7 +940,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let content: Option<String> = serde_json::from_value(res.unwrap()).unwrap();
+        let content: Option<String> = res.and_then(|v| serde_json::from_value(v).ok()).flatten();
         assert_eq!(content, Some("New!".to_string()));
     }
 
@@ -1070,7 +1063,7 @@ mod tests {
             .await
             .unwrap();
         // The command returns Option<String>, so result should be Some(Value::Null) or similar
-        let content: Option<String> = serde_json::from_value(res.unwrap_or(Value::Null)).unwrap();
+        let content: Option<String> = res.and_then(|v| serde_json::from_value(v).ok()).flatten();
         assert!(content.is_none());
     }
 
@@ -1205,10 +1198,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let items1 = match res1 {
-            CompletionResponse::Array(items) => items,
-            CompletionResponse::List(list) => list.items,
-        };
+        let items1 = get_completion_items(res1);
         assert!(items1.iter().any(|i| i.label == "status"));
 
         // 2. Second completion (at the same position)
@@ -1228,10 +1218,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let items2 = match res2 {
-            CompletionResponse::Array(items) => items,
-            CompletionResponse::List(list) => list.items,
-        };
+        let items2 = get_completion_items(res2);
         assert!(items2.iter().any(|i| i.label == "status"));
     }
 
@@ -1272,10 +1259,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let items = match res {
-            CompletionResponse::Array(items) => items,
-            CompletionResponse::List(list) => list.items,
-        };
+        let items = get_completion_items(res);
         assert!(items.iter().any(|i| i.label == "status"));
     }
 
@@ -1304,10 +1288,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let items = match res {
-            CompletionResponse::Array(items) => items,
-            CompletionResponse::List(list) => list.items,
-        };
+        let items = get_completion_items(res);
 
         // Check for any item that has a detail (description)
         // With "ls -", we expect options like "--all -- do not ignore entries starting with ."
@@ -1316,5 +1297,12 @@ mod tests {
             has_detail,
             "Expected at least one completion item to have a description in detail field. Items: {items:?}"
         );
+    }
+
+    fn get_completion_items(response: CompletionResponse) -> Vec<CompletionItem> {
+        match response {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        }
     }
 }
