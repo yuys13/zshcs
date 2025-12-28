@@ -293,7 +293,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tower_lsp::jsonrpc::{
         Id,
-        Request as JsonRpcRequest,
         Response as JsonRpcResponse,
         // Notification as JsonRpcNotification, // Removed due to persistent import issues
         // Error as JsonRpcError // Marked as unused for now
@@ -311,36 +310,48 @@ mod tests {
     }; // Keep for JsonRpcResponse parts // For sharing DashMap across async tasks if needed, though Client is Clone
 
     async fn read_message(stream: &mut DuplexStream) -> Option<String> {
-        // let mut len_buf = [0u8; 20]; // Unused variable
-        let mut content_length = 0;
+        let timeout_duration = std::time::Duration::from_secs(5);
 
-        // Read headers
-        let mut header_buf = Vec::new();
-        loop {
-            let byte = stream.read_u8().await.ok()?;
-            header_buf.push(byte);
-            if header_buf.ends_with(b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&header_buf);
-                for line in headers.lines() {
-                    if let Some(stripped_line) = line.strip_prefix("Content-Length: ") {
-                        content_length = stripped_line.trim().parse().ok()?;
+        let result = tokio::time::timeout(timeout_duration, async {
+            let mut content_length = 0;
+
+            // Read headers
+            let mut header_buf = Vec::new();
+            loop {
+                let byte = stream.read_u8().await.ok()?;
+                header_buf.push(byte);
+                if header_buf.ends_with(b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&header_buf);
+                    for line in headers.lines() {
+                        if let Some(stripped_line) = line.strip_prefix("Content-Length: ") {
+                            content_length = stripped_line.trim().parse().ok()?;
+                        }
                     }
+                    break;
                 }
-                break;
+                if header_buf.len() > 2048 {
+                    // Prevent infinite loop on malformed headers
+                    return None;
+                }
             }
-            if header_buf.len() > 2048 {
-                // Prevent infinite loop on malformed headers
+
+            if content_length == 0 {
                 return None;
             }
-        }
 
-        if content_length == 0 {
-            return None;
-        }
+            let mut content_buf = vec![0u8; content_length];
+            stream.read_exact(&mut content_buf).await.ok()?;
+            String::from_utf8(content_buf).ok()
+        })
+        .await;
 
-        let mut content_buf = vec![0u8; content_length];
-        stream.read_exact(&mut content_buf).await.ok()?;
-        String::from_utf8(content_buf).ok()
+        match result {
+            Ok(msg_opt) => msg_opt,
+            Err(_) => {
+                eprintln!("Timeout reading message from stream");
+                None
+            }
+        }
     }
 
     async fn write_message(stream: &mut DuplexStream, message: &str) -> std::io::Result<()> {
@@ -376,20 +387,35 @@ mod tests {
             R::Result: DeserializeOwned,
         {
             let id = self.next_request_id();
-            let request = JsonRpcRequest::build(R::METHOD)
-                .params(serde_json::to_value(params).unwrap())
-                .id(id) // send i64 id
-                .finish();
-            let request_json = serde_json::to_string(&request).unwrap();
-            write_message(self.stream, &request_json).await.unwrap();
+            let params_value = serde_json::to_value(params).unwrap();
+            let mut request_value = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": R::METHOD,
+                "id": id
+            });
+            if let Some(obj) = request_value
+                .as_object_mut()
+                .filter(|_| !params_value.is_null())
+            {
+                obj.insert("params".to_string(), params_value);
+            }
+
+            let request_json = serde_json::to_string(&request_value)
+                .map_err(|e| tower_lsp::jsonrpc::Error::invalid_params(e.to_string()))?;
+            write_message(self.stream, &request_json)
+                .await
+                .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
 
             loop {
-                let response_json = read_message(self.stream).await.unwrap();
+                let response_json = read_message(self.stream)
+                    .await
+                    .ok_or_else(tower_lsp::jsonrpc::Error::internal_error)?;
                 if response_json.contains("\"method\"") && !response_json.contains("\"id\"") {
                     eprintln!("Skipping notification: {response_json}");
                     continue;
                 }
-                let response: JsonRpcResponse = serde_json::from_str(&response_json).unwrap();
+                let response: JsonRpcResponse = serde_json::from_str(&response_json)
+                    .map_err(|_| tower_lsp::jsonrpc::Error::parse_error())?;
                 let (response_id_val, result_val): (
                     Id,
                     std::result::Result<Value, tower_lsp::jsonrpc::Error>,
@@ -439,10 +465,8 @@ mod tests {
                 "method": N::METHOD,
                 "params": params_value
             });
-            let notification_json = serde_json::to_string(&notification_value).unwrap();
-            write_message(self.stream, &notification_json)
-                .await
-                .unwrap();
+            let notification_json = serde_json::to_string(&notification_value).unwrap_or_default();
+            let _ = write_message(self.stream, &notification_json).await;
         }
 
         async fn read_notification<N: LspNotificationTrait>(&mut self) -> Option<N::Params>
@@ -467,8 +491,7 @@ mod tests {
                     // When `params` is `null`, `value.get("params").unwrap().is_null()` is `true`.
                     // In both cases, if `N::Params` can be deserialized from `Value::Null` (e.g., if `N::Params` is `()`),
                     // we attempt to do so. This handles the flexibility of the "initialized" notification's parameters.
-                    if N::METHOD == "initialized"
-                        && (value.get("params").is_none() || value.get("params").unwrap().is_null())
+                    if N::METHOD == "initialized" && value.get("params").is_none_or(|p| p.is_null())
                     {
                         return serde_json::from_value(Value::Null).ok();
                     }
@@ -799,7 +822,9 @@ mod tests {
             .send_request::<request::ExecuteCommand>(params)
             .await
             .unwrap();
-        let content: Option<String> = serde_json::from_value(result.unwrap()).unwrap();
+        let content: Option<String> = result
+            .and_then(|v| serde_json::from_value(v).ok())
+            .flatten();
 
         let expected_text = "line1\nnew line2 more\nline3".to_string();
         assert_eq!(
@@ -836,19 +861,10 @@ mod tests {
 
         // Assertions
         let response = response.expect("Expected completion response");
-        match response {
-            CompletionResponse::Array(items) => {
-                assert!(!items.is_empty());
-                // Check if "status" is in items
-                let has_status = items.iter().any(|item| item.label == "status");
-                assert!(has_status, "Expected 'status' in completion items");
-            }
-            CompletionResponse::List(list) => {
-                assert!(!list.items.is_empty());
-                let has_status = list.items.iter().any(|item| item.label == "status");
-                assert!(has_status, "Expected 'status' in completion items");
-            }
-        }
+        let items = get_completion_items(response);
+        assert!(!items.is_empty());
+        let has_status = items.iter().any(|item| item.label == "status");
+        assert!(has_status, "Expected 'status' in completion items");
     }
 
     #[tokio::test]
@@ -895,7 +911,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let content: Option<String> = serde_json::from_value(res.unwrap()).unwrap();
+        let content: Option<String> = res.and_then(|v| serde_json::from_value(v).ok()).flatten();
         assert_eq!(content, Some("BA".to_string()));
     }
 
@@ -939,7 +955,369 @@ mod tests {
             })
             .await
             .unwrap();
-        let content: Option<String> = serde_json::from_value(res.unwrap()).unwrap();
+        let content: Option<String> = res.and_then(|v| serde_json::from_value(v).ok()).flatten();
         assert_eq!(content, Some("New!".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_position_to_byte_offset_utf8_utf16() {
+        let text = "あa😊b";
+        // "あ" is 3 bytes, 1 utf16 code unit
+        // "a" is 1 byte, 1 utf16 code unit
+        // "😊" is 4 bytes, 2 utf16 code units (surrogate pair)
+        // "b" is 1 byte, 1 utf16 code unit
+
+        // End of "あ": char 1 -> byte 3
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 1)),
+            Some(3)
+        );
+        // End of "a": char 2 -> byte 4
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 2)),
+            Some(4)
+        );
+        // Middle of "😊" (first surrogate): char 3 -> byte 8 (end of emoji)
+        // Current implementation returns end of char if offset falls within it.
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 3)),
+            Some(8)
+        );
+        // End of "😊": char 4 -> byte 8
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 4)),
+            Some(8)
+        );
+        // End of "b": char 5 -> byte 9
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 5)),
+            Some(9)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_position_to_byte_offset_edge_cases() {
+        let text = "line1\nline2";
+        // Normal case
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 5)),
+            Some(5)
+        );
+        // Next line
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(1, 0)),
+            Some(6)
+        );
+        // Non-existent line
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(2, 0)),
+            None
+        );
+        // Position beyond line length (should return end of line)
+        assert_eq!(
+            Backend::position_to_byte_offset(text, Position::new(0, 100)),
+            Some(5)
+        );
+        // Empty text
+        assert_eq!(
+            Backend::position_to_byte_offset("", Position::new(0, 0)),
+            Some(0)
+        );
+        assert_eq!(
+            Backend::position_to_byte_offset("", Position::new(0, 1)),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_edge_cases() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        // Server requires initialization
+        let initialize_params = InitializeParams::default();
+        test_client
+            .send_request::<request::Initialize>(initialize_params)
+            .await
+            .unwrap();
+        test_client
+            .send_notification::<Initialized>(InitializedParams {})
+            .await;
+
+        // Unknown command
+        let params = ExecuteCommandParams {
+            command: "unknown".to_string(),
+            ..Default::default()
+        };
+        let res = test_client
+            .send_request::<request::ExecuteCommand>(params)
+            .await
+            .unwrap();
+        assert!(res.is_none());
+
+        // Incorrect arguments
+        let params = ExecuteCommandParams {
+            command: "zshcs/getDocumentContent".to_string(),
+            arguments: vec![serde_json::json!(123)], // Not a URL
+            ..Default::default()
+        };
+        let res = test_client
+            .send_request::<request::ExecuteCommand>(params)
+            .await
+            .unwrap();
+        assert!(res.is_none());
+
+        // Document not found
+        let params = ExecuteCommandParams {
+            command: "zshcs/getDocumentContent".to_string(),
+            arguments: vec![serde_json::json!("file:///notfound.zsh")],
+            ..Default::default()
+        };
+        let res = test_client
+            .send_request::<request::ExecuteCommand>(params)
+            .await
+            .unwrap();
+        // The command returns Option<String>, so result should be Some(Value::Null) or similar
+        let content: Option<String> = res.and_then(|v| serde_json::from_value(v).ok()).flatten();
+        assert!(content.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_did_change_invalid_range() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        let doc_uri = Url::parse("file:///invalid_range.zsh").unwrap();
+        test_client.init_and_open(&doc_uri, "original").await;
+
+        // start > end range
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 2),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 5), Position::new(0, 2))),
+                range_length: None,
+                text: "X".to_string(),
+            }],
+        };
+        test_client
+            .send_notification::<DidChangeTextDocument>(params)
+            .await;
+
+        // Should receive a warning log message instead of crashing
+        let log = test_client.read_notification::<LogMessage>().await.unwrap();
+        assert_eq!(log.typ, MessageType::WARNING);
+        assert!(log.message.contains("invalid range"));
+    }
+
+    #[tokio::test]
+    async fn test_did_change_document_not_found() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        let doc_uri = Url::parse("file:///not_opened.zsh").unwrap();
+
+        // Server requires initialization
+        let initialize_params = InitializeParams::default();
+        test_client
+            .send_request::<request::Initialize>(initialize_params)
+            .await
+            .unwrap();
+        test_client
+            .send_notification::<Initialized>(InitializedParams {})
+            .await;
+
+        // Skip initialization log messages
+        test_client.read_notification::<LogMessage>().await.unwrap(); // "server initialized!"
+        test_client.read_notification::<LogMessage>().await.unwrap(); // "Server version: ..."
+
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 1),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 0), Position::new(0, 0))),
+                range_length: None,
+                text: "X".to_string(),
+            }],
+        };
+        test_client
+            .send_notification::<DidChangeTextDocument>(params)
+            .await;
+
+        let log = test_client.read_notification::<LogMessage>().await.unwrap();
+        assert_eq!(log.typ, MessageType::WARNING);
+        assert!(log.message.contains("document not found"));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        // Server requires initialization
+        let initialize_params = InitializeParams::default();
+        test_client
+            .send_request::<request::Initialize>(initialize_params)
+            .await
+            .unwrap();
+        test_client
+            .send_notification::<Initialized>(InitializedParams {})
+            .await;
+
+        // Shutdown expects no params, so we must use a request that doesn't send null if N::Params is ()
+        // tower_lsp's request::Shutdown has Params = ()
+        test_client
+            .send_request::<request::Shutdown>(())
+            .await
+            .unwrap();
+        // Success means it responded with Ok(()) which is null in JSON-RPC
+    }
+
+    #[test]
+    fn test_create_capture_script() {
+        let temp_path = Backend::create_capture_script().expect("Failed to create script");
+        assert!(temp_path.exists());
+        let metadata = std::fs::metadata(&temp_path).unwrap();
+        assert!(metadata.is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(
+                metadata.permissions().mode() & 0o111 != 0,
+                "Script should be executable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_completion_consecutive() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        let doc_uri = Url::parse("file:///consecutive.zsh").unwrap();
+        test_client.init_and_open(&doc_uri, "git ").await;
+
+        // 1. First completion
+        let res1 = test_client
+            .send_request::<request::Completion>(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
+                    position: Position::new(0, 4),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let items1 = get_completion_items(res1);
+        assert!(items1.iter().any(|i| i.label == "status"));
+
+        // 2. Second completion (at the same position)
+        let res2 = test_client
+            .send_request::<request::Completion>(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
+                    position: Position::new(0, 4),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let items2 = get_completion_items(res2);
+        assert!(items2.iter().any(|i| i.label == "status"));
+    }
+
+    #[tokio::test]
+    async fn test_completion_after_change() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        let doc_uri = Url::parse("file:///after_change.zsh").unwrap();
+        test_client.init_and_open(&doc_uri, "git ").await;
+
+        // Change document: append "sta"
+        test_client
+            .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 2),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 4), Position::new(0, 4))),
+                    range_length: None,
+                    text: "sta".to_string(),
+                }],
+            })
+            .await;
+        test_client.read_notification::<LogMessage>().await; // didChange
+
+        let res = test_client
+            .send_request::<request::Completion>(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
+                    position: Position::new(0, 7), // After "git sta"
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let items = get_completion_items(res);
+        assert!(items.iter().any(|i| i.label == "status"));
+    }
+
+    #[tokio::test]
+    async fn test_completion_with_description() {
+        let (mut client_stream, _server_handle) = setup_server();
+        let mut test_client = TestClient::new(&mut client_stream);
+
+        let doc_uri = Url::parse("file:///description.zsh").unwrap();
+        // "ls -" usually shows options with descriptions like "--all -- do not ignore entries starting with ."
+        test_client.init_and_open(&doc_uri, "ls -").await;
+
+        let res = test_client
+            .send_request::<request::Completion>(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
+                    position: Position::new(0, 5),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let items = get_completion_items(res);
+
+        // Check for any item that has a detail (description)
+        // With "ls -", we expect options like "--all -- do not ignore entries starting with ."
+        let has_detail = items.iter().any(|i| i.detail.is_some());
+        assert!(
+            has_detail,
+            "Expected at least one completion item to have a description in detail field. Items: {items:?}"
+        );
+    }
+
+    fn get_completion_items(response: CompletionResponse) -> Vec<CompletionItem> {
+        match response {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        }
     }
 }
