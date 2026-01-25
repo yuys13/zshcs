@@ -1,5 +1,7 @@
 # Zsh Completion Server (zshcs)
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/yuys13/zshcs)
+
 `Zsh Completion Server` (`zshcs`) is a Language Server Protocol (LSP)
 implementation for Zsh shell scripts.
 It aims to provide high-performance and accurate completion features by
