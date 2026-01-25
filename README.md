@@ -97,3 +97,12 @@ cargo clippy --no-deps --all-targets -- -D warnings
 ## License
 
 [MIT License](LICENSE)
+
+## Original code
+
+This project includes code derived from the following repositories.
+We would like to express our gratitude to the original authors and
+contributors for their great work.
+
+- [zsh-capture-completion](https://github.com/Valodim/zsh-capture-completion)
+- [deoplete-zsh](https://github.com/deoplete-plugins/deoplete-zsh)
