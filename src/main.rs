@@ -4,48 +4,169 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 
 use std::sync::Arc;
-use tempfile::NamedTempFile;
+use tempfile::TempDir;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, oneshot};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
+const ZPTYRC_ZSH: &str = include_str!("../bin/zptyrc.zsh");
 const ZSH_SCRIPT_PERMISSIONS: u32 = 0o755;
+
+struct CompletionRequest {
+    prefix: String,
+    responder: oneshot::Sender<std::result::Result<Vec<CompletionItem>, String>>,
+}
 
 #[derive(Debug)]
 struct Backend {
     client: Client,
     document_map: Arc<DashMap<Url, String>>,
     document_versions: Arc<DashMap<Url, i32>>,
-    _temp_path: tempfile::TempPath,
+    _temp_dir: TempDir,
+    completion_tx: mpsc::Sender<CompletionRequest>,
 }
 
 impl Backend {
     fn new(client: Client) -> Self {
-        // Create temp file for capture.zsh once on startup
-        let temp_path =
-            Self::create_capture_script().expect("Failed to create and prepare capture.zsh script");
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir for zpty scripts");
+        let capture_path = temp_dir.path().join("capture.zsh");
+        let zptyrc_path = temp_dir.path().join("zptyrc.zsh");
+
+        let mut capture_file = std::fs::File::create(&capture_path).unwrap();
+        write!(capture_file, "{}", CAPTURE_ZSH).unwrap();
+        let mut perms = capture_file.metadata().unwrap().permissions();
+        perms.set_mode(ZSH_SCRIPT_PERMISSIONS);
+        capture_file.set_permissions(perms).unwrap();
+        drop(capture_file); // flush and close
+
+        let mut zptyrc_file = std::fs::File::create(&zptyrc_path).unwrap();
+        write!(zptyrc_file, "{}", ZPTYRC_ZSH).unwrap();
+        drop(zptyrc_file); // flush and close
+
+        let (tx, rx) = mpsc::channel(32);
+
+        let client_clone = client.clone();
+        tokio::spawn(Self::run_completion_daemon(capture_path, rx, client_clone));
 
         Backend {
             client,
             document_map: Arc::new(DashMap::new()),
             document_versions: Arc::new(DashMap::new()),
-            _temp_path: temp_path,
+            _temp_dir: temp_dir,
+            completion_tx: tx,
         }
     }
 
-    fn create_capture_script() -> std::io::Result<tempfile::TempPath> {
-        let mut temp_file = NamedTempFile::new()?;
-        write!(temp_file, "{}", CAPTURE_ZSH)?;
-        temp_file.flush()?;
+    async fn run_completion_daemon(
+        script_path: std::path::PathBuf,
+        mut rx: mpsc::Receiver<CompletionRequest>,
+        client: Client,
+    ) {
+        let mut child = tokio::process::Command::new(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("Failed to spawn completion daemon");
 
-        // Make executable
-        let mut perms = temp_file.as_file().metadata()?.permissions();
-        perms.set_mode(ZSH_SCRIPT_PERMISSIONS);
-        temp_file.as_file().set_permissions(perms)?;
+        let mut stdin = child.stdin.take().expect("Failed to open stdin");
+        let stdout = child.stdout.take().expect("Failed to open stdout");
+        let mut stderr = child.stderr.take().expect("Failed to open stderr");
 
-        // Return the temp path. It will be deleted when the TempPath is dropped (RAII).
-        Ok(temp_file.into_temp_path())
+        // Spawn stderr logger
+        let client_for_stderr = client.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(&mut stderr);
+            let mut line = String::new();
+            while let Ok(len) = reader.read_line(&mut line).await {
+                if len == 0 {
+                    break;
+                }
+                client_for_stderr
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("capture.zsh stderr: {}", line.trim_end()),
+                    )
+                    .await;
+                line.clear();
+            }
+        });
+
+        let mut stdout_reader = BufReader::new(stdout);
+
+        while let Some(req) = rx.recv().await {
+            // Send input message to daemon
+            let msg = format!("input:{}\n", req.prefix);
+            if let Err(e) = stdin.write_all(msg.as_bytes()).await {
+                let _ = req
+                    .responder
+                    .send(Err(format!("Failed to write to daemon: {}", e)));
+                continue;
+            }
+
+            // Read response until EOC
+            let mut items = Vec::new();
+            let mut line = String::new();
+            let mut error_msg = None;
+
+            loop {
+                line.clear();
+                match stdout_reader.read_line(&mut line).await {
+                    Ok(0) => {
+                        error_msg = Some("Daemon stdout closed unexpectedly".to_string());
+                        break;
+                    }
+                    Ok(_) => {
+                        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                        if trimmed.ends_with("\x01EOC\x01") {
+                            // Trim EOC marker from the end of the line if it was appended to a candidate,
+                            // otherwise it's on a line by itself.
+                            let content = trimmed.trim_end_matches("\x01EOC\x01");
+                            if !content.is_empty() {
+                                Self::parse_candidate_line(content, &mut items);
+                            }
+                            break;
+                        }
+                        if !trimmed.is_empty() {
+                            Self::parse_candidate_line(trimmed, &mut items);
+                        }
+                    }
+                    Err(e) => {
+                        error_msg = Some(format!("Error reading daemon stdout: {}", e));
+                        break;
+                    }
+                }
+            }
+
+            if let Some(err) = error_msg {
+                let _ = req.responder.send(Err(err));
+            } else {
+                let _ = req.responder.send(Ok(items));
+            }
+        }
+    }
+
+    fn parse_candidate_line(line: &str, items: &mut Vec<CompletionItem>) {
+        // ddc-source-shell_native style outputs `candidate\tdescription`
+        let parts: Vec<&str> = line.splitn(2, '\t').collect();
+        let label = parts[0].to_string();
+        let detail = if parts.len() > 1 && !parts[1].trim().is_empty() {
+            Some(parts[1].to_string())
+        } else {
+            None
+        };
+
+        items.push(CompletionItem {
+            label: label.clone(),
+            kind: Some(CompletionItemKind::TEXT),
+            insert_text: Some(label),
+            detail,
+            ..Default::default()
+        });
     }
 
     fn position_to_byte_offset(text: &str, position: Position) -> Option<usize> {
@@ -197,64 +318,46 @@ impl LanguageServer for Backend {
             text[line_start..offset].to_string()
         };
 
-        // Run capture.zsh
-        // Use tokio::try_join! or separate tasks if reading stderr/stdout simultaneously is needed for large outputs,
-        // but for simple cases verify if Output capture is enough.
-        // Using tokio::time::timeout to prevent hanging.
+        // Request completion from the daemon
         use tokio::time::{Duration, timeout};
-        let command_future = tokio::process::Command::new(&self._temp_path)
-            .arg(prefix)
-            .kill_on_drop(true)
-            .output();
+        let (tx, rx) = oneshot::channel();
+        let req = CompletionRequest {
+            prefix,
+            responder: tx,
+        };
 
-        let output_result = timeout(Duration::from_millis(3000), command_future).await;
+        if self.completion_tx.send(req).await.is_err() {
+            self.client
+                .log_message(
+                    MessageType::ERROR,
+                    "Failed to send request to completion daemon",
+                )
+                .await;
+            return Ok(None);
+        }
+
+        let output_result = timeout(Duration::from_millis(3000), rx).await;
 
         match output_result {
-            Ok(Ok(output)) => {
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    self.client
-                        .log_message(
-                            MessageType::ERROR,
-                            format!("capture.zsh failed: {}", stderr),
-                        )
-                        .await;
-                    return Ok(None);
-                }
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut items = Vec::new();
-                for line in stdout.lines() {
-                    // Parse line: "candidate -- description" or "candidate"
-                    let parts: Vec<&str> = line.splitn(2, " -- ").collect();
-                    let label = parts[0].to_string();
-                    let detail = if parts.len() > 1 {
-                        Some(parts[1].to_string())
-                    } else {
-                        None
-                    };
-
-                    items.push(CompletionItem {
-                        label: label.clone(),
-                        kind: Some(CompletionItemKind::TEXT),
-                        insert_text: Some(label),
-                        detail,
-                        ..Default::default()
-                    });
-                }
-                Ok(Some(CompletionResponse::Array(items)))
-            }
-            Ok(Err(e)) => {
+            Ok(Ok(Ok(items))) => Ok(Some(CompletionResponse::Array(items))),
+            Ok(Ok(Err(e))) => {
                 self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Failed to execute capture.zsh: {}", e),
-                    )
+                    .log_message(MessageType::ERROR, format!("Daemon returned error: {}", e))
+                    .await;
+                Ok(None)
+            }
+            Ok(Err(_)) => {
+                self.client
+                    .log_message(MessageType::ERROR, "Completion daemon responder dropped")
                     .await;
                 Ok(None)
             }
             Err(_) => {
                 self.client
-                    .log_message(MessageType::ERROR, "capture.zsh timed out".to_string())
+                    .log_message(
+                        MessageType::ERROR,
+                        "completion daemon timed out".to_string(),
+                    )
                     .await;
                 Ok(None)
             }
@@ -1169,23 +1272,6 @@ mod tests {
             .await
             .unwrap();
         // Success means it responded with Ok(()) which is null in JSON-RPC
-    }
-
-    #[test]
-    fn test_create_capture_script() {
-        let temp_path = Backend::create_capture_script().expect("Failed to create script");
-        assert!(temp_path.exists());
-        let metadata = std::fs::metadata(&temp_path).unwrap();
-        assert!(metadata.is_file());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert!(
-                metadata.permissions().mode() & 0o111 != 0,
-                "Script should be executable"
-            );
-        }
     }
 
     #[tokio::test]

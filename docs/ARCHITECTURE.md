@@ -21,49 +21,48 @@ The project consists of two main components:
 - **State Management**:
   - Maintains open documents in memory using `DashMap`.
   - Tracks document versions to handle out-of-order updates.
-- **Resource Lifecycle**:
-  - Manages the lifecycle of the embedded `capture.zsh` execution script,
-    ensuring it is created once at startup and cleaned up on shutdown.
-  - Uses `tempfile::TempPath` for automatic file deletion.
+- **Resource Lifecycle & Actor Pattern**:
+  - The embedded Zsh scripts (`capture.zsh` and `zptyrc.zsh`) are written to a temporary directory created on startup.
+  - A persistent background daemon is spawned via `tokio::spawn` to run `capture.zsh`.
+  - The `Backend` struct holds an `mpsc::Sender` channel to communicate with this daemon instead of spawning new processes.
 - **Synchronization**: Supports `TextDocumentSyncKind::INCREMENTAL`.
   - `didChange` events update the in-memory document state by applying changes
     to the byte offsets calculated from LSP `Position` (line/character).
 
-### 2. Completion Engine (`bin/capture.zsh`)
+### 2. Completion Engine (`bin/capture.zsh` and `bin/zptyrc.zsh`)
 
 This is the core logic for providing authentic Zsh completions.
 
-- **Embedding**: The script content is embedded into the Rust binary at compile
-  time using `include_str!("../bin/capture.zsh")`.
+- **Embedding**: The scripts are embedded into the Rust binary at compile
+  time using `include_str!`.
 - **Execution Flow**:
-  1. When the server starts, it creates a temporary file containing the
-     `capture.zsh` script and keeps its path.
-  2. For each `completion` request, the server determines the context (current
-     line/cursor position) from the document.
-  3. It executes the existing temporary script as a subprocess.
+  1. At startup, a temporary directory is created with `capture.zsh` and `zptyrc.zsh`.
+  2. The server spawns a persistent daemon running `capture.zsh`.
+  3. The daemon initializes an interactive Zsh session inside `zpty` using configurations from `zptyrc.zsh`.
+  4. It then enters an infinite loop, reading standard input for RPC-like messages (`input:<text>`).
 - **Mechanism**:
   - **`zpty`**: The script uses the `zsh/zpty` module to spawn a pseudo-terminal
-    session. This allows it to simulate an interactive Zsh environment.
-  - **Hooking**: It overrides the `compadd` builtin function. Instead of
+    session. This simulates an interactive Zsh environment.
+  - **Hooking**: It overrides the `compadd` builtin function in `zptyrc.zsh`. Instead of
     displaying completions to the user, the overridden `compadd` captures the raw
     candidates and descriptions passed by Zsh's completion system.
   - **Output**: The script prints the captured completion items to `stdout` in a
-    format parsed by the Rust server (e.g., `candidate -- description`).
+    tab-separated format (`candidate\tdescription`). The completion finishes with an EOC marker (`\x01EOC\x01`).
 
 ## Data Flow for Completion
 
 1. **Client**: Sends `textDocument/completion` with cursor position.
 2. **Server (Rust)**:
    - Extracts the relevant line or context from the in-memory document.
-   - Spawns a subprocess using the pre-created `capture.zsh` temp file:
-     `<temp_script> <prefix>`.
-3. **Subprocess (Zsh)**:
-   - Initializes a clean Zsh environment.
-   - Invokes Zsh completion system (`compinit`).
-   - Triggers completion for the provided context.
-   - `compadd` hook intercepts results.
-   - Prints results to `stdout`.
-4. **Server (Rust)**:
-   - Parses `stdout` from the subprocess.
-   - Converts lines into LSP `CompletionItem` objects.
-   - Returns the list to the Client.
+   - Sends a request (the prefix context and a `oneshot::Sender`) through the mpsc channel to the background daemon task.
+3. **Background Daemon Task (Rust)**:
+   - Writes `input:<prefix>` to the `stdin` of the running `capture.zsh` subprocess.
+   - Reads `stdout` lines from the subprocess until it sees the `\x01EOC\x01` marker.
+4. **Subprocess (Zsh within `zpty`)**:
+   - Triggers `Ctrl+U` to clear buffer, inputs the prefix, and simulates hitting `Tab` (`Ctrl+I`).
+   - `compadd` hook intercepts results, formatted as internal JSON-like strings.
+   - Prints results to `stdout`, terminating the output with `\x01EOC\x01`.
+5. **Server (Rust)**:
+   - Parses the tab-separated stdout lines into LSP `CompletionItem` objects.
+   - Returns the parsed result through the `oneshot` channel back to the LSP completion handler.
+   - Returns the final list to the Client.

@@ -2,152 +2,59 @@
 
 zmodload zsh/zpty || { echo 'error: missing module zsh/zpty' >&2; exit 1 }
 
-# spawn shell
-zpty z zsh -f -i
+local zpty_rcfile=${0:h}/zptyrc.zsh
+[[ -r $zpty_rcfile ]] || { echo "error: rcfile not found: $zpty_rcfile" >&2; exit 1; }
 
-# line buffer for pty output
-local line
+# Spawn shell with non-blocking (-b) output
+zpty -b z zsh --no-rcs --interactive
 
-setopt rcquotes
-() {
-    zpty -w z source $1
-    repeat 4; do
-        zpty -r z line
-        [[ $line == ok* ]] && return
-    done
-    echo 'error initializing.' >&2
-    exit 2
-} =( <<< '
-typeset -gx ZSHCS_CACHE_DIR=${ZSHCS_CACHE_DIR:-"${XDG_CACHE_HOME:-"$HOME/.cache"}/zshcs/zsh"}
+# Line buffer for pty output
+local line=
 
-mkdir -p "$ZSHCS_CACHE_DIR"
+# Initialize shell settings before processing
+zpty -w z "source ${(qq)zpty_rcfile} && echo ok || exit 2"
+zpty -r -m z line '*ok'$'\r' || { echo "error: pty initialization failure" >&2; exit 2 }
 
-# no prompt!
-PROMPT=
+# Constants
+MSG_CHDIR="chdir:"
+MSG_INPUT="input:"
 
-# load completion system
-autoload compinit
-compinit -u -d "$ZSHCS_CACHE_DIR/compdump"
+END_OF_COMPLETION=$'\n\x01EOC\x01\n'
 
-# never run a command
-bindkey ''^M'' undefined
-bindkey ''^J'' undefined
-bindkey ''^I'' complete-word
+ACCEPT_LINE=$'\C-J'
+COMPLETE_WORD=$'\C-I'
+KILL_BUFFER=$'\C-U'
+NULL_BYTE=$'\0'
 
-# send a line with null-byte at the end before and after completions are output
-null-line () {
-    echo -E - $''\0''
-}
-compprefuncs=( null-line )
-comppostfuncs=( null-line exit )
+# Main loop to read from stdin and process completion
+local message=
+local user_input=
+while true; do
+    IFS= read -r message || break
 
-# never group stuff!
-zstyle '':completion:*'' list-grouped false
-zstyle '':completion:*'' force-list always
-# don''t insert tab when attempting completion on empty line
-zstyle '':completion:*'' insert-tab false
-# no list separator, this saves some stripping later on
-zstyle '':completion:*'' list-separator ''''
-# for list even if too many
-zstyle '':completion:*'' list-prompt   ''''
-zstyle '':completion:*'' select-prompt ''''
-zstyle '':completion:*'' menu true
+    case $message in
+        $MSG_CHDIR*)
+            # Change the current working directory in the pty
+            local new_cwd=${message#$MSG_CHDIR}
+            zpty -w -n z "${KILL_BUFFER}cd ${(qq)new_cwd}${ACCEPT_LINE}"
+            continue
+            ;;
+        $MSG_INPUT*)
+            # Do completion
+            user_input=${message#$MSG_INPUT}
+            ;;
+        *)
+            echo "error: invalid message: $message" >&2
+            exit 1
+            ;;
+    esac
 
-# we use zparseopts
-zmodload zsh/zutil
+    # Trigger completion and send it to the pty
+    zpty -w -n z "${KILL_BUFFER}${user_input}${COMPLETE_WORD}"
 
-# override compadd (this our hook)
-compadd () {
+    # Completion results are output between null bytes
+    zpty -r -m z line "*${NULL_BYTE}*${NULL_BYTE}" || { echo "error: pty read failure" >&2; exit 1 }
+    echo -nE - "${${(@0)line}[2]}${END_OF_COMPLETION}"
 
-    # check if any of -O, -A or -D are given
-    if [[ ${@[1,(i)(-|--)]} == *-(O|A|D)\ * ]]; then
-        # if that is the case, just delegate and leave
-        builtin compadd "$@"
-        return $?
-    fi
-
-    # ok, this concerns us!
-    # echo -E - got this: "$@"
-
-    # be careful with namespacing here, we don''t want to mess with stuff that
-    # should be passed to compadd!
-    typeset -a __hits __dscr __tmp
-    integer i __d_idx=0
-
-    # do we have a description parameter?
-    # note we don''t use zparseopts here because of combined option parameters
-    # with arguments like -default- confuse it.
-    for (( i=1; i <= $#; i++ )); do
-        if [[ ${@[$i]} == -d ]]; then
-            __d_idx=$i
-            break
-        fi
-    done
-
-    if (( __d_idx )); then
-        # next param after -d
-        __tmp=${@[$__d_idx+1]}
-        # description can be given as an array parameter name, or inline () array
-        if [[ $__tmp == \(* ]]; then
-            eval "__dscr=$__tmp"
-        else
-            __dscr=( "${(@P)__tmp}" )
-        fi
-    fi
-
-    # capture completions by injecting -A parameter into the compadd call.
-    # this takes care of matching for us.
-    builtin compadd -A __hits -D __dscr "$@"
-
-    setopt localoptions norcexpandparam extendedglob
-
-    # extract prefixes and suffixes from compadd call. we can''t do zsh''s cool
-    # -r remove-func magic, but it''s better than nothing.
-    typeset -A apre hpre hsuf asuf
-    zparseopts -E P:=apre p:=hpre S:=asuf s:=hsuf
-
-    # append / to directories? we are only emulating -f in a half-assed way
-    # here, but it''s better than nothing.
-    integer dirsuf=0
-    # don''t be fooled by -default- >.>
-    if [[ -z $hsuf && "${${@//-default-/}% -# *}" == *-[[:alnum:]]#f* ]]; then
-        dirsuf=1
-    fi
-
-    # just drop
-    [[ -n $__hits ]] || return
-
-    # this is the point where we have all matches in $__hits and all
-    # descriptions in $__dscr!
-
-    # display all matches
-    local dsuf dscr
-    for i in {1..$#__hits}; do
-
-        # add a dir suffix?
-        (( dirsuf )) && [[ -d $__hits[$i] ]] && dsuf=/ || dsuf=
-        # description to be displayed afterwards
-        (( $#__dscr >= $i )) && dscr=" -- ${${__dscr[$i]}##$__hits[$i] #}" || dscr=
-
-        echo -E - "$IPREFIX$apre$hpre$__hits[$i]$dsuf$hsuf$asuf$dscr"
-
-    done
-
-}
-
-# signal success!
-echo ok')
-
-zpty -w z "$*"$'\t'
-
-integer tog=0
-# read from the pty, and parse linewise
-while zpty -r z; do :; done | while IFS= read -r line; do
-    if [[ $line == *$'\0\r' ]]; then
-        (( tog++ )) && return 0 || continue
-    fi
-    # display between toggles
-    (( tog )) && echo -E - "$line"
+    user_input=
 done
-
-return 2
