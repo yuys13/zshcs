@@ -20,8 +20,7 @@ jobs:
 
     - name: Set up Rust
       run: |
-        rustup --version
-        rustup component add clippy
+        rustup show
 
     - name: Cache dependencies
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
