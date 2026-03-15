@@ -31,19 +31,23 @@ struct Backend {
 
 impl Backend {
     fn new(client: Client) -> Self {
+        Self::new_with_scripts(client, CAPTURE_ZSH, ZPTYRC_ZSH)
+    }
+
+    fn new_with_scripts(client: Client, capture_script: &str, zptyrc_script: &str) -> Self {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir for zpty scripts");
         let capture_path = temp_dir.path().join("capture.zsh");
         let zptyrc_path = temp_dir.path().join("zptyrc.zsh");
 
         let mut capture_file = std::fs::File::create(&capture_path).unwrap();
-        write!(capture_file, "{}", CAPTURE_ZSH).unwrap();
+        write!(capture_file, "{}", capture_script).unwrap();
         let mut perms = capture_file.metadata().unwrap().permissions();
         perms.set_mode(ZSH_SCRIPT_PERMISSIONS);
         capture_file.set_permissions(perms).unwrap();
         drop(capture_file); // flush and close
 
         let mut zptyrc_file = std::fs::File::create(&zptyrc_path).unwrap();
-        write!(zptyrc_file, "{}", ZPTYRC_ZSH).unwrap();
+        write!(zptyrc_file, "{}", zptyrc_script).unwrap();
         drop(zptyrc_file); // flush and close
 
         let (tx, rx) = mpsc::channel(32);
@@ -637,6 +641,25 @@ mod tests {
     fn setup_server() -> (DuplexStream, tokio::task::JoinHandle<()>) {
         let (client_stream, server_stream) = tokio::io::duplex(4096);
         let (service, client_socket) = LspService::new(Backend::new);
+
+        let server_handle = tokio::spawn(async move {
+            let (server_read, server_write) = tokio::io::split(server_stream);
+            Server::new(server_read, server_write, client_socket)
+                .serve(service)
+                .await;
+        });
+
+        (client_stream, server_handle)
+    }
+
+    fn setup_server_with_scripts(
+        capture_script: &'static str,
+        zptyrc_script: &'static str,
+    ) -> (DuplexStream, tokio::task::JoinHandle<()>) {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let (service, client_socket) = LspService::new(move |client| {
+            Backend::new_with_scripts(client, capture_script, zptyrc_script)
+        });
 
         let server_handle = tokio::spawn(async move {
             let (server_read, server_write) = tokio::io::split(server_stream);
@@ -1398,6 +1421,104 @@ mod tests {
             has_detail,
             "Expected at least one completion item to have a description in detail field. Items: {items:?}"
         );
+    }
+
+    #[test]
+    fn test_parse_candidate_line() {
+        let mut items = Vec::new();
+
+        // 1. Only candidate without tab
+        Backend::parse_candidate_line("git status", &mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "git status");
+        assert_eq!(items[0].detail, None);
+
+        items.clear();
+
+        // 2. Candidate with tab and description
+        Backend::parse_candidate_line("status\tshow working tree status", &mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "status");
+        assert_eq!(items[0].detail.as_deref(), Some("show working tree status"));
+
+        items.clear();
+
+        // 3. Candidate with tab but empty or whitespace description
+        Backend::parse_candidate_line("status\t   ", &mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "status");
+        assert_eq!(items[0].detail, None);
+
+        items.clear();
+
+        // 4. Multiple tabs in description
+        Backend::parse_candidate_line("foo\tbar\tbaz", &mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "foo");
+        assert_eq!(items[0].detail.as_deref(), Some("bar\tbaz"));
+    }
+
+    #[tokio::test]
+    async fn test_daemon_crash_tolerance() {
+        // Mock capture script that exits immediately
+        let (mut client_stream, _server_handle) =
+            setup_server_with_scripts("#!/usr/bin/env zsh\nexit 1\n", "");
+        let mut test_client = TestClient::new(&mut client_stream);
+        let doc_uri = Url::parse("file:///crash.zsh").unwrap();
+        test_client.init_and_open(&doc_uri, "git ").await;
+
+        let res = test_client
+            .send_request::<request::Completion>(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
+                    position: Position::new(0, 4),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await;
+
+        // Expecting Ok(None) instead of crashing, because when daemon crashes, responder drops cleanly.
+        assert!(res.is_ok());
+        assert!(res.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_daemon_timeout() {
+        // Mock capture script that sleeps, preventing an immediate EOC response
+        let (mut client_stream, _server_handle) = setup_server_with_scripts(
+            "#!/usr/bin/env zsh\nwhile read -r p; do sleep 5; done\n",
+            "",
+        );
+        let mut test_client = TestClient::new(&mut client_stream);
+        let doc_uri = Url::parse("file:///timeout.zsh").unwrap();
+        test_client.init_and_open(&doc_uri, "git ").await;
+
+        let start = std::time::Instant::now();
+        let res = test_client
+            .send_request::<request::Completion>(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
+                    position: Position::new(0, 4),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await;
+
+        // The completion() handler uses a 3000ms timeout
+        let elapsed = start.elapsed().as_millis();
+        assert!(elapsed >= 3000, "Completion should wait for the timeout");
+
+        // Expecting Ok(None) because the request timed out.
+        assert!(res.is_ok());
+        assert!(res.unwrap().is_none());
     }
 
     fn get_completion_items(response: CompletionResponse) -> Vec<CompletionItem> {
