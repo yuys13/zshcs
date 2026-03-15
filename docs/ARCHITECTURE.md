@@ -60,7 +60,7 @@ This is the core logic for providing authentic Zsh completions.
    - Reads `stdout` lines from the subprocess until it sees the `\x01EOC\x01` marker.
 4. **Subprocess (Zsh within `zpty`)**:
    - Triggers `Ctrl+U` to clear buffer, inputs the prefix, and simulates hitting `Tab` (`Ctrl+I`).
-   - `compadd` hook intercepts results, formatted as internal JSON-like strings.
+   - `compadd` hook intercepts results, which are formatted as tab-separated values.
    - Prints results to `stdout`, terminating the output with `\x01EOC\x01`.
 5. **Server (Rust)**:
    - Parses the tab-separated stdout lines into LSP `CompletionItem` objects.
