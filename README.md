@@ -65,10 +65,11 @@ vim.lsp.enable("zshcs")
 `zshcs` consists of two main components:
 
 1. **LSP Server (Rust)**: Handles communication with the editor, document
-   synchronization, and Zsh process management.
-2. **Completion Engine (Zsh)**: An embedded `capture.zsh` script uses the `zpty`
-   module to simulate an interactive Zsh session and hooks the `compadd`
-   built-in to capture completion candidates.
+   synchronization, and spawning/communicating with the background Zsh daemon.
+2. **Completion Engine (Zsh)**: An embedded `capture.zsh` script runs as a persistent
+   background daemon. It uses the `zpty` module to simulate an interactive Zsh session
+   and hooks the `compadd` built-in to capture completion candidates efficiently without
+   the overhead of repeated initializations.
 
 For more details on the architecture, please refer to
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -104,5 +105,6 @@ cargo clippy --no-deps --all-targets -- -D warnings
 
 This project includes code derived from the following repositories, and we extend our gratitude to their original authors and contributors for their great work.
 
+- [ddc-source-shell_native](https://github.com/Shougo/ddc-source-shell_native)
 - [zsh-capture-completion](https://github.com/Valodim/zsh-capture-completion)
 - [deoplete-zsh](https://github.com/deoplete-plugins/deoplete-zsh)
