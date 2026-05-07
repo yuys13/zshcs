@@ -16,3 +16,11 @@ updates:
       patch:
         update-types:
           - "patch"
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      nix:
+        patterns:
+          - "*"
