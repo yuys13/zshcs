@@ -48,6 +48,7 @@
                 enable = true;
                 package = rustToolchain;
               };
+              yamlfmt.enable = true;
             };
           };
 
