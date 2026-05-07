@@ -1,50 +1,38 @@
 name: Rust CI
-
 permissions:
   contents: read
-
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-
 env:
   CARGO_TERM_COLOR: always
-
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-    - name: Set up Rust
-      run: |
-        rustup show
-
-    - name: Cache dependencies
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
-
-    - name: Check formatting
-      run: cargo fmt --check
-
-    - name: Run Clippy
-      run: cargo clippy --no-deps --all-targets -- -D warnings
-
-    - name: Build
-      run: cargo build
-
-    - name: Install dependencies for tests
-      run: | 
-        sudo apt-get install -y --no-install-recommends zsh
-
-    - name: Run tests
-      run: cargo test
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set up Rust
+        run: |
+          rustup show
+      - name: Cache dependencies
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run Clippy
+        run: cargo clippy --no-deps --all-targets -- -D warnings
+      - name: Build
+        run: cargo build
+      - name: Install dependencies for tests
+        run: |
+          sudo apt-get install -y --no-install-recommends zsh
+      - name: Run tests
+        run: cargo test
