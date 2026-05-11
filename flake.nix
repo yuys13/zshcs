@@ -61,7 +61,8 @@
             ];
 
             shellHook = ''
-              echo "Rust development environment loaded (flake-parts)"
+              echo "Rust development environment loaded"
+              cargo --version
             '';
           };
         };
