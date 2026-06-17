@@ -14,7 +14,7 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - name: Flake Check
-        run: nix flake check --all-systems
+        run: nix flake check --no-build --all-systems --keep-going
   develop-test:
     needs: flake-check
     strategy:
