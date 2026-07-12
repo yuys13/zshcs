@@ -1,5 +1,5 @@
 {
-  description = "A devShell for zshcs";
+  description = "zshcs - Zsh LSP server";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -50,6 +50,25 @@
               };
               yamlfmt.enable = true;
             };
+          };
+
+          packages.default = pkgs.rustPlatform.buildRustPackage {
+            pname = "zshcs";
+            version = "0.1.0";
+            src = pkgs.lib.cleanSource ./.;
+
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+
+            # Disable check phase because the tests launch a zsh subprocess
+            # using zpty, which requires pty access not available in the Nix sandbox.
+            doCheck = false;
+          };
+
+          apps.default = {
+            type = "app";
+            program = "${config.packages.default}/bin/zshcs";
           };
 
           devShells.default = pkgs.mkShell {
