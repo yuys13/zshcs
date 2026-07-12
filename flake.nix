@@ -55,23 +55,11 @@
           packages.default = pkgs.rustPlatform.buildRustPackage {
             pname = "zshcs";
             version = "0.1.0";
-            src = ./.;
+            src = pkgs.lib.cleanSource ./.;
 
             cargoLock = {
               lockFile = ./Cargo.lock;
             };
-
-            nativeBuildInputs = [
-              pkgs.pkg-config
-            ];
-
-            buildInputs = [
-              pkgs.openssl
-            ];
-
-            nativeCheckInputs = [
-              pkgs.zsh
-            ];
 
             # Disable check phase because the tests launch a zsh subprocess
             # using zpty, which requires pty access not available in the Nix sandbox.
