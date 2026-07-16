@@ -24,3 +24,7 @@ updates:
       nix:
         patterns:
           - "*"
+  - package-ecosystem: "rust-toolchain"
+    directory: "/"
+    schedule:
+      interval: "weekly"

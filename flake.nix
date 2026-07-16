@@ -38,6 +38,10 @@
             overlays = [ (import inputs.rust-overlay) ];
           };
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
         in
         {
           treefmt.config = {
@@ -52,7 +56,7 @@
             };
           };
 
-          packages.default = pkgs.rustPlatform.buildRustPackage {
+          packages.default = rustPlatform.buildRustPackage {
             pname = "zshcs";
             version = "0.1.0";
             src = pkgs.lib.cleanSource ./.;
