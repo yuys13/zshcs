@@ -8,8 +8,6 @@ updates:
       actions:
         patterns:
           - "*"
-    cooldown:
-      default-days: 1
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
