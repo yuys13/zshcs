@@ -65,9 +65,12 @@
               lockFile = ./Cargo.lock;
             };
 
-            # Disable check phase because the tests launch a zsh subprocess
-            # using zpty, which requires pty access not available in the Nix sandbox.
-            doCheck = false;
+            nativeBuildInputs = [ pkgs.zsh ];
+
+            preCheck = ''
+              export HOME=$TMPDIR
+            '';
+
           };
 
           apps.default = {
