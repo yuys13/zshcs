@@ -1,5 +1,5 @@
 {
-  description = "zshcs - Zsh LSP server";
+  description = "zshcs - Authentic Zsh completions for any LSP-compliant editor.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -76,6 +76,7 @@
           apps.default = {
             type = "app";
             program = "${config.packages.default}/bin/zshcs";
+            meta.description = "Authentic Zsh completions for any LSP-compliant editor.";
           };
 
           devShells.default = pkgs.mkShell {
