@@ -15,7 +15,7 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
       - name: Flake Check
         run: nix flake check --no-build --all-systems --keep-going
-  develop-test:
+  build:
     needs: flake-check
     strategy:
       matrix:
@@ -39,7 +39,7 @@ jobs:
       - name: Clippy
         run: nix develop --command cargo clippy --no-deps --all-targets -- -D warnings
       - name: Build
-        run: nix develop --command cargo build
+        run: nix develop --command cargo build --release
       - name: Run tests
         run: nix develop --command cargo test
       - name: Nix Build
