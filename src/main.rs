@@ -1,7 +1,6 @@
 use dashmap::DashMap;
 use serde_json::Value;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -13,7 +12,6 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
 const ZPTYRC_ZSH: &str = include_str!("../bin/zptyrc.zsh");
-const ZSH_SCRIPT_PERMISSIONS: u32 = 0o755;
 
 struct CompletionRequest {
     prefix: String,
@@ -41,9 +39,6 @@ impl Backend {
 
         let mut capture_file = std::fs::File::create(&capture_path).unwrap();
         write!(capture_file, "{}", capture_script).unwrap();
-        let mut perms = capture_file.metadata().unwrap().permissions();
-        perms.set_mode(ZSH_SCRIPT_PERMISSIONS);
-        capture_file.set_permissions(perms).unwrap();
         drop(capture_file); // flush and close
 
         let mut zptyrc_file = std::fs::File::create(&zptyrc_path).unwrap();
@@ -69,7 +64,8 @@ impl Backend {
         mut rx: mpsc::Receiver<CompletionRequest>,
         client: Client,
     ) {
-        let mut child = tokio::process::Command::new(&script_path)
+        let mut child = tokio::process::Command::new("zsh")
+            .arg(&script_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
