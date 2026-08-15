@@ -26,8 +26,12 @@ Development (TDD) as described by Kent Beck. This involves the following cycle:
 
 ## Project Structure
 
-- `src/main.rs`: The main entry point of the application. Contains LSP handlers
-  and integration tests.
+- `src/main.rs`: The main CLI entry point of the application.
+- `src/lib.rs`: The root library crate exposing modules.
+- `src/server.rs`: The LSP server backend implementing `LanguageServer`.
+- `src/completion.rs`: Completion daemon runner and candidate parser.
+- `src/document.rs`: Document position and byte offset utilities.
+- `tests/`: Integration tests for server lifecycle and completions.
 - `bin/capture.zsh`: The Zsh script used to hook into Zsh's completion system
   and capture candidates. Embedded and managed by the LSP server.
 - `docs/`: Contains project documentation, including architectural details.
