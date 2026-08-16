@@ -14,7 +14,7 @@ The project consists of two main components:
 
 ## Component Details
 
-### 1. LSP Server (`src/main.rs`)
+### 1. LSP Server (`src/server.rs`, `src/lib.rs`, `src/main.rs`)
 
 - **Library**: Built using `tower-lsp` to handle the Language Server Protocol
   communication.
