@@ -125,469 +125,338 @@ pub fn parse_candidate_line(line: &str, items: &mut Vec<CompletionItem>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn test_parse_candidate_line() {
+    #[rstest]
+    // 1. Only candidate without tab
+    #[case("git status", "git status", None)]
+    // 2. Candidate with tab and description
+    #[case(
+        "status\tshow working tree status",
+        "status",
+        Some("show working tree status")
+    )]
+    // 3. Candidate with tab but empty or whitespace description
+    #[case("status\t   ", "status", None)]
+    // 4. Multiple tabs in description
+    #[case("foo\tbar\tbaz", "foo", Some("bar\tbaz"))]
+    fn test_parse_candidate_line(
+        #[case] input: &str,
+        #[case] expected_label: &str,
+        #[case] expected_detail: Option<&str>,
+    ) {
         let mut items = Vec::new();
-
-        // 1. Only candidate without tab
-        parse_candidate_line("git status", &mut items);
+        parse_candidate_line(input, &mut items);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "git status");
-        assert_eq!(items[0].detail, None);
-
-        items.clear();
-
-        // 2. Candidate with tab and description
-        parse_candidate_line("status\tshow working tree status", &mut items);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "status");
-        assert_eq!(items[0].detail.as_deref(), Some("show working tree status"));
-
-        items.clear();
-
-        // 3. Candidate with tab but empty or whitespace description
-        parse_candidate_line("status\t   ", &mut items);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "status");
-        assert_eq!(items[0].detail, None);
-
-        items.clear();
-
-        // 4. Multiple tabs in description
-        parse_candidate_line("foo\tbar\tbaz", &mut items);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "foo");
-        assert_eq!(items[0].detail.as_deref(), Some("bar\tbaz"));
+        assert_eq!(items[0].label, expected_label);
+        assert_eq!(items[0].detail.as_deref(), expected_detail);
     }
 
-    #[test]
-    fn test_parse_candidate_line_empty_and_whitespace() {
+    #[rstest]
+    // 1. Empty string
+    #[case("", "", None, Some(""), Some(CompletionItemKind::TEXT))]
+    // 2. Whitespace only
+    #[case("   ", "   ", None, Some("   "), Some(CompletionItemKind::TEXT))]
+    // 3. Single tab only
+    #[case("\t", "", None, Some(""), Some(CompletionItemKind::TEXT))]
+    // 4. Tab with whitespace
+    #[case("\t   ", "", None, Some(""), Some(CompletionItemKind::TEXT))]
+    #[case("   \t   ", "   ", None, Some("   "), Some(CompletionItemKind::TEXT))]
+    // 5. Consecutive tabs only
+    #[case("\t\t", "", None, Some(""), Some(CompletionItemKind::TEXT))]
+    #[case("\t\t\t", "", None, Some(""), Some(CompletionItemKind::TEXT))]
+    // 6. Empty label with description
+    #[case(
+        "\tdescription only",
+        "",
+        Some("description only"),
+        Some(""),
+        Some(CompletionItemKind::TEXT)
+    )]
+    fn test_parse_candidate_line_empty_and_whitespace(
+        #[case] input: &str,
+        #[case] expected_label: &str,
+        #[case] expected_detail: Option<&str>,
+        #[case] expected_insert_text: Option<&str>,
+        #[case] expected_kind: Option<CompletionItemKind>,
+    ) {
         let mut items = Vec::new();
-
-        // 1. Empty string
-        parse_candidate_line("", &mut items);
+        parse_candidate_line(input, &mut items);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "");
-        assert_eq!(items[0].detail, None);
-        assert_eq!(items[0].insert_text.as_deref(), Some(""));
-        assert_eq!(items[0].kind, Some(CompletionItemKind::TEXT));
-
-        items.clear();
-
-        // 2. Whitespace only
-        parse_candidate_line("   ", &mut items);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "   ");
-        assert_eq!(items[0].detail, None);
-
-        items.clear();
-
-        // 3. Single tab only
-        parse_candidate_line("\t", &mut items);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "");
-        assert_eq!(items[0].detail, None);
-
-        items.clear();
-
-        // 4. Tab with whitespace
-        parse_candidate_line("\t   ", &mut items);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "");
-        assert_eq!(items[0].detail, None);
-
-        items.clear();
-
-        parse_candidate_line("   \t   ", &mut items);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "   ");
-        assert_eq!(items[0].detail, None);
-
-        items.clear();
-
-        // 5. Consecutive tabs only
-        parse_candidate_line("\t\t", &mut items);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "");
-        assert_eq!(items[0].detail, None);
-
-        items.clear();
-
-        parse_candidate_line("\t\t\t", &mut items);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "");
-        assert_eq!(items[0].detail, None);
-
-        items.clear();
-
-        // 6. Empty label with description
-        parse_candidate_line("\tdescription only", &mut items);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "");
-        assert_eq!(items[0].detail.as_deref(), Some("description only"));
+        assert_eq!(items[0].label, expected_label);
+        assert_eq!(items[0].detail.as_deref(), expected_detail);
+        assert_eq!(items[0].insert_text.as_deref(), expected_insert_text);
+        assert_eq!(items[0].kind, expected_kind);
     }
 
-    #[test]
-    fn test_parse_candidate_line_leading_trailing_spaces() {
+    #[rstest]
+    // Leading whitespace in label
+    #[case("  status\tdesc", "  status", Some("desc"))]
+    // Trailing whitespace in label
+    #[case("status  \tdesc", "status  ", Some("desc"))]
+    // Both leading and trailing in label
+    #[case("  cmd  \tdesc", "  cmd  ", Some("desc"))]
+    // Preserving leading and trailing spaces in detail
+    #[case(
+        "status\t  detailed description  ",
+        "status",
+        Some("  detailed description  ")
+    )]
+    // Trailing tab only
+    #[case("status\t", "status", None)]
+    // Without tab, spaces preserved
+    #[case("  leading and trailing  ", "  leading and trailing  ", None)]
+    fn test_parse_candidate_line_leading_trailing_spaces(
+        #[case] input: &str,
+        #[case] expected_label: &str,
+        #[case] expected_detail: Option<&str>,
+    ) {
         let mut items = Vec::new();
-
-        // Leading whitespace in label
-        parse_candidate_line("  status\tdesc", &mut items);
-        assert_eq!(items[0].label, "  status");
-        assert_eq!(items[0].detail.as_deref(), Some("desc"));
-
-        items.clear();
-
-        // Trailing whitespace in label
-        parse_candidate_line("status  \tdesc", &mut items);
-        assert_eq!(items[0].label, "status  ");
-        assert_eq!(items[0].detail.as_deref(), Some("desc"));
-
-        items.clear();
-
-        // Both leading and trailing in label
-        parse_candidate_line("  cmd  \tdesc", &mut items);
-        assert_eq!(items[0].label, "  cmd  ");
-        assert_eq!(items[0].detail.as_deref(), Some("desc"));
-
-        items.clear();
-
-        // Preserving leading and trailing spaces in detail
-        parse_candidate_line("status\t  detailed description  ", &mut items);
-        assert_eq!(items[0].label, "status");
-        assert_eq!(items[0].detail.as_deref(), Some("  detailed description  "));
-
-        items.clear();
-
-        // Trailing tab only
-        parse_candidate_line("status\t", &mut items);
-        assert_eq!(items[0].label, "status");
-        assert_eq!(items[0].detail, None);
-
-        items.clear();
-
-        // Without tab, spaces preserved
-        parse_candidate_line("  leading and trailing  ", &mut items);
-        assert_eq!(items[0].label, "  leading and trailing  ");
-        assert_eq!(items[0].detail, None);
-    }
-
-    #[test]
-    fn test_parse_candidate_line_tab_delimiters() {
-        let mut items = Vec::new();
-
-        // Consecutive tabs with description
-        parse_candidate_line("status\t\tdesc", &mut items);
+        parse_candidate_line(input, &mut items);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "status");
-        assert_eq!(items[0].detail.as_deref(), Some("\tdesc"));
+        assert_eq!(items[0].label, expected_label);
+        assert_eq!(items[0].detail.as_deref(), expected_detail);
+    }
 
-        items.clear();
-
-        // Multiple tabs in description
-        parse_candidate_line("part1\tpart2\tpart3", &mut items);
+    #[rstest]
+    // Consecutive tabs with description
+    #[case("status\t\tdesc", "status", Some("\tdesc"))]
+    // Multiple tabs in description
+    #[case("part1\tpart2\tpart3", "part1", Some("part2\tpart3"))]
+    // Many tabs in description
+    #[case("cmd\topt1\topt2\topt3\topt4", "cmd", Some("opt1\topt2\topt3\topt4"))]
+    fn test_parse_candidate_line_tab_delimiters(
+        #[case] input: &str,
+        #[case] expected_label: &str,
+        #[case] expected_detail: Option<&str>,
+    ) {
+        let mut items = Vec::new();
+        parse_candidate_line(input, &mut items);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "part1");
-        assert_eq!(items[0].detail.as_deref(), Some("part2\tpart3"));
+        assert_eq!(items[0].label, expected_label);
+        assert_eq!(items[0].detail.as_deref(), expected_detail);
+    }
 
-        items.clear();
-
-        // Many tabs in description
-        parse_candidate_line("cmd\topt1\topt2\topt3\topt4", &mut items);
+    #[rstest]
+    // Double and single quotes
+    #[case(
+        "\"double quoted\"\t'single quoted' desc",
+        "\"double quoted\"",
+        Some("'single quoted' desc")
+    )]
+    // Backslashes
+    #[case("path\\to\\file\tdesc\\path", "path\\to\\file", Some("desc\\path"))]
+    // Escaped quotes
+    #[case("escaped\\\"quote\\\"\tdesc", "escaped\\\"quote\\\"", Some("desc"))]
+    // Single quote label, double quote desc
+    #[case("'single'\t\"double\"", "'single'", Some("\"double\""))]
+    fn test_parse_candidate_line_quotes_and_escapes(
+        #[case] input: &str,
+        #[case] expected_label: &str,
+        #[case] expected_detail: Option<&str>,
+    ) {
+        let mut items = Vec::new();
+        parse_candidate_line(input, &mut items);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "cmd");
-        assert_eq!(items[0].detail.as_deref(), Some("opt1\topt2\topt3\topt4"));
+        assert_eq!(items[0].label, expected_label);
+        assert_eq!(items[0].detail.as_deref(), expected_detail);
     }
 
-    #[test]
-    fn test_parse_candidate_line_quotes_and_escapes() {
+    #[rstest]
+    // Environment variables and parameter expansions
+    #[case("$VAR\tenvironment variable", "$VAR", Some("environment variable"))]
+    #[case(
+        "${VAR:-default}\tparameter expansion",
+        "${VAR:-default}",
+        Some("parameter expansion")
+    )]
+    // Globs and braces
+    #[case("*.tar.gz\tglob pattern", "*.tar.gz", Some("glob pattern"))]
+    #[case("{a,b,c}\tbrace expansion", "{a,b,c}", Some("brace expansion"))]
+    #[case("[0-9]*.txt\trange glob", "[0-9]*.txt", Some("range glob"))]
+    // Pipes, redirects, and background
+    #[case("cmd1 | cmd2\tpipeline", "cmd1 | cmd2", Some("pipeline"))]
+    #[case("cmd &\tbackground", "cmd &", Some("background"))]
+    #[case("cmd1; cmd2\tseparator", "cmd1; cmd2", Some("separator"))]
+    #[case("cmd1 && cmd2\tand operator", "cmd1 && cmd2", Some("and operator"))]
+    #[case(">out.log\tredirect stdout", ">out.log", Some("redirect stdout"))]
+    #[case("2>&1\tredirect stderr", "2>&1", Some("redirect stderr"))]
+    // Subshells and process substitution
+    #[case("<(cmd)\tprocess substitution", "<(cmd)", Some("process substitution"))]
+    #[case("$(whoami)\tsubshell", "$(whoami)", Some("subshell"))]
+    #[case("`pwd`\tbacktick", "`pwd`", Some("backtick"))]
+    // Flags and options
+    #[case("-o:fmt\tcolon flag", "-o:fmt", Some("colon flag"))]
+    #[case("--opt=val\tequals flag", "--opt=val", Some("equals flag"))]
+    #[case("~/.zshrc\ttilde path", "~/.zshrc", Some("tilde path"))]
+    fn test_parse_candidate_line_shell_metacharacters(
+        #[case] input: &str,
+        #[case] expected_label: &str,
+        #[case] expected_detail: Option<&str>,
+    ) {
         let mut items = Vec::new();
-
-        // Double and single quotes
-        parse_candidate_line("\"double quoted\"\t'single quoted' desc", &mut items);
-        assert_eq!(items[0].label, "\"double quoted\"");
-        assert_eq!(items[0].detail.as_deref(), Some("'single quoted' desc"));
-
-        items.clear();
-
-        // Backslashes
-        parse_candidate_line("path\\to\\file\tdesc\\path", &mut items);
-        assert_eq!(items[0].label, "path\\to\\file");
-        assert_eq!(items[0].detail.as_deref(), Some("desc\\path"));
-
-        items.clear();
-
-        // Escaped quotes
-        parse_candidate_line("escaped\\\"quote\\\"\tdesc", &mut items);
-        assert_eq!(items[0].label, "escaped\\\"quote\\\"");
-        assert_eq!(items[0].detail.as_deref(), Some("desc"));
-
-        items.clear();
-
-        // Single quote label, double quote desc
-        parse_candidate_line("'single'\t\"double\"", &mut items);
-        assert_eq!(items[0].label, "'single'");
-        assert_eq!(items[0].detail.as_deref(), Some("\"double\""));
+        parse_candidate_line(input, &mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, expected_label);
+        assert_eq!(items[0].detail.as_deref(), expected_detail);
     }
 
-    #[test]
-    fn test_parse_candidate_line_shell_metacharacters() {
+    #[rstest]
+    // ANSI color in label
+    #[case(
+        "\x1b[32m--verbose\x1b[0m\tenable verbose",
+        "\x1b[32m--verbose\x1b[0m",
+        Some("enable verbose")
+    )]
+    // ANSI color in detail
+    #[case(
+        "--color\t\x1b[1mcolored description\x1b[0m",
+        "--color",
+        Some("\x1b[1mcolored description\x1b[0m")
+    )]
+    // Protocol control character literal
+    #[case("\x01EOC\x01\tmarker in label", "\x01EOC\x01", Some("marker in label"))]
+    fn test_parse_candidate_line_ansi_escapes(
+        #[case] input: &str,
+        #[case] expected_label: &str,
+        #[case] expected_detail: Option<&str>,
+    ) {
         let mut items = Vec::new();
-
-        // Environment variables and parameter expansions
-        parse_candidate_line("$VAR\tenvironment variable", &mut items);
-        assert_eq!(items[0].label, "$VAR");
-        assert_eq!(items[0].detail.as_deref(), Some("environment variable"));
-
-        items.clear();
-
-        parse_candidate_line("${VAR:-default}\tparameter expansion", &mut items);
-        assert_eq!(items[0].label, "${VAR:-default}");
-        assert_eq!(items[0].detail.as_deref(), Some("parameter expansion"));
-
-        items.clear();
-
-        // Globs and braces
-        parse_candidate_line("*.tar.gz\tglob pattern", &mut items);
-        assert_eq!(items[0].label, "*.tar.gz");
-        assert_eq!(items[0].detail.as_deref(), Some("glob pattern"));
-
-        items.clear();
-
-        parse_candidate_line("{a,b,c}\tbrace expansion", &mut items);
-        assert_eq!(items[0].label, "{a,b,c}");
-        assert_eq!(items[0].detail.as_deref(), Some("brace expansion"));
-
-        items.clear();
-
-        parse_candidate_line("[0-9]*.txt\trange glob", &mut items);
-        assert_eq!(items[0].label, "[0-9]*.txt");
-        assert_eq!(items[0].detail.as_deref(), Some("range glob"));
-
-        items.clear();
-
-        // Pipes, redirects, and background
-        parse_candidate_line("cmd1 | cmd2\tpipeline", &mut items);
-        assert_eq!(items[0].label, "cmd1 | cmd2");
-        assert_eq!(items[0].detail.as_deref(), Some("pipeline"));
-
-        items.clear();
-
-        parse_candidate_line("cmd &\tbackground", &mut items);
-        assert_eq!(items[0].label, "cmd &");
-        assert_eq!(items[0].detail.as_deref(), Some("background"));
-
-        items.clear();
-
-        parse_candidate_line("cmd1; cmd2\tseparator", &mut items);
-        assert_eq!(items[0].label, "cmd1; cmd2");
-        assert_eq!(items[0].detail.as_deref(), Some("separator"));
-
-        items.clear();
-
-        parse_candidate_line("cmd1 && cmd2\tand operator", &mut items);
-        assert_eq!(items[0].label, "cmd1 && cmd2");
-        assert_eq!(items[0].detail.as_deref(), Some("and operator"));
-
-        items.clear();
-
-        parse_candidate_line(">out.log\tredirect stdout", &mut items);
-        assert_eq!(items[0].label, ">out.log");
-        assert_eq!(items[0].detail.as_deref(), Some("redirect stdout"));
-
-        items.clear();
-
-        parse_candidate_line("2>&1\tredirect stderr", &mut items);
-        assert_eq!(items[0].label, "2>&1");
-        assert_eq!(items[0].detail.as_deref(), Some("redirect stderr"));
-
-        items.clear();
-
-        // Subshells and process substitution
-        parse_candidate_line("<(cmd)\tprocess substitution", &mut items);
-        assert_eq!(items[0].label, "<(cmd)");
-        assert_eq!(items[0].detail.as_deref(), Some("process substitution"));
-
-        items.clear();
-
-        parse_candidate_line("$(whoami)\tsubshell", &mut items);
-        assert_eq!(items[0].label, "$(whoami)");
-        assert_eq!(items[0].detail.as_deref(), Some("subshell"));
-
-        items.clear();
-
-        parse_candidate_line("`pwd`\tbacktick", &mut items);
-        assert_eq!(items[0].label, "`pwd`");
-        assert_eq!(items[0].detail.as_deref(), Some("backtick"));
-
-        items.clear();
-
-        // Flags and options
-        parse_candidate_line("-o:fmt\tcolon flag", &mut items);
-        assert_eq!(items[0].label, "-o:fmt");
-        assert_eq!(items[0].detail.as_deref(), Some("colon flag"));
-
-        items.clear();
-
-        parse_candidate_line("--opt=val\tequals flag", &mut items);
-        assert_eq!(items[0].label, "--opt=val");
-        assert_eq!(items[0].detail.as_deref(), Some("equals flag"));
-
-        items.clear();
-
-        parse_candidate_line("~/.zshrc\ttilde path", &mut items);
-        assert_eq!(items[0].label, "~/.zshrc");
-        assert_eq!(items[0].detail.as_deref(), Some("tilde path"));
+        parse_candidate_line(input, &mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, expected_label);
+        assert_eq!(items[0].detail.as_deref(), expected_detail);
     }
 
-    #[test]
-    fn test_parse_candidate_line_ansi_escapes() {
+    #[rstest]
+    // CJK Japanese
+    #[case("コミット\t変更内容を記録する", "コミット", Some("変更内容を記録する"))]
+    #[case("設定ファイル.zsh\t設定の概要", "設定ファイル.zsh", Some("設定の概要"))]
+    // CJK Chinese
+    #[case("分支\t显示分支列表", "分支", Some("显示分支列表"))]
+    // CJK Korean
+    #[case("커밋\t커밋 생성", "커밋", Some("커밋 생성"))]
+    // Emojis with ZWJ and skin tones
+    #[case("✨ feat\t新機能の追加", "✨ feat", Some("新機能の追加"))]
+    #[case("🚀 deploy\tデプロイ実行", "🚀 deploy", Some("デプロイ実行"))]
+    #[case("👨‍👩‍👧‍👦 family\t家族絵文字", "👨‍👩‍👧‍👦 family", Some("家族絵文字"))]
+    #[case(
+        "👍🏽 thumbs_up\tskin tone emoji",
+        "👍🏽 thumbs_up",
+        Some("skin tone emoji")
+    )]
+    // Accents
+    #[case("café\tFrench cafe", "café", Some("French cafe"))]
+    #[case(
+        "üñîçødé\tcombining and accents",
+        "üñîçødé",
+        Some("combining and accents")
+    )]
+    // RTL
+    #[case("مرحبا\tArabic greeting", "مرحبا", Some("Arabic greeting"))]
+    #[case("שלום\tHebrew greeting", "שלום", Some("Hebrew greeting"))]
+    fn test_parse_candidate_line_multibyte_and_unicode(
+        #[case] input: &str,
+        #[case] expected_label: &str,
+        #[case] expected_detail: Option<&str>,
+    ) {
         let mut items = Vec::new();
-
-        // ANSI color in label
-        parse_candidate_line("\x1b[32m--verbose\x1b[0m\tenable verbose", &mut items);
-        assert_eq!(items[0].label, "\x1b[32m--verbose\x1b[0m");
-        assert_eq!(items[0].detail.as_deref(), Some("enable verbose"));
-
-        items.clear();
-
-        // ANSI color in detail
-        parse_candidate_line("--color\t\x1b[1mcolored description\x1b[0m", &mut items);
-        assert_eq!(items[0].label, "--color");
-        assert_eq!(
-            items[0].detail.as_deref(),
-            Some("\x1b[1mcolored description\x1b[0m")
-        );
-
-        items.clear();
-
-        // Protocol control character literal
-        parse_candidate_line("\x01EOC\x01\tmarker in label", &mut items);
-        assert_eq!(items[0].label, "\x01EOC\x01");
-        assert_eq!(items[0].detail.as_deref(), Some("marker in label"));
+        parse_candidate_line(input, &mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, expected_label);
+        assert_eq!(items[0].detail.as_deref(), expected_detail);
     }
 
-    #[test]
-    fn test_parse_candidate_line_multibyte_and_unicode() {
+    #[rstest]
+    #[case(10_000, 10_000)]
+    #[case(10_000, 0)]
+    #[case(10, 50_000)]
+    fn test_parse_candidate_line_extremely_long(
+        #[case] label_len: usize,
+        #[case] detail_len: usize,
+    ) {
         let mut items = Vec::new();
-
-        // CJK Japanese
-        parse_candidate_line("コミット\t変更内容を記録する", &mut items);
-        assert_eq!(items[0].label, "コミット");
-        assert_eq!(items[0].detail.as_deref(), Some("変更内容を記録する"));
-
-        items.clear();
-
-        parse_candidate_line("設定ファイル.zsh\t設定の概要", &mut items);
-        assert_eq!(items[0].label, "設定ファイル.zsh");
-        assert_eq!(items[0].detail.as_deref(), Some("設定の概要"));
-
-        items.clear();
-
-        // CJK Chinese
-        parse_candidate_line("分支\t显示分支列表", &mut items);
-        assert_eq!(items[0].label, "分支");
-        assert_eq!(items[0].detail.as_deref(), Some("显示分支列表"));
-
-        items.clear();
-
-        // CJK Korean
-        parse_candidate_line("커밋\t커밋 생성", &mut items);
-        assert_eq!(items[0].label, "커밋");
-        assert_eq!(items[0].detail.as_deref(), Some("커밋 생성"));
-
-        items.clear();
-
-        // Emojis with ZWJ and skin tones
-        parse_candidate_line("✨ feat\t新機能の追加", &mut items);
-        assert_eq!(items[0].label, "✨ feat");
-        assert_eq!(items[0].detail.as_deref(), Some("新機能の追加"));
-
-        items.clear();
-
-        parse_candidate_line("🚀 deploy\tデプロイ実行", &mut items);
-        assert_eq!(items[0].label, "🚀 deploy");
-        assert_eq!(items[0].detail.as_deref(), Some("デプロイ実行"));
-
-        items.clear();
-
-        parse_candidate_line("👨‍👩‍👧‍👦 family\t家族絵文字", &mut items);
-        assert_eq!(items[0].label, "👨‍👩‍👧‍👦 family");
-        assert_eq!(items[0].detail.as_deref(), Some("家族絵文字"));
-
-        items.clear();
-
-        parse_candidate_line("👍🏽 thumbs_up\tskin tone emoji", &mut items);
-        assert_eq!(items[0].label, "👍🏽 thumbs_up");
-        assert_eq!(items[0].detail.as_deref(), Some("skin tone emoji"));
-
-        items.clear();
-
-        // Accents
-        parse_candidate_line("café\tFrench cafe", &mut items);
-        assert_eq!(items[0].label, "café");
-        assert_eq!(items[0].detail.as_deref(), Some("French cafe"));
-
-        items.clear();
-
-        parse_candidate_line("üñîçødé\tcombining and accents", &mut items);
-        assert_eq!(items[0].label, "üñîçødé");
-        assert_eq!(items[0].detail.as_deref(), Some("combining and accents"));
-
-        items.clear();
-
-        // RTL
-        parse_candidate_line("مرحبا\tArabic greeting", &mut items);
-        assert_eq!(items[0].label, "مرحبا");
-        assert_eq!(items[0].detail.as_deref(), Some("Arabic greeting"));
-
-        items.clear();
-
-        parse_candidate_line("שלום\tHebrew greeting", &mut items);
-        assert_eq!(items[0].label, "שלום");
-        assert_eq!(items[0].detail.as_deref(), Some("Hebrew greeting"));
-    }
-
-    #[test]
-    fn test_parse_candidate_line_extremely_long() {
-        let mut items = Vec::new();
-        let long_label = "a".repeat(10_000);
-        let long_detail = "b".repeat(10_000);
-        let line = format!("{}\t{}", long_label, long_detail);
+        let long_label = "a".repeat(label_len);
+        let line = if detail_len > 0 {
+            let long_detail = "b".repeat(detail_len);
+            format!("{}\t{}", long_label, long_detail)
+        } else {
+            long_label.clone()
+        };
 
         parse_candidate_line(&line, &mut items);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label.len(), 10_000);
+        assert_eq!(items[0].label.len(), label_len);
         assert_eq!(items[0].label, long_label);
-        assert_eq!(items[0].detail.as_deref(), Some(long_detail.as_str()));
+        if detail_len > 0 {
+            assert_eq!(items[0].detail.as_ref().map(|s| s.len()), Some(detail_len));
+        } else {
+            assert_eq!(items[0].detail, None);
+        }
     }
 
-    #[test]
-    fn test_parse_candidate_line_item_properties() {
+    #[rstest]
+    #[case(
+        "checkout\tswitch branch",
+        "checkout",
+        Some(CompletionItemKind::TEXT),
+        Some("checkout"),
+        Some("switch branch")
+    )]
+    #[case(
+        "commit",
+        "commit",
+        Some(CompletionItemKind::TEXT),
+        Some("commit"),
+        None
+    )]
+    #[case(
+        "--help\tshow help",
+        "--help",
+        Some(CompletionItemKind::TEXT),
+        Some("--help"),
+        Some("show help")
+    )]
+    fn test_parse_candidate_line_item_properties(
+        #[case] input: &str,
+        #[case] expected_label: &str,
+        #[case] expected_kind: Option<CompletionItemKind>,
+        #[case] expected_insert_text: Option<&str>,
+        #[case] expected_detail: Option<&str>,
+    ) {
         let mut items = Vec::new();
-        parse_candidate_line("checkout\tswitch branch", &mut items);
+        parse_candidate_line(input, &mut items);
         assert_eq!(items.len(), 1);
         let item = &items[0];
-        assert_eq!(item.label, "checkout");
-        assert_eq!(item.kind, Some(CompletionItemKind::TEXT));
-        assert_eq!(item.insert_text.as_deref(), Some("checkout"));
-        assert_eq!(item.detail.as_deref(), Some("switch branch"));
+        assert_eq!(item.label, expected_label);
+        assert_eq!(item.kind, expected_kind);
+        assert_eq!(item.insert_text.as_deref(), expected_insert_text);
+        assert_eq!(item.detail.as_deref(), expected_detail);
     }
 
-    #[test]
-    fn test_parse_candidate_line_accumulation() {
+    #[rstest]
+    #[case(&[], &[])]
+    #[case(&["single\tonly"], &[("single", Some("only"))])]
+    #[case(
+        &["first\tdesc1", "second\tdesc2", "third"],
+        &[("first", Some("desc1")), ("second", Some("desc2")), ("third", None)]
+    )]
+    #[case(
+        &["--flag\toption", "-v\tverbose", "subcmd"],
+        &[("--flag", Some("option")), ("-v", Some("verbose")), ("subcmd", None)]
+    )]
+    fn test_parse_candidate_line_accumulation(
+        #[case] inputs: &[&str],
+        #[case] expected: &[(&str, Option<&str>)],
+    ) {
         let mut items = Vec::new();
-        parse_candidate_line("first\tdesc1", &mut items);
-        parse_candidate_line("second\tdesc2", &mut items);
-        parse_candidate_line("third", &mut items);
-
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].label, "first");
-        assert_eq!(items[0].detail.as_deref(), Some("desc1"));
-        assert_eq!(items[1].label, "second");
-        assert_eq!(items[1].detail.as_deref(), Some("desc2"));
-        assert_eq!(items[2].label, "third");
-        assert_eq!(items[2].detail, None);
+        for input in inputs {
+            parse_candidate_line(input, &mut items);
+        }
+        assert_eq!(items.len(), expected.len());
+        for (item, &(exp_label, exp_detail)) in items.iter().zip(expected.iter()) {
+            assert_eq!(item.label, exp_label);
+            assert_eq!(item.detail.as_deref(), exp_detail);
+        }
     }
 }

@@ -12,3 +12,6 @@ lsp-types = "0.97" # Added to reference types in test code
 futures = "0.3" # Added for asynchronous processing in tests
 dashmap = "6.2.1"
 tempfile = "3.27.0"
+
+[dev-dependencies]
+rstest = "0.25.0"
