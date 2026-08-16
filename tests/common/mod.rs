@@ -245,6 +245,14 @@ impl<'a> TestClient<'a> {
     }
 }
 
+pub const MOCK_DUMMY_CAPTURE: &str =
+    "#!/bin/zsh\nwhile read -r line; do\n  printf \"status\\tshow status\\x01EOC\\x01\\n\"\ndone\n";
+pub const MOCK_DUMMY_ZPTYRC: &str = "";
+
+pub fn setup_server_mock() -> (DuplexStream, tokio::task::JoinHandle<()>) {
+    setup_server_with_scripts(MOCK_DUMMY_CAPTURE, MOCK_DUMMY_ZPTYRC)
+}
+
 pub fn setup_server() -> (DuplexStream, tokio::task::JoinHandle<()>) {
     let (client_stream, server_stream) = tokio::io::duplex(4096);
     let (service, client_socket) = LspService::new(Backend::new);

@@ -1,6 +1,6 @@
 mod common;
 
-use common::{TestClient, setup_server};
+use common::{TestClient, setup_server_mock as setup_server};
 use tower_lsp::lsp_types::{
     ClientCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
     ExecuteCommandParams, InitializeParams, InitializeResult, InitializedParams, LogMessageParams,

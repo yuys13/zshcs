@@ -316,7 +316,7 @@ done
 #[tokio::test]
 async fn test_stress_rapid_interleaved_sync_and_completion_burst() {
     // Single client performing rapid back-to-back edits and completions
-    let (mut client_stream, _server_handle) = common::setup_server();
+    let (mut client_stream, _server_handle) = common::setup_server_mock();
     let mut test_client = common::TestClient::new(&mut client_stream);
 
     let doc_uri = Url::parse("file:///burst_interleaved.zsh").unwrap();
@@ -402,7 +402,7 @@ done
 
 #[tokio::test]
 async fn test_stress_multi_document_concurrent_edits() {
-    let (mut client_stream, _server_handle) = common::setup_server();
+    let (mut client_stream, _server_handle) = common::setup_server_mock();
     let mut test_client = common::TestClient::new(&mut client_stream);
 
     let doc_a = Url::parse("file:///concurrent_doc_a.zsh").unwrap();
@@ -740,7 +740,7 @@ fn test_fuzz_position_to_byte_offset_invariants() {
 
 #[tokio::test]
 async fn test_stress_did_change_random_incremental_edits_fuzz() {
-    let (mut client_stream, _server_handle) = common::setup_server();
+    let (mut client_stream, _server_handle) = common::setup_server_mock();
     let mut test_client = common::TestClient::new(&mut client_stream);
 
     let doc_uri = Url::parse("file:///fuzz_incremental.zsh").unwrap();
@@ -832,7 +832,7 @@ async fn test_stress_did_change_random_incremental_edits_fuzz() {
 
 #[tokio::test]
 async fn test_stress_did_change_malformed_ranges_and_split_surrogates() {
-    let (mut client_stream, _server_handle) = common::setup_server();
+    let (mut client_stream, _server_handle) = common::setup_server_mock();
     let mut test_client = common::TestClient::new(&mut client_stream);
 
     let doc_uri = Url::parse("file:///malformed_ranges.zsh").unwrap();

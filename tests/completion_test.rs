@@ -570,7 +570,10 @@ done
 
 #[tokio::test]
 async fn test_completion_unopened_document() {
-    let (mut client_stream, _server_handle) = setup_server();
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(
+        "#!/bin/zsh\nwhile read -r line; do\n  printf \"\\x01EOC\\x01\\n\"\ndone\n",
+        "",
+    );
     let mut test_client = common::TestClient::new(&mut client_stream);
 
     let initialize_params = tower_lsp::lsp_types::InitializeParams::default();
@@ -603,7 +606,10 @@ async fn test_completion_unopened_document() {
 
 #[tokio::test]
 async fn test_completion_out_of_bounds_position() {
-    let (mut client_stream, _server_handle) = setup_server();
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(
+        "#!/bin/zsh\nwhile read -r line; do\n  printf \"\\x01EOC\\x01\\n\"\ndone\n",
+        "",
+    );
     let mut test_client = common::TestClient::new(&mut client_stream);
 
     let doc_uri = Url::parse("file:///out_of_bounds.zsh").unwrap();
@@ -812,10 +818,16 @@ async fn test_completion_crlf_document() {
 
 #[tokio::test]
 async fn test_completion_concurrent_requests() {
+    let mock_capture = r#"#!/bin/zsh
+while read -r line; do
+  printf "status\tshow working tree status\x01EOC\x01\n"
+done
+"#;
     let handles: Vec<_> = (0..5)
         .map(|i| {
             tokio::spawn(async move {
-                let (mut client_stream, _server_handle) = setup_server();
+                let (mut client_stream, _server_handle) =
+                    setup_server_with_scripts(mock_capture, "");
                 let mut test_client = common::TestClient::new(&mut client_stream);
                 let doc_uri = Url::parse(&format!("file:///concurrent_{i}.zsh")).unwrap();
                 test_client.init_and_open(&doc_uri, "git s").await;
