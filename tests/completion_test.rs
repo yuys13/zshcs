@@ -222,3 +222,637 @@ async fn test_daemon_timeout() {
     assert!(res.is_ok());
     assert!(res.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn test_completion_mock_empty_candidates() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    printf "\x01EOC\x01\n"
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///empty_cand.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "some_cmd ").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 9),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert!(items.is_empty(), "Expected empty candidates list");
+}
+
+#[tokio::test]
+async fn test_completion_mock_mixed_formats() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    printf "status\tShow working tree status\n"
+    printf "add\n"
+    printf "commit\tRecord changes to repository\n"
+    printf "diff\n"
+    printf "\x01EOC\x01\n"
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///mixed_formats.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git ").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[0].label, "status");
+    assert_eq!(items[0].detail.as_deref(), Some("Show working tree status"));
+    assert_eq!(items[1].label, "add");
+    assert_eq!(items[1].detail, None);
+    assert_eq!(items[2].label, "commit");
+    assert_eq!(
+        items[2].detail.as_deref(),
+        Some("Record changes to repository")
+    );
+    assert_eq!(items[3].label, "diff");
+    assert_eq!(items[3].detail, None);
+}
+
+#[tokio::test]
+async fn test_completion_mock_inline_eoc() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    printf "status\tShow status\n"
+    printf "branch\tList branches\x01EOC\x01\n"
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///inline_eoc.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git ").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].label, "status");
+    assert_eq!(items[0].detail.as_deref(), Some("Show status"));
+    assert_eq!(items[1].label, "branch");
+    assert_eq!(items[1].detail.as_deref(), Some("List branches"));
+}
+
+#[tokio::test]
+async fn test_completion_mock_blank_lines_and_crlf() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    printf "\r\n"
+    printf "status\tShow status\r\n"
+    printf "\r\n\r\n"
+    printf "log\tShow commit logs\r\n"
+    printf "\r\n"
+    printf "\x01EOC\x01\r\n"
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///crlf_mock.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git ").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].label, "status");
+    assert_eq!(items[0].detail.as_deref(), Some("Show status"));
+    assert_eq!(items[1].label, "log");
+    assert_eq!(items[1].detail.as_deref(), Some("Show commit logs"));
+}
+
+#[tokio::test]
+async fn test_completion_mock_unicode_and_emoji() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    printf "補完候補1\t説明文1\n"
+    printf "🎉celebrate\tparty 🎈\n"
+    printf "🚀deploy\tデプロイ実行\n"
+    printf "\x01EOC\x01\n"
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///unicode_mock.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "test ").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 5),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].label, "補完候補1");
+    assert_eq!(items[0].detail.as_deref(), Some("説明文1"));
+    assert_eq!(items[1].label, "🎉celebrate");
+    assert_eq!(items[1].detail.as_deref(), Some("party 🎈"));
+    assert_eq!(items[2].label, "🚀deploy");
+    assert_eq!(items[2].detail.as_deref(), Some("デプロイ実行"));
+}
+
+#[tokio::test]
+async fn test_completion_mock_special_chars() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    printf "%s\t%s\n" "arg'with\"quotes" "desc'with\"quotes"
+    printf "%s\t%s\n" 'path\with\backslashes' 'desc\with\backslashes'
+    printf "%s\t%s\n" '$VAR' 'env var'
+    printf "\x01EOC\x01\n"
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///special_mock.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "test ").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 5),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].label, "arg'with\"quotes");
+    assert_eq!(items[0].detail.as_deref(), Some("desc'with\"quotes"));
+    assert_eq!(items[1].label, "path\\with\\backslashes");
+    assert_eq!(items[1].detail.as_deref(), Some("desc\\with\\backslashes"));
+    assert_eq!(items[2].label, "$VAR");
+    assert_eq!(items[2].detail.as_deref(), Some("env var"));
+}
+
+#[tokio::test]
+async fn test_completion_mock_stderr_logging() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    echo "warning: daemon debug warning" >&2
+    printf "status\tShow status\n"
+    printf "\x01EOC\x01\n"
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///stderr_mock.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git ").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].label, "status");
+
+    // Check stderr notification was received
+    let log_msg = test_client.read_notification::<LogMessage>().await.unwrap();
+    assert_eq!(log_msg.typ, tower_lsp::lsp_types::MessageType::WARNING);
+    assert!(
+        log_msg
+            .message
+            .contains("capture.zsh stderr: warning: daemon debug warning"),
+        "Expected stderr warning log, got: {}",
+        log_msg.message
+    );
+}
+
+#[tokio::test]
+async fn test_completion_mock_crash_mid_stream() {
+    let mock_script = r#"#!/usr/bin/env zsh
+read -r line
+printf "candidate1\tdesc1\n"
+exit 1
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///crash_mid.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git ").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await;
+
+    assert!(res.is_ok());
+    assert!(res.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_completion_mock_large_candidate_list() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    for i in {1..500}; do
+        printf "cand%d\tdescription %d\n" "$i" "$i"
+    done
+    printf "\x01EOC\x01\n"
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///large_cand.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "test ").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 5),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert_eq!(items.len(), 500);
+    assert_eq!(items[0].label, "cand1");
+    assert_eq!(items[0].detail.as_deref(), Some("description 1"));
+    assert_eq!(items[499].label, "cand500");
+    assert_eq!(items[499].detail.as_deref(), Some("description 500"));
+}
+
+#[tokio::test]
+async fn test_completion_unopened_document() {
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(
+        "#!/bin/zsh\nwhile read -r line; do\n  printf \"\\x01EOC\\x01\\n\"\ndone\n",
+        "",
+    );
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let initialize_params = tower_lsp::lsp_types::InitializeParams::default();
+    test_client
+        .send_request::<tower_lsp::lsp_types::request::Initialize>(initialize_params)
+        .await
+        .unwrap();
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::Initialized>(
+            tower_lsp::lsp_types::InitializedParams {},
+        )
+        .await;
+
+    let doc_uri = Url::parse("file:///unopened.zsh").unwrap();
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 0),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await;
+
+    assert!(res.is_ok());
+    assert!(res.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_completion_out_of_bounds_position() {
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(
+        "#!/bin/zsh\nwhile read -r line; do\n  printf \"\\x01EOC\\x01\\n\"\ndone\n",
+        "",
+    );
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///out_of_bounds.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git ").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(100, 0),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await;
+
+    assert!(res.is_ok());
+    assert!(res.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_completion_multiline_document() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///multiline.zsh").unwrap();
+    let doc_content = "#!/usr/bin/env zsh\ngit s\nls -";
+    test_client.init_and_open(&doc_uri, doc_content).await;
+
+    // Line 1, char 5: "git s" -> completion on "git s"
+    let res1 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(1, 5),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items1 = get_completion_items(res1);
+    assert!(items1.iter().any(|i| i.label == "status"));
+
+    // Line 2, char 4: "ls -" -> completion on "ls -"
+    let res2 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(2, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items2 = get_completion_items(res2);
+    assert!(items2.iter().any(|i| i.label.starts_with('-')));
+
+    // Line 1, char 0: line start -> prefix ""
+    let res3 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(1, 0),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await;
+    assert!(res3.is_ok());
+}
+
+#[tokio::test]
+async fn test_completion_multibyte_prefix() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///multibyte_prefix.zsh").unwrap();
+    // Japanese comment on line 0, "git s" on line 1
+    let doc_content = "# 日本語コメント\ngit s";
+    test_client.init_and_open(&doc_uri, doc_content).await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(1, 5),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert!(items.iter().any(|i| i.label == "status"));
+
+    // Multi-byte character on the same line before command
+    // "echo 'こんにちは' && git s"
+    // UTF-16 code units: 6 ("echo '") + 5 ("こんにちは") + 11 ("' && git s") = 22
+    test_client
+        .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 2),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "echo 'こんにちは' && git s".to_string(),
+            }],
+        })
+        .await;
+    test_client.read_notification::<LogMessage>().await;
+
+    let res2 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 22),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items2 = get_completion_items(res2);
+    assert!(items2.iter().any(|i| i.label == "status"));
+}
+
+#[tokio::test]
+async fn test_completion_middle_of_word() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///middle_word.zsh").unwrap();
+    test_client
+        .init_and_open(&doc_uri, "git status --short")
+        .await;
+
+    // Position (0, 6) -> prefix is "git st"
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 6),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert!(items.iter().any(|i| i.label == "status"));
+}
+
+#[tokio::test]
+async fn test_completion_crlf_document() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///crlf_doc.zsh").unwrap();
+    let doc_content = "echo 1\r\ngit s\r\necho 2";
+    test_client.init_and_open(&doc_uri, doc_content).await;
+
+    // Line 1, char 5: "git s"
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(1, 5),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert!(items.iter().any(|i| i.label == "status"));
+}
+
+#[tokio::test]
+async fn test_completion_concurrent_requests() {
+    let mock_capture = r#"#!/bin/zsh
+while read -r line; do
+  printf "status\tshow working tree status\x01EOC\x01\n"
+done
+"#;
+    let handles: Vec<_> = (0..5)
+        .map(|i| {
+            tokio::spawn(async move {
+                let (mut client_stream, _server_handle) =
+                    setup_server_with_scripts(mock_capture, "");
+                let mut test_client = common::TestClient::new(&mut client_stream);
+                let doc_uri = Url::parse(&format!("file:///concurrent_{i}.zsh")).unwrap();
+                test_client.init_and_open(&doc_uri, "git s").await;
+
+                let res = test_client
+                    .send_request::<request::Completion>(CompletionParams {
+                        text_document_position: TextDocumentPositionParams {
+                            text_document: TextDocumentIdentifier { uri: doc_uri },
+                            position: Position::new(0, 5),
+                        },
+                        work_done_progress_params: Default::default(),
+                        partial_result_params: Default::default(),
+                        context: None,
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+                let items = get_completion_items(res);
+                assert!(items.iter().any(|item| item.label == "status"));
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}

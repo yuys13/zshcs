@@ -75,6 +75,7 @@ pub async fn write_message(stream: &mut DuplexStream, message: &str) -> std::io:
 pub struct TestClient<'a> {
     pub stream: &'a mut DuplexStream,
     pub request_id_counter: i64,
+    pub notification_queue: std::collections::VecDeque<String>,
 }
 
 impl<'a> TestClient<'a> {
@@ -82,6 +83,7 @@ impl<'a> TestClient<'a> {
         TestClient {
             stream,
             request_id_counter: 0,
+            notification_queue: std::collections::VecDeque::new(),
         }
     }
 
@@ -120,7 +122,7 @@ impl<'a> TestClient<'a> {
                 .await
                 .ok_or_else(tower_lsp::jsonrpc::Error::internal_error)?;
             if response_json.contains("\"method\"") && !response_json.contains("\"id\"") {
-                eprintln!("Skipping notification: {response_json}");
+                self.notification_queue.push_back(response_json);
                 continue;
             }
             let response: JsonRpcResponse = serde_json::from_str(&response_json)
@@ -179,11 +181,15 @@ impl<'a> TestClient<'a> {
     where
         N::Params: DeserializeOwned,
     {
-        loop {
-            let message_json = read_message(self.stream).await?;
-            if let Ok(value) = serde_json::from_str::<Value>(&message_json)
+        // First check queued notifications
+        let mut i = 0;
+        while i < self.notification_queue.len() {
+            let msg = &self.notification_queue[i];
+            if let Ok(value) = serde_json::from_str::<Value>(msg)
                 && value.get("method").and_then(Value::as_str) == Some(N::METHOD)
             {
+                let message_json = self.notification_queue.remove(i).unwrap();
+                let value: Value = serde_json::from_str(&message_json).ok()?;
                 if let Some(params_value) = value.get("params") {
                     return serde_json::from_value(params_value.clone()).ok();
                 }
@@ -191,6 +197,25 @@ impl<'a> TestClient<'a> {
                     return serde_json::from_value(Value::Null).ok();
                 }
                 return None;
+            }
+            i += 1;
+        }
+
+        loop {
+            let message_json = read_message(self.stream).await?;
+            if let Ok(value) = serde_json::from_str::<Value>(&message_json) {
+                if value.get("method").and_then(Value::as_str) == Some(N::METHOD) {
+                    if let Some(params_value) = value.get("params") {
+                        return serde_json::from_value(params_value.clone()).ok();
+                    }
+                    if N::METHOD == "initialized" && value.get("params").is_none_or(|p| p.is_null())
+                    {
+                        return serde_json::from_value(Value::Null).ok();
+                    }
+                    return None;
+                } else if value.get("method").is_some() && value.get("id").is_none() {
+                    self.notification_queue.push_back(message_json);
+                }
             }
         }
     }
@@ -218,6 +243,14 @@ impl<'a> TestClient<'a> {
         .await;
         self.read_notification::<LogMessage>().await; // didOpen
     }
+}
+
+pub const MOCK_DUMMY_CAPTURE: &str =
+    "#!/bin/zsh\nwhile read -r line; do\n  printf \"status\\tshow status\\x01EOC\\x01\\n\"\ndone\n";
+pub const MOCK_DUMMY_ZPTYRC: &str = "";
+
+pub fn setup_server_mock() -> (DuplexStream, tokio::task::JoinHandle<()>) {
+    setup_server_with_scripts(MOCK_DUMMY_CAPTURE, MOCK_DUMMY_ZPTYRC)
 }
 
 pub fn setup_server() -> (DuplexStream, tokio::task::JoinHandle<()>) {
