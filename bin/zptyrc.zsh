@@ -37,7 +37,7 @@ bindkey '^U' kill-buffer
 # Synchronize working directory helper
 _zshcs_chdir() {
     builtin cd -- "$1" 2>/dev/null
-    builtin print -n -P $'\0__cd_done__\0'
+    builtin print -n -r -- $'\0__cd_done__\0'
 }
 
 # Never run commands, except `cd` or `_zshcs_chdir`

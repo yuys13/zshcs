@@ -194,7 +194,7 @@ async fn test_daemon_crash_tolerance() {
 async fn test_daemon_timeout() {
     // Mock capture script that sleeps, preventing an immediate EOC response
     let (mut client_stream, _server_handle) = setup_server_with_scripts(
-        "#!/usr/bin/env zsh\nwhile read -r p; do sleep 5; done\n",
+        "#!/usr/bin/env zsh\nwhile read -r p; do sleep 10; done\n",
         "",
     );
     let mut test_client = common::TestClient::new(&mut client_stream);
@@ -217,7 +217,7 @@ async fn test_daemon_timeout() {
         .await;
 
     let elapsed = start.elapsed().as_millis();
-    assert!(elapsed >= 2500, "Completion should wait for the timeout");
+    assert!(elapsed >= 5000, "Completion should wait for the timeout");
 
     assert!(res.is_ok());
     assert!(res.unwrap().is_none());

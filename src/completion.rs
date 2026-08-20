@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, MessageType};
 
 pub const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
 pub const ZPTYRC_ZSH: &str = include_str!("../bin/zptyrc.zsh");
-pub const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
+pub const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_millis(5000);
 
 pub struct CompletionRequest {
     pub prefix: String,
