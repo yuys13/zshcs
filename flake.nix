@@ -65,7 +65,10 @@
               lockFile = ./Cargo.lock;
             };
 
-            nativeBuildInputs = [ pkgs.zsh ];
+            nativeBuildInputs = [
+              pkgs.zsh
+              pkgs.git
+            ];
 
             preCheck = ''
               export HOME=$TMPDIR
