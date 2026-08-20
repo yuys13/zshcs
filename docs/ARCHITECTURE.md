@@ -14,20 +14,23 @@ The project consists of two main components:
 
 ## Component Details
 
-### 1. LSP Server (`src/server.rs`, `src/lib.rs`, `src/main.rs`)
+### 1. LSP Server (`src/server.rs`, `src/lib.rs`, `src/main.rs`, `src/document.rs`)
 
 - **Library**: Built using `tower-lsp` to handle the Language Server Protocol
   communication.
-- **State Management**:
-  - Maintains open documents in memory using `DashMap`.
-  - Tracks document versions to handle out-of-order updates.
+- **State Management (`src/document.rs`)**:
+  - `DocumentManager`: Thread-safe manager wrapping `Arc<DashMap<Url, DocumentState>>` to decouple document tracking from `Backend`.
+  - `DocumentState`: Encapsulates `uri`, `version`, and document `text` atomically.
+  - Handles complete document lifecycle: `didOpen` (`open`), `didChange` (`apply_changes`), and `didClose` (`close` to reclaim memory).
+  - Validates version monotonicity (`OutdatedVersion` error) and ensures atomic rollbacks if incremental range replacement fails.
+  - Converts LSP UTF-16 cursor positions to Rust UTF-8 byte offsets, safely handling multibyte characters, surrogate pairs, and CRLF line endings.
 - **Resource Lifecycle & Actor Pattern**:
   - The embedded Zsh scripts (`capture.zsh` and `zptyrc.zsh`) are written to a temporary directory created on startup.
   - A persistent background daemon is spawned via `tokio::spawn` to run `capture.zsh`.
   - The `Backend` struct holds an `mpsc::Sender` channel to communicate with this daemon instead of spawning new processes.
 - **Synchronization**: Supports `TextDocumentSyncKind::INCREMENTAL`.
-  - `didChange` events update the in-memory document state by applying changes
-    to the byte offsets calculated from LSP `Position` (line/character).
+  - `didChange` events update the in-memory document state through `DocumentManager::apply_changes`.
+  - `didClose` events safely free document memory through `DocumentManager::close`.
 
 ### 2. Completion Engine (`bin/capture.zsh` and `bin/zptyrc.zsh`)
 
