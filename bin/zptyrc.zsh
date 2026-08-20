@@ -34,10 +34,16 @@ bindkey '^B' backward-char
 bindkey '^I' complete-word
 bindkey '^U' kill-buffer
 
-# Never run commands, except `cd`
+# Synchronize working directory helper
+_zshcs_chdir() {
+    builtin cd -- "$1" 2>/dev/null
+    builtin print -n -P $'\0__cd_done__\0'
+}
+
+# Never run commands, except `cd` or `_zshcs_chdir`
 setopt debug_before_cmd
 DEBUGTRAP() {
-    [[ $ZSH_DEBUG_CMD == 'cd '* ]] || setopt err_exit
+    [[ $ZSH_DEBUG_CMD == ('cd '*|'_zshcs_chdir '*) ]] || setopt err_exit
 }
 
 # Send a line with null-byte at the end before and after completions are output
