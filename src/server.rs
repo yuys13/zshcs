@@ -156,10 +156,16 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
+        let cwd = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.parent().map(|parent| parent.to_path_buf()));
+
         // Request completion from the daemon
         let (tx, rx) = oneshot::channel();
         let req = CompletionRequest {
             prefix,
+            cwd,
             responder: tx,
         };
 
