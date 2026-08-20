@@ -255,7 +255,8 @@ pub fn setup_server_mock() -> (DuplexStream, tokio::task::JoinHandle<()>) {
 
 pub fn setup_server() -> (DuplexStream, tokio::task::JoinHandle<()>) {
     let (client_stream, server_stream) = tokio::io::duplex(4096);
-    let (service, client_socket) = LspService::new(Backend::new);
+    let (service, client_socket) =
+        LspService::new(|client| Backend::new(client).expect("Failed to initialize test backend"));
 
     let server_handle = tokio::spawn(async move {
         let (server_read, server_write) = tokio::io::split(server_stream);
@@ -274,6 +275,7 @@ pub fn setup_server_with_scripts(
     let (client_stream, server_stream) = tokio::io::duplex(4096);
     let (service, client_socket) = LspService::new(move |client| {
         Backend::new_with_scripts(client, capture_script, zptyrc_script)
+            .expect("Failed to initialize test backend with scripts")
     });
 
     let server_handle = tokio::spawn(async move {

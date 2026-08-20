@@ -6,6 +6,8 @@ use tokio::time::timeout;
 use tower_lsp::Client;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, MessageType};
 
+use crate::error::{ZshcsError, ZshcsResult};
+
 pub const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
 pub const ZPTYRC_ZSH: &str = include_str!("../bin/zptyrc.zsh");
 pub const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
@@ -13,7 +15,7 @@ pub const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
 pub struct CompletionRequest {
     pub prefix: String,
     pub cwd: Option<PathBuf>,
-    pub responder: oneshot::Sender<Result<Vec<CompletionItem>, String>>,
+    pub responder: oneshot::Sender<ZshcsResult<Vec<CompletionItem>>>,
 }
 
 struct DaemonProcess {
@@ -33,9 +35,15 @@ impl DaemonProcess {
             .kill_on_drop(true)
             .spawn()?;
 
-        let stdin = child.stdin.take().expect("Failed to open stdin");
-        let stdout = child.stdout.take().expect("Failed to open stdout");
-        let mut stderr = child.stderr.take().expect("Failed to open stderr");
+        let stdin = child.stdin.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to open stdin")
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to open stdout")
+        })?;
+        let mut stderr = child.stderr.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to open stderr")
+        })?;
 
         // Spawn stderr logger
         let client_for_stderr = client.clone();
@@ -108,15 +116,15 @@ pub async fn run_completion_daemon(
                             format!("Failed to spawn completion daemon: {e}"),
                         )
                         .await;
-                    let _ = req
-                        .responder
-                        .send(Err(format!("Failed to spawn completion daemon: {e}")));
+                    let _ = req.responder.send(Err(ZshcsError::Io(e)));
                     continue;
                 }
             }
         }
 
-        let proc = daemon.as_mut().unwrap();
+        let Some(proc) = daemon.as_mut() else {
+            continue;
+        };
 
         // Execute request with timeout to protect supervisor against hung processes
         let exec_result = timeout(DAEMON_REQUEST_TIMEOUT, async {
@@ -184,7 +192,7 @@ pub async fn run_completion_daemon(
                 if let Some(mut p) = daemon.take() {
                     let _ = p.child.start_kill();
                 }
-                let _ = req.responder.send(Err(format!("Daemon I/O failure: {e}")));
+                let _ = req.responder.send(Err(ZshcsError::Io(e)));
             }
             Err(_) => {
                 client
@@ -199,9 +207,9 @@ pub async fn run_completion_daemon(
                 if let Some(mut p) = daemon.take() {
                     let _ = p.child.start_kill();
                 }
-                let _ = req
-                    .responder
-                    .send(Err("Completion request timed out".to_string()));
+                let _ = req.responder.send(Err(ZshcsError::Daemon(
+                    "Completion request timed out".to_string(),
+                )));
             }
         }
     }

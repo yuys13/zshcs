@@ -193,4 +193,26 @@ mod tests {
         assert!(matches!(fail_io(), Err(ZshcsError::Io(_))));
         assert!(matches!(fail_doc(), Err(ZshcsError::Document(_))));
     }
+
+    #[test]
+    fn test_error_debug_formatting() {
+        let err = ZshcsError::Daemon("test debug".to_string());
+        let debug_str = format!("{err:?}");
+        assert!(debug_str.contains("Daemon(\"test debug\")"));
+    }
+
+    #[test]
+    fn test_error_sources_completeness() {
+        let uri = Url::parse("file:///b.zsh").unwrap();
+        let doc_err: ZshcsError = DocumentError::NotFound(uri).into();
+        assert!(doc_err.source().is_some());
+
+        let io_err: ZshcsError = std::io::Error::other("io failure").into();
+        assert!(io_err.source().is_some());
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        drop(tx);
+        let req_err: ZshcsError = rx.blocking_recv().unwrap_err().into();
+        assert!(req_err.source().is_some());
+    }
 }
