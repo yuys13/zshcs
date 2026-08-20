@@ -856,3 +856,139 @@ done
         handle.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn test_daemon_crash_recovery_on_next_request() {
+    // Mock script that succeeds once, then exits on next request, and succeeds on fresh spawn
+    let mock_script = r#"#!/usr/bin/env zsh
+count=0
+while IFS= read -r line; do
+    count=$((count + 1))
+    if [[ $count -eq 1 ]]; then
+        printf "recovered_status\tShow status\x01EOC\x01\n"
+    else
+        exit 1
+    fi
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///recovery.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git ").await;
+
+    // 1. First request succeeds
+    let res1 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap();
+
+    let items1 = get_completion_items(res1.expect("First request should succeed"));
+    assert_eq!(items1[0].label, "recovered_status");
+
+    // 2. Second request causes the daemon to exit 1 (crash)
+    let res2 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await;
+
+    // Res2 is None (or handled error)
+    assert!(res2.is_ok());
+    assert!(res2.unwrap().is_none());
+
+    // 3. Third request: Supervisor should automatically restart the daemon and succeed
+    let res3 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap();
+
+    let items3 =
+        get_completion_items(res3.expect("Third request should succeed after auto-restart"));
+    assert_eq!(items3[0].label, "recovered_status");
+}
+
+#[tokio::test]
+async fn test_daemon_crash_between_requests_auto_restart() {
+    // Mock script that exits immediately after sending first completion response
+    let mock_script = r#"#!/usr/bin/env zsh
+read -r line
+printf "resp_item\tdesc\x01EOC\x01\n"
+exit 0
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///exit_between.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git ").await;
+
+    // 1. First request
+    let res1 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap();
+
+    let items1 = get_completion_items(res1.expect("First request should succeed"));
+    assert_eq!(items1[0].label, "resp_item");
+
+    // Wait a brief moment to ensure process exit has occurred
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // 2. Second request: Process already exited between requests. Supervisor must detect and restart!
+    let res2 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap();
+
+    let items2 =
+        get_completion_items(res2.expect("Second request should succeed via supervisor restart"));
+    assert_eq!(items2[0].label, "resp_item");
+}

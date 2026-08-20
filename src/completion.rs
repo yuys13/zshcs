@@ -12,52 +12,119 @@ pub struct CompletionRequest {
     pub responder: oneshot::Sender<Result<Vec<CompletionItem>, String>>,
 }
 
+struct DaemonProcess {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout_reader: BufReader<tokio::process::ChildStdout>,
+}
+
+impl DaemonProcess {
+    fn spawn(script_path: &PathBuf, client: &Client) -> std::io::Result<Self> {
+        let mut child = tokio::process::Command::new("zsh")
+            .arg(script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        let stdin = child.stdin.take().expect("Failed to open stdin");
+        let stdout = child.stdout.take().expect("Failed to open stdout");
+        let mut stderr = child.stderr.take().expect("Failed to open stderr");
+
+        // Spawn stderr logger
+        let client_for_stderr = client.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(&mut stderr);
+            let mut line = String::new();
+            while let Ok(len) = reader.read_line(&mut line).await {
+                if len == 0 {
+                    break;
+                }
+                client_for_stderr
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("capture.zsh stderr: {}", line.trim_end()),
+                    )
+                    .await;
+                line.clear();
+            }
+        });
+
+        let stdout_reader = BufReader::new(stdout);
+        Ok(DaemonProcess {
+            child,
+            stdin,
+            stdout_reader,
+        })
+    }
+
+    fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
 pub async fn run_completion_daemon(
     script_path: PathBuf,
     mut rx: mpsc::Receiver<CompletionRequest>,
     client: Client,
 ) {
-    let mut child = tokio::process::Command::new("zsh")
-        .arg(&script_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("Failed to spawn completion daemon");
-
-    let mut stdin = child.stdin.take().expect("Failed to open stdin");
-    let stdout = child.stdout.take().expect("Failed to open stdout");
-    let mut stderr = child.stderr.take().expect("Failed to open stderr");
-
-    // Spawn stderr logger
-    let client_for_stderr = client.clone();
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(&mut stderr);
-        let mut line = String::new();
-        while let Ok(len) = reader.read_line(&mut line).await {
-            if len == 0 {
-                break;
-            }
-            client_for_stderr
-                .log_message(
-                    MessageType::WARNING,
-                    format!("capture.zsh stderr: {}", line.trim_end()),
-                )
-                .await;
-            line.clear();
-        }
-    });
-
-    let mut stdout_reader = BufReader::new(stdout);
+    let mut daemon: Option<DaemonProcess> = None;
 
     while let Some(req) = rx.recv().await {
+        if req.responder.is_closed() {
+            continue;
+        }
+
+        // Check if existing daemon process has terminated
+        if let Some(proc) = daemon.as_mut()
+            && !proc.is_alive()
+        {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    "Completion daemon process terminated, restarting...",
+                )
+                .await;
+            daemon = None;
+        }
+
+        // Spawn daemon if not currently running
+        let proc = match daemon.as_mut() {
+            Some(proc) => proc,
+            None => match DaemonProcess::spawn(&script_path, &client) {
+                Ok(p) => {
+                    daemon = Some(p);
+                    daemon.as_mut().unwrap()
+                }
+                Err(e) => {
+                    client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("Failed to spawn completion daemon: {e}"),
+                        )
+                        .await;
+                    let _ = req
+                        .responder
+                        .send(Err(format!("Failed to spawn completion daemon: {e}")));
+                    continue;
+                }
+            },
+        };
+
         // Send input message to daemon
         let msg = format!("input:{}\n", req.prefix);
-        if let Err(e) = stdin.write_all(msg.as_bytes()).await {
+        if let Err(e) = proc.stdin.write_all(msg.as_bytes()).await {
+            client
+                .log_message(
+                    MessageType::ERROR,
+                    format!("Failed to write to completion daemon stdin: {e}"),
+                )
+                .await;
+            daemon = None;
             let _ = req
                 .responder
-                .send(Err(format!("Failed to write to daemon: {}", e)));
+                .send(Err(format!("Failed to write to daemon: {e}")));
             continue;
         }
 
@@ -68,9 +135,16 @@ pub async fn run_completion_daemon(
 
         loop {
             line.clear();
-            match stdout_reader.read_line(&mut line).await {
+            match proc.stdout_reader.read_line(&mut line).await {
                 Ok(0) => {
                     error_msg = Some("Daemon stdout closed unexpectedly".to_string());
+                    client
+                        .log_message(
+                            MessageType::ERROR,
+                            "Completion daemon stdout closed unexpectedly",
+                        )
+                        .await;
+                    daemon = None;
                     break;
                 }
                 Ok(_) => {
@@ -89,7 +163,14 @@ pub async fn run_completion_daemon(
                     }
                 }
                 Err(e) => {
-                    error_msg = Some(format!("Error reading daemon stdout: {}", e));
+                    error_msg = Some(format!("Error reading daemon stdout: {e}"));
+                    client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("Error reading completion daemon stdout: {e}"),
+                        )
+                        .await;
+                    daemon = None;
                     break;
                 }
             }
