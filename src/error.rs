@@ -215,4 +215,11 @@ mod tests {
         let req_err: ZshcsError = rx.blocking_recv().unwrap_err().into();
         assert!(req_err.source().is_some());
     }
+
+    #[test]
+    fn test_error_send_sync_static() {
+        fn assert_send_sync<T: Send + Sync + 'static>() {}
+        assert_send_sync::<ZshcsError>();
+        assert_send_sync::<DocumentError>();
+    }
 }
