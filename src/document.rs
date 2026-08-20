@@ -1,34 +1,21 @@
 use dashmap::DashMap;
 use std::sync::Arc;
+use thiserror::Error;
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent, Url};
 
 /// Errors related to document management and synchronization.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DocumentError {
     /// Document was not found in the manager.
+    #[error("document not found: {0}")]
     NotFound(Url),
     /// Invalid range specified for replacement.
+    #[error("invalid range {0:?}")]
     InvalidRange(Range),
     /// Outdated document version received.
+    #[error("outdated version received: current {current}, received {received}")]
     OutdatedVersion { current: i32, received: i32 },
 }
-
-impl std::fmt::Display for DocumentError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DocumentError::NotFound(uri) => write!(f, "document not found: {uri}"),
-            DocumentError::InvalidRange(range) => write!(f, "invalid range {range:?}"),
-            DocumentError::OutdatedVersion { current, received } => {
-                write!(
-                    f,
-                    "outdated version received: current {current}, received {received}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for DocumentError {}
 
 /// Represents the in-memory state of an open document.
 #[derive(Debug, Clone, PartialEq, Eq)]
