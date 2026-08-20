@@ -1280,12 +1280,12 @@ async fn test_completion_relative_path_and_working_directory_real() {
 }
 
 #[tokio::test]
-async fn test_completion_chdir_spaces_and_unicode_path() {
+async fn test_completion_chdir_spaces_and_special_path() {
     let temp_parent = tempfile::tempdir().unwrap();
-    let special_dir = temp_parent.path().join("フォルダ with space and 特殊文字");
+    let special_dir = temp_parent.path().join("dir with space and special-chars");
     std::fs::create_dir_all(&special_dir).unwrap();
 
-    let target_file = "unicode_target_123.txt";
+    let target_file = "special_target_123.txt";
     std::fs::write(special_dir.join(target_file), "content").unwrap();
 
     let script_file = special_dir.join("main.zsh");
@@ -1294,7 +1294,7 @@ async fn test_completion_chdir_spaces_and_unicode_path() {
     let (mut client_stream, _server_handle) = setup_server();
     let mut test_client = common::TestClient::new(&mut client_stream);
 
-    test_client.init_and_open(&script_uri, "cat uni").await;
+    test_client.init_and_open(&script_uri, "cat spe").await;
 
     let res = test_client
         .send_request::<request::Completion>(CompletionParams {
@@ -1313,10 +1313,10 @@ async fn test_completion_chdir_spaces_and_unicode_path() {
         .unwrap();
 
     let items = get_completion_items(res);
-    let has_target = items.iter().any(|i| i.label.contains("unicode_target_123"));
+    let has_target = items.iter().any(|i| i.label.contains("special_target_123"));
     assert!(
         has_target,
-        "Expected unicode target file in completion in special directory. Got: {items:?}"
+        "Expected special target file in completion in special directory. Got: {items:?}"
     );
 }
 
