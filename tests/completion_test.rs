@@ -217,10 +217,93 @@ async fn test_daemon_timeout() {
         .await;
 
     let elapsed = start.elapsed().as_millis();
-    assert!(elapsed >= 3000, "Completion should wait for the timeout");
+    assert!(elapsed >= 2500, "Completion should wait for the timeout");
 
     assert!(res.is_ok());
     assert!(res.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_daemon_timeout_recovery_on_subsequent_request() {
+    // Mock script that hangs on the first request (sleep 100), but on restart returns a valid item
+    let temp_dir = tempfile::tempdir().unwrap();
+    let count_file_path = temp_dir.path().join("spawn_count.txt");
+    let count_path_str = count_file_path.to_str().unwrap().to_string();
+
+    let mock_script = Box::leak(
+        format!(
+            r#"#!/usr/bin/env zsh
+count_file="{count_path_str}"
+count=0
+if [[ -f "$count_file" ]]; then
+    count=$(cat "$count_file")
+fi
+count=$((count + 1))
+echo "$count" > "$count_file"
+
+while IFS= read -r line; do
+    if [[ $line == input:* ]]; then
+        if [[ $count -eq 1 ]]; then
+            sleep 100
+        else
+            printf "timeout_recovered\tdesc\x01EOC\x01\n"
+        fi
+    fi
+done
+"#
+        )
+        .into_boxed_str(),
+    );
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///timeout_recovery.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git ").await;
+
+    // 1. First request hangs and should time out
+    let res1 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await;
+
+    assert!(res1.is_ok());
+    assert!(res1.unwrap().is_none());
+
+    // 2. Second request immediately after: Supervisor must kill the hung child and spawn a new one!
+    let start2 = std::time::Instant::now();
+    let res2 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap();
+
+    let elapsed2 = start2.elapsed().as_millis();
+    assert!(
+        elapsed2 < 2000,
+        "Second request after timeout should succeed quickly, took {elapsed2}ms"
+    );
+
+    let items =
+        get_completion_items(res2.expect("Second request must succeed via supervisor restart"));
+    assert_eq!(items[0].label, "timeout_recovered");
 }
 
 #[tokio::test]
@@ -1348,4 +1431,153 @@ done
 
     let items3 = get_completion_items(res3);
     assert_eq!(items3[0].label, "item_ok");
+}
+
+#[tokio::test]
+async fn test_completion_chdir_non_existent_directory() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///non/existent/path/dir/script.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git s").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 5),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert!(items.iter().any(|i| i.label == "status"));
+}
+
+#[tokio::test]
+async fn test_completion_chdir_unusual_characters_and_symbols() {
+    let temp_parent = tempfile::tempdir().unwrap();
+    let complex_dir_name = "dir_with'quote_\"double\"_$var_#hash_!excl_~tilde_:colon";
+    let special_dir = temp_parent.path().join(complex_dir_name);
+    std::fs::create_dir_all(&special_dir).unwrap();
+
+    let target_file = "complex_symbol_target.txt";
+    std::fs::write(special_dir.join(target_file), "hello").unwrap();
+
+    let script_file = special_dir.join("main.zsh");
+    let script_uri = Url::from_file_path(&script_file).unwrap();
+
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    test_client.init_and_open(&script_uri, "cat comp").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: script_uri.clone(),
+                },
+                position: Position::new(0, 8),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert!(
+        items
+            .iter()
+            .any(|i| i.label.contains("complex_symbol_target")),
+        "Expected complex target file in completion for special directory. Got: {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_completion_rapid_directory_switching_stress() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let mut dir_uris = Vec::new();
+
+    // Create 10 different directories with unique marker files
+    for i in 0..10 {
+        let dir = temp_root.path().join(format!("dir_{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target_file = format!("marker_{i}.txt");
+        std::fs::write(dir.join(target_file), format!("data_{i}")).unwrap();
+        let script = dir.join("run.zsh");
+        dir_uris.push((Url::from_file_path(&script).unwrap(), format!("marker_{i}")));
+    }
+
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    // Initialize with the first document
+    test_client.init_and_open(&dir_uris[0].0, "cat mark").await;
+
+    // Open the other 9 documents
+    for (uri, _) in dir_uris.iter().skip(1) {
+        test_client
+            .send_notification::<tower_lsp::lsp_types::notification::DidOpenTextDocument>(
+                tower_lsp::lsp_types::DidOpenTextDocumentParams {
+                    text_document: tower_lsp::lsp_types::TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "zsh".to_string(),
+                        version: 1,
+                        text: "cat mark".to_string(),
+                    },
+                },
+            )
+            .await;
+        test_client
+            .read_notification::<tower_lsp::lsp_types::notification::LogMessage>()
+            .await;
+    }
+
+    // Rapidly alternate requests between directories
+    for cycle in 0..3 {
+        for (i, (uri, marker)) in dir_uris.iter().enumerate() {
+            let res = test_client
+                .send_request::<request::Completion>(CompletionParams {
+                    text_document_position: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: Position::new(0, 8),
+                    },
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                    context: None,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+
+            let items = get_completion_items(res);
+            let has_own_marker = items.iter().any(|item| item.label.contains(marker));
+            assert!(
+                has_own_marker,
+                "Cycle {cycle}, dir {i}: expected {marker} in completion. Got: {items:?}"
+            );
+
+            // Verify isolation: must not contain markers from other directories
+            for (other_idx, (_, other_marker)) in dir_uris.iter().enumerate() {
+                if other_idx != i {
+                    let has_other = items.iter().any(|item| item.label.contains(other_marker));
+                    assert!(
+                        !has_other,
+                        "Directory isolation breach: dir {i} contained {other_marker} from dir {other_idx}"
+                    );
+                }
+            }
+        }
+    }
 }

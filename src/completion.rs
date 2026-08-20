@@ -1,11 +1,14 @@
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
 use tower_lsp::Client;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, MessageType};
 
 pub const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
 pub const ZPTYRC_ZSH: &str = include_str!("../bin/zptyrc.zsh");
+pub const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
 
 pub struct CompletionRequest {
     pub prefix: String,
@@ -93,12 +96,10 @@ pub async fn run_completion_daemon(
         }
 
         // Spawn daemon if not currently running
-        let proc = match daemon.as_mut() {
-            Some(proc) => proc,
-            None => match DaemonProcess::spawn(&script_path, &client) {
+        if daemon.is_none() {
+            match DaemonProcess::spawn(&script_path, &client) {
                 Ok(p) => {
                     daemon = Some(p);
-                    daemon.as_mut().unwrap()
                 }
                 Err(e) => {
                     client
@@ -112,102 +113,96 @@ pub async fn run_completion_daemon(
                         .send(Err(format!("Failed to spawn completion daemon: {e}")));
                     continue;
                 }
-            },
-        };
-
-        // Synchronize working directory if specified and changed
-        if let Some(target_cwd) = &req.cwd {
-            let need_chdir = match &proc.current_cwd {
-                Some(current) => current != target_cwd,
-                None => true,
-            };
-            if need_chdir {
-                let chdir_msg = format!("chdir:{}\n", target_cwd.display());
-                if let Err(e) = proc.stdin.write_all(chdir_msg.as_bytes()).await {
-                    client
-                        .log_message(
-                            MessageType::ERROR,
-                            format!("Failed to write chdir to completion daemon stdin: {e}"),
-                        )
-                        .await;
-                    daemon = None;
-                    let _ = req
-                        .responder
-                        .send(Err(format!("Failed to write to daemon: {e}")));
-                    continue;
-                }
-                proc.current_cwd = Some(target_cwd.clone());
             }
         }
 
-        // Send input message to daemon
-        let msg = format!("input:{}\n", req.prefix);
-        if let Err(e) = proc.stdin.write_all(msg.as_bytes()).await {
-            client
-                .log_message(
-                    MessageType::ERROR,
-                    format!("Failed to write to completion daemon stdin: {e}"),
-                )
-                .await;
-            daemon = None;
-            let _ = req
-                .responder
-                .send(Err(format!("Failed to write to daemon: {e}")));
-            continue;
-        }
+        let proc = daemon.as_mut().unwrap();
 
-        // Read response until EOC
-        let mut items = Vec::new();
-        let mut line = String::new();
-        let mut error_msg = None;
-
-        loop {
-            line.clear();
-            match proc.stdout_reader.read_line(&mut line).await {
-                Ok(0) => {
-                    error_msg = Some("Daemon stdout closed unexpectedly".to_string());
-                    client
-                        .log_message(
-                            MessageType::ERROR,
-                            "Completion daemon stdout closed unexpectedly",
-                        )
-                        .await;
-                    daemon = None;
-                    break;
-                }
-                Ok(_) => {
-                    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-                    if trimmed.ends_with("\x01EOC\x01") {
-                        // Trim EOC marker from the end of the line if it was appended to a candidate,
-                        // otherwise it's on a line by itself.
-                        let content = trimmed.trim_end_matches("\x01EOC\x01");
-                        if !content.is_empty() {
-                            parse_candidate_line(content, &mut items);
-                        }
-                        break;
-                    }
-                    if !trimmed.is_empty() {
-                        parse_candidate_line(trimmed, &mut items);
-                    }
-                }
-                Err(e) => {
-                    error_msg = Some(format!("Error reading daemon stdout: {e}"));
-                    client
-                        .log_message(
-                            MessageType::ERROR,
-                            format!("Error reading completion daemon stdout: {e}"),
-                        )
-                        .await;
-                    daemon = None;
-                    break;
+        // Execute request with timeout to protect supervisor against hung processes
+        let exec_result = timeout(DAEMON_REQUEST_TIMEOUT, async {
+            // Synchronize working directory if specified and changed
+            if let Some(target_cwd) = &req.cwd {
+                let need_chdir = match &proc.current_cwd {
+                    Some(current) => current != target_cwd,
+                    None => true,
+                };
+                if need_chdir {
+                    let sanitized_cwd = target_cwd.to_string_lossy().replace(['\r', '\n'], "");
+                    let chdir_msg = format!("chdir:{sanitized_cwd}\n");
+                    proc.stdin.write_all(chdir_msg.as_bytes()).await?;
+                    proc.current_cwd = Some(target_cwd.clone());
                 }
             }
-        }
 
-        if let Some(err) = error_msg {
-            let _ = req.responder.send(Err(err));
-        } else {
-            let _ = req.responder.send(Ok(items));
+            // Send input message to daemon (sanitizing newlines)
+            let sanitized_prefix = req.prefix.replace(['\r', '\n'], "");
+            let msg = format!("input:{sanitized_prefix}\n");
+            proc.stdin.write_all(msg.as_bytes()).await?;
+
+            // Read response until EOC
+            let mut items = Vec::new();
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                let len = proc.stdout_reader.read_line(&mut line).await?;
+                if len == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "Completion daemon stdout closed unexpectedly",
+                    ));
+                }
+
+                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                if trimmed.ends_with("\x01EOC\x01") {
+                    let content = trimmed.trim_end_matches("\x01EOC\x01");
+                    if !content.is_empty() {
+                        parse_candidate_line(content, &mut items);
+                    }
+                    break;
+                }
+                if !trimmed.is_empty() {
+                    parse_candidate_line(trimmed, &mut items);
+                }
+            }
+
+            Ok(items)
+        })
+        .await;
+
+        match exec_result {
+            Ok(Ok(items)) => {
+                let _ = req.responder.send(Ok(items));
+            }
+            Ok(Err(e)) => {
+                client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Completion daemon I/O failure: {e}"),
+                    )
+                    .await;
+                if let Some(mut p) = daemon.take() {
+                    let _ = p.child.start_kill();
+                }
+                let _ = req.responder.send(Err(format!("Daemon I/O failure: {e}")));
+            }
+            Err(_) => {
+                client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!(
+                            "Completion request timed out after {}ms, terminating hung daemon...",
+                            DAEMON_REQUEST_TIMEOUT.as_millis()
+                        ),
+                    )
+                    .await;
+                if let Some(mut p) = daemon.take() {
+                    let _ = p.child.start_kill();
+                }
+                let _ = req
+                    .responder
+                    .send(Err("Completion request timed out".to_string()));
+            }
         }
     }
 }
