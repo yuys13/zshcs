@@ -40,12 +40,6 @@ _zshcs_chdir() {
     builtin print -n -r -- $'\0__cd_done__\0'
 }
 
-# Never run commands, except `cd` or `_zshcs_chdir`
-setopt debug_before_cmd
-DEBUGTRAP() {
-    [[ $ZSH_DEBUG_CMD == ('cd '*|'_zshcs_chdir '*) ]] || setopt err_exit
-}
-
 # Send a line with null-byte at the end before and after completions are output
 null-line () {
     echo -E - $'\0'

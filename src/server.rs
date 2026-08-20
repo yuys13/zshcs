@@ -179,7 +179,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
-        let output_result = timeout(Duration::from_millis(6000), rx).await;
+        let output_result = timeout(Duration::from_millis(3000), rx).await;
 
         match output_result {
             Ok(Ok(Ok(items))) => Ok(Some(CompletionResponse::Array(items))),

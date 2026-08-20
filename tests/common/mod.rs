@@ -19,7 +19,7 @@ use tower_lsp::{LspService, Server};
 use zshcs::Backend;
 
 pub async fn read_message(stream: &mut DuplexStream) -> Option<String> {
-    let timeout_duration = Duration::from_secs(10);
+    let timeout_duration = Duration::from_secs(5);
 
     let result = tokio::time::timeout(timeout_duration, async {
         let mut content_length = 0;
