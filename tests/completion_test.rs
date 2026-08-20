@@ -863,11 +863,13 @@ async fn test_daemon_crash_recovery_on_next_request() {
     let mock_script = r#"#!/usr/bin/env zsh
 count=0
 while IFS= read -r line; do
-    count=$((count + 1))
-    if [[ $count -eq 1 ]]; then
-        printf "recovered_status\tShow status\x01EOC\x01\n"
-    else
-        exit 1
+    if [[ $line == input:* ]]; then
+        count=$((count + 1))
+        if [[ $count -eq 1 ]]; then
+            printf "recovered_status\tShow status\x01EOC\x01\n"
+        else
+            exit 1
+        fi
     fi
 done
 "#;
@@ -940,9 +942,12 @@ done
 async fn test_daemon_crash_between_requests_auto_restart() {
     // Mock script that exits immediately after sending first completion response
     let mock_script = r#"#!/usr/bin/env zsh
-read -r line
-printf "resp_item\tdesc\x01EOC\x01\n"
-exit 0
+while IFS= read -r line; do
+    if [[ $line == input:* ]]; then
+        printf "resp_item\tdesc\x01EOC\x01\n"
+        exit 0
+    fi
+done
 "#;
     let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
     let mut test_client = common::TestClient::new(&mut client_stream);
@@ -991,4 +996,356 @@ exit 0
     let items2 =
         get_completion_items(res2.expect("Second request should succeed via supervisor restart"));
     assert_eq!(items2[0].label, "resp_item");
+}
+
+#[tokio::test]
+async fn test_completion_working_directory_sync_protocol() {
+    // Mock script that echoes received commands and candidates based on chdir
+    let mock_script = r#"#!/usr/bin/env zsh
+current_dir="none"
+while IFS= read -r line; do
+    if [[ $line == chdir:* ]]; then
+        current_dir="${line#chdir:}"
+    elif [[ $line == input:* ]]; then
+        printf "%s_item\tdir: %s\x01EOC\x01\n" "$current_dir" "$current_dir"
+    fi
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri_1 = Url::parse("file:///project/dir_one/file1.zsh").unwrap();
+    let doc_uri_2 = Url::parse("file:///project/dir_two/file2.zsh").unwrap();
+
+    test_client.init_and_open(&doc_uri_1, "ls ").await;
+
+    // 1. First request for dir_one -> should receive chdir:/project/dir_one
+    let res1 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri_1.clone(),
+                },
+                position: Position::new(0, 3),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items1 = get_completion_items(res1);
+    assert_eq!(items1[0].label, "/project/dir_one_item");
+
+    // 2. Second request for the same document in dir_one -> cwd hasn't changed, still dir_one
+    let res2 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri_1.clone(),
+                },
+                position: Position::new(0, 3),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items2 = get_completion_items(res2);
+    assert_eq!(items2[0].label, "/project/dir_one_item");
+
+    // 3. Third request for document in dir_two -> should receive chdir:/project/dir_two
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidOpenTextDocument>(
+            tower_lsp::lsp_types::DidOpenTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentItem {
+                    uri: doc_uri_2.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: "ls ".to_string(),
+                },
+            },
+        )
+        .await;
+    test_client
+        .read_notification::<tower_lsp::lsp_types::notification::LogMessage>()
+        .await;
+
+    let res3 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri_2.clone(),
+                },
+                position: Position::new(0, 3),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items3 = get_completion_items(res3);
+    assert_eq!(items3[0].label, "/project/dir_two_item");
+}
+
+#[tokio::test]
+async fn test_completion_relative_path_and_working_directory_real() {
+    let temp_dir_a = tempfile::tempdir().unwrap();
+    let temp_dir_b = tempfile::tempdir().unwrap();
+
+    // Create unique files in each directory
+    let file_a_name = "alpha_unique_target.txt";
+    let file_b_name = "beta_unique_target.txt";
+    std::fs::write(temp_dir_a.path().join(file_a_name), "hello a").unwrap();
+    std::fs::write(temp_dir_b.path().join(file_b_name), "hello b").unwrap();
+
+    let script_a = temp_dir_a.path().join("script_a.zsh");
+    let script_b = temp_dir_b.path().join("script_b.zsh");
+    let uri_a = Url::from_file_path(&script_a).unwrap();
+    let uri_b = Url::from_file_path(&script_b).unwrap();
+
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    // 1. Open script in dir A and complete `cat alp`
+    test_client.init_and_open(&uri_a, "cat alp").await;
+
+    let res_a = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri_a.clone() },
+                position: Position::new(0, 7),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items_a = get_completion_items(res_a);
+    let has_alpha = items_a
+        .iter()
+        .any(|i| i.label.contains("alpha_unique_target"));
+    let has_beta_in_a = items_a
+        .iter()
+        .any(|i| i.label.contains("beta_unique_target"));
+    assert!(
+        has_alpha,
+        "Expected alpha file in completions for dir A. Got: {items_a:?}"
+    );
+    assert!(
+        !has_beta_in_a,
+        "Beta file should NOT be in completions for dir A"
+    );
+
+    // 2. Open script in dir B and complete `cat bet`
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidOpenTextDocument>(
+            tower_lsp::lsp_types::DidOpenTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentItem {
+                    uri: uri_b.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: "cat bet".to_string(),
+                },
+            },
+        )
+        .await;
+    test_client
+        .read_notification::<tower_lsp::lsp_types::notification::LogMessage>()
+        .await;
+
+    let res_b = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri_b.clone() },
+                position: Position::new(0, 7),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items_b = get_completion_items(res_b);
+    let has_beta = items_b
+        .iter()
+        .any(|i| i.label.contains("beta_unique_target"));
+    let has_alpha_in_b = items_b
+        .iter()
+        .any(|i| i.label.contains("alpha_unique_target"));
+    assert!(
+        has_beta,
+        "Expected beta file in completions for dir B. Got: {items_b:?}"
+    );
+    assert!(
+        !has_alpha_in_b,
+        "Alpha file should NOT be in completions for dir B"
+    );
+}
+
+#[tokio::test]
+async fn test_completion_chdir_spaces_and_unicode_path() {
+    let temp_parent = tempfile::tempdir().unwrap();
+    let special_dir = temp_parent.path().join("フォルダ with space and 特殊文字");
+    std::fs::create_dir_all(&special_dir).unwrap();
+
+    let target_file = "unicode_target_123.txt";
+    std::fs::write(special_dir.join(target_file), "content").unwrap();
+
+    let script_file = special_dir.join("main.zsh");
+    let script_uri = Url::from_file_path(&script_file).unwrap();
+
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    test_client.init_and_open(&script_uri, "cat uni").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: script_uri.clone(),
+                },
+                position: Position::new(0, 7),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    let has_target = items.iter().any(|i| i.label.contains("unicode_target_123"));
+    assert!(
+        has_target,
+        "Expected unicode target file in completion in special directory. Got: {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_completion_chdir_non_file_uri() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("untitled:untitled-1").unwrap();
+    test_client.init_and_open(&doc_uri, "git s").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 5),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert!(items.iter().any(|i| i.label == "status"));
+}
+
+#[tokio::test]
+async fn test_completion_chdir_resync_after_daemon_restart() {
+    // Mock script that requires chdir before input; fails if chdir wasn't received in this process
+    let mock_script = r#"#!/usr/bin/env zsh
+has_chdir=0
+count=0
+while IFS= read -r line; do
+    if [[ $line == chdir:* ]]; then
+        has_chdir=1
+    elif [[ $line == input:* ]]; then
+        if [[ $has_chdir -eq 1 ]]; then
+            count=$((count + 1))
+            if [[ $count -eq 1 ]]; then
+                printf "item_ok\tdesc\x01EOC\x01\n"
+            else
+                exit 1
+            fi
+        else
+            printf "item_no_chdir\tdesc\x01EOC\x01\n"
+        fi
+    fi
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///workspace/project/script.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git ").await;
+
+    // 1. First request receives chdir and succeeds
+    let res1 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items1 = get_completion_items(res1);
+    assert_eq!(items1[0].label, "item_ok");
+
+    // 2. Second request causes crash
+    let _ = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await;
+
+    // 3. Third request after supervisor restart: new daemon must receive chdir again
+    let res3 = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items3 = get_completion_items(res3);
+    assert_eq!(items3[0].label, "item_ok");
 }

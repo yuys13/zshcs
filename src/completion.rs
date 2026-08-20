@@ -9,6 +9,7 @@ pub const ZPTYRC_ZSH: &str = include_str!("../bin/zptyrc.zsh");
 
 pub struct CompletionRequest {
     pub prefix: String,
+    pub cwd: Option<PathBuf>,
     pub responder: oneshot::Sender<Result<Vec<CompletionItem>, String>>,
 }
 
@@ -16,6 +17,7 @@ struct DaemonProcess {
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
     stdout_reader: BufReader<tokio::process::ChildStdout>,
+    current_cwd: Option<PathBuf>,
 }
 
 impl DaemonProcess {
@@ -56,6 +58,7 @@ impl DaemonProcess {
             child,
             stdin,
             stdout_reader,
+            current_cwd: None,
         })
     }
 
@@ -111,6 +114,31 @@ pub async fn run_completion_daemon(
                 }
             },
         };
+
+        // Synchronize working directory if specified and changed
+        if let Some(target_cwd) = &req.cwd {
+            let need_chdir = match &proc.current_cwd {
+                Some(current) => current != target_cwd,
+                None => true,
+            };
+            if need_chdir {
+                let chdir_msg = format!("chdir:{}\n", target_cwd.display());
+                if let Err(e) = proc.stdin.write_all(chdir_msg.as_bytes()).await {
+                    client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("Failed to write chdir to completion daemon stdin: {e}"),
+                        )
+                        .await;
+                    daemon = None;
+                    let _ = req
+                        .responder
+                        .send(Err(format!("Failed to write to daemon: {e}")));
+                    continue;
+                }
+                proc.current_cwd = Some(target_cwd.clone());
+            }
+        }
 
         // Send input message to daemon
         let msg = format!("input:{}\n", req.prefix);
