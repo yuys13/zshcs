@@ -613,6 +613,25 @@ async fn test_multi_document_did_close() {
             },
         )
         .await;
+    let close_log = test_client.read_notification::<LogMessage>().await.unwrap();
+    assert_eq!(close_log.typ, MessageType::INFO);
+    assert!(
+        close_log
+            .message
+            .contains("textDocument/didClose: file:///close_a.zsh")
+    );
+
+    // Verify doc_a is discarded from memory
+    let res_a = test_client
+        .send_request::<request::ExecuteCommand>(ExecuteCommandParams {
+            command: "zshcs/getDocumentContent".to_string(),
+            arguments: vec![serde_json::to_value(&doc_a).unwrap()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let content_a: Option<String> = res_a.and_then(|v| serde_json::from_value(v).ok()).flatten();
+    assert_eq!(content_a, None, "Closed doc_a must be freed from memory");
 
     // Edit doc_b
     test_client
@@ -638,6 +657,183 @@ async fn test_multi_document_did_close() {
         .unwrap();
     let content_b: Option<String> = res_b.and_then(|v| serde_json::from_value(v).ok()).flatten();
     assert_eq!(content_b, Some("initial B updated".to_string()));
+}
+
+#[tokio::test]
+async fn test_did_close_handler() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///test_close_standalone.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "echo closing").await;
+
+    // Verify document exists
+    let res = test_client
+        .send_request::<request::ExecuteCommand>(ExecuteCommandParams {
+            command: "zshcs/getDocumentContent".to_string(),
+            arguments: vec![serde_json::to_value(&doc_uri).unwrap()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let content: Option<String> = res.and_then(|v| serde_json::from_value(v).ok()).flatten();
+    assert_eq!(content, Some("echo closing".to_string()));
+
+    // Send didClose
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidCloseTextDocument>(
+            tower_lsp::lsp_types::DidCloseTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+            },
+        )
+        .await;
+
+    let log = test_client.read_notification::<LogMessage>().await.unwrap();
+    assert_eq!(log.typ, MessageType::INFO);
+    assert!(
+        log.message
+            .contains("textDocument/didClose: file:///test_close_standalone.zsh")
+    );
+
+    // Verify document is removed
+    let res_after = test_client
+        .send_request::<request::ExecuteCommand>(ExecuteCommandParams {
+            command: "zshcs/getDocumentContent".to_string(),
+            arguments: vec![serde_json::to_value(&doc_uri).unwrap()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let content_after: Option<String> = res_after
+        .and_then(|v| serde_json::from_value(v).ok())
+        .flatten();
+    assert_eq!(content_after, None);
+}
+
+#[tokio::test]
+async fn test_did_close_unopened_document() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let initialize_params = InitializeParams::default();
+    test_client
+        .send_request::<request::Initialize>(initialize_params)
+        .await
+        .unwrap();
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+    test_client.read_notification::<LogMessage>().await.unwrap();
+    test_client.read_notification::<LogMessage>().await.unwrap();
+
+    let doc_uri = Url::parse("file:///never_opened.zsh").unwrap();
+
+    // Send didClose for unopened file
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidCloseTextDocument>(
+            tower_lsp::lsp_types::DidCloseTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+            },
+        )
+        .await;
+
+    let log = test_client.read_notification::<LogMessage>().await.unwrap();
+    assert_eq!(log.typ, MessageType::WARNING);
+    assert!(log.message.contains("document not found"));
+}
+
+#[tokio::test]
+async fn test_did_change_outdated_version() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///outdated_version.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "initial text").await;
+
+    // Apply change with version 2
+    test_client
+        .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 2),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "version 2 text".to_string(),
+            }],
+        })
+        .await;
+    test_client.read_notification::<LogMessage>().await;
+
+    // Attempt to apply change with version 1 (outdated)
+    test_client
+        .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 1),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "stale version 1 text".to_string(),
+            }],
+        })
+        .await;
+
+    let log = test_client.read_notification::<LogMessage>().await.unwrap();
+    assert_eq!(log.typ, MessageType::WARNING);
+    assert!(log.message.contains("outdated version"));
+
+    // Verify document content was preserved at version 2
+    let res = test_client
+        .send_request::<request::ExecuteCommand>(ExecuteCommandParams {
+            command: "zshcs/getDocumentContent".to_string(),
+            arguments: vec![serde_json::to_value(&doc_uri).unwrap()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let content: Option<String> = res.and_then(|v| serde_json::from_value(v).ok()).flatten();
+    assert_eq!(content, Some("version 2 text".to_string()));
+}
+
+#[tokio::test]
+async fn test_completion_after_did_close() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///completion_closed.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git s").await;
+
+    // Close document
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidCloseTextDocument>(
+            tower_lsp::lsp_types::DidCloseTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+            },
+        )
+        .await;
+    test_client.read_notification::<LogMessage>().await;
+
+    // Request completion on closed document
+    let res = test_client
+        .send_request::<request::Completion>(tower_lsp::lsp_types::CompletionParams {
+            text_document_position: tower_lsp::lsp_types::TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(0, 5),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await;
+
+    assert!(res.is_ok());
+    assert!(
+        res.unwrap().is_none(),
+        "Completion on closed document must return None"
+    );
 }
 
 #[tokio::test]
@@ -1034,4 +1230,275 @@ async fn test_rapid_burst_completion_requests() {
             "Burst request {i} failed to contain 'status'"
         );
     }
+}
+
+#[tokio::test]
+async fn test_reopen_closed_document() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///reopen.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "initial text").await;
+
+    // Close
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidCloseTextDocument>(
+            tower_lsp::lsp_types::DidCloseTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+            },
+        )
+        .await;
+    test_client.read_notification::<LogMessage>().await;
+
+    // Verify it is gone
+    let res = test_client
+        .send_request::<request::ExecuteCommand>(ExecuteCommandParams {
+            command: "zshcs/getDocumentContent".to_string(),
+            arguments: vec![serde_json::to_value(&doc_uri).unwrap()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let content: Option<String> = res.and_then(|v| serde_json::from_value(v).ok()).flatten();
+    assert_eq!(content, None);
+
+    // Reopen
+    test_client
+        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: doc_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: "reopened text".to_string(),
+            },
+        })
+        .await;
+    test_client.read_notification::<LogMessage>().await;
+
+    // Modify
+    test_client
+        .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 2),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "modified reopened text".to_string(),
+            }],
+        })
+        .await;
+    test_client.read_notification::<LogMessage>().await;
+
+    // Verify
+    let res2 = test_client
+        .send_request::<request::ExecuteCommand>(ExecuteCommandParams {
+            command: "zshcs/getDocumentContent".to_string(),
+            arguments: vec![serde_json::to_value(&doc_uri).unwrap()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let content2: Option<String> = res2.and_then(|v| serde_json::from_value(v).ok()).flatten();
+    assert_eq!(content2, Some("modified reopened text".to_string()));
+}
+
+#[tokio::test]
+async fn test_double_did_close() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///double_close.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "content").await;
+
+    // First didClose -> INFO
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidCloseTextDocument>(
+            tower_lsp::lsp_types::DidCloseTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+            },
+        )
+        .await;
+    let log1 = test_client.read_notification::<LogMessage>().await.unwrap();
+    assert_eq!(log1.typ, MessageType::INFO);
+    assert!(
+        log1.message
+            .contains("textDocument/didClose: file:///double_close.zsh")
+    );
+
+    // Second didClose -> WARNING
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidCloseTextDocument>(
+            tower_lsp::lsp_types::DidCloseTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+            },
+        )
+        .await;
+    let log2 = test_client.read_notification::<LogMessage>().await.unwrap();
+    assert_eq!(log2.typ, MessageType::WARNING);
+    assert!(log2.message.contains("document not found"));
+}
+
+#[tokio::test]
+async fn test_did_change_on_closed_document() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///change_after_close.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "content").await;
+
+    // Close
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidCloseTextDocument>(
+            tower_lsp::lsp_types::DidCloseTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+            },
+        )
+        .await;
+    test_client.read_notification::<LogMessage>().await;
+
+    // Attempt to change
+    test_client
+        .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 2),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "new content".to_string(),
+            }],
+        })
+        .await;
+
+    let log = test_client.read_notification::<LogMessage>().await.unwrap();
+    assert_eq!(log.typ, MessageType::WARNING);
+    assert!(log.message.contains("document not found"));
+}
+
+#[tokio::test]
+async fn test_rapid_open_change_close_reopen_cycle() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///rapid_cycle.zsh").unwrap();
+
+    let initialize_params = InitializeParams::default();
+    test_client
+        .send_request::<request::Initialize>(initialize_params)
+        .await
+        .unwrap();
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+    test_client.read_notification::<LogMessage>().await.unwrap();
+    test_client.read_notification::<LogMessage>().await.unwrap();
+
+    for cycle in 1..=10 {
+        // Open
+        test_client
+            .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: format!("cycle_{cycle}_initial"),
+                },
+            })
+            .await;
+        test_client.read_notification::<LogMessage>().await.unwrap();
+
+        // Change
+        test_client
+            .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 2),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: format!("cycle_{cycle}_modified"),
+                }],
+            })
+            .await;
+        test_client.read_notification::<LogMessage>().await.unwrap();
+
+        // Verify content
+        let res = test_client
+            .send_request::<request::ExecuteCommand>(ExecuteCommandParams {
+                command: "zshcs/getDocumentContent".to_string(),
+                arguments: vec![serde_json::to_value(&doc_uri).unwrap()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let content: Option<String> = res.and_then(|v| serde_json::from_value(v).ok()).flatten();
+        assert_eq!(content, Some(format!("cycle_{cycle}_modified")));
+
+        // Close
+        test_client
+            .send_notification::<tower_lsp::lsp_types::notification::DidCloseTextDocument>(
+                tower_lsp::lsp_types::DidCloseTextDocumentParams {
+                    text_document: tower_lsp::lsp_types::TextDocumentIdentifier {
+                        uri: doc_uri.clone(),
+                    },
+                },
+            )
+            .await;
+        test_client.read_notification::<LogMessage>().await.unwrap();
+
+        // Verify content is None
+        let res_closed = test_client
+            .send_request::<request::ExecuteCommand>(ExecuteCommandParams {
+                command: "zshcs/getDocumentContent".to_string(),
+                arguments: vec![serde_json::to_value(&doc_uri).unwrap()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let content_closed: Option<String> = res_closed
+            .and_then(|v| serde_json::from_value(v).ok())
+            .flatten();
+        assert_eq!(content_closed, None);
+    }
+}
+
+#[tokio::test]
+async fn test_close_and_immediate_completion_race() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///race_close.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git ").await;
+
+    // Send didClose immediately followed by completion request
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidCloseTextDocument>(
+            tower_lsp::lsp_types::DidCloseTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+            },
+        )
+        .await;
+
+    let res = test_client
+        .send_request::<request::Completion>(tower_lsp::lsp_types::CompletionParams {
+            text_document_position: tower_lsp::lsp_types::TextDocumentPositionParams {
+                text_document: tower_lsp::lsp_types::TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap();
+
+    // Since document was closed, completion must safely return None
+    assert!(res.is_none());
 }

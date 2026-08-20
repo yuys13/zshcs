@@ -1,8 +1,6 @@
 use std::io::Write;
-use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
@@ -12,13 +10,12 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::completion::{CAPTURE_ZSH, CompletionRequest, ZPTYRC_ZSH, run_completion_daemon};
-use crate::document::position_to_byte_offset;
+use crate::document::DocumentManager;
 
 #[derive(Debug)]
 pub struct Backend {
     client: Client,
-    document_map: Arc<DashMap<Url, String>>,
-    document_versions: Arc<DashMap<Url, i32>>,
+    document_manager: DocumentManager,
     _temp_dir: TempDir,
     completion_tx: mpsc::Sender<CompletionRequest>,
 }
@@ -48,11 +45,14 @@ impl Backend {
 
         Backend {
             client,
-            document_map: Arc::new(DashMap::new()),
-            document_versions: Arc::new(DashMap::new()),
+            document_manager: DocumentManager::new(),
             _temp_dir: temp_dir,
             completion_tx: tx,
         }
+    }
+
+    pub fn document_manager(&self) -> &DocumentManager {
+        &self.document_manager
     }
 }
 
@@ -104,8 +104,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
         let version = params.text_document.version;
-        self.document_map.insert(uri.clone(), text);
-        self.document_versions.insert(uri.clone(), version);
+        self.document_manager.open(uri.clone(), version, text);
         self.client
             .log_message(MessageType::INFO, format!("textDocument/didOpen: {uri}"))
             .await;
@@ -115,64 +114,46 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
 
-        for change in params.content_changes {
-            if let Some(range) = change.range {
-                // Incremental update
-                let res = {
-                    if let Some(mut doc) = self.document_map.get_mut(&uri) {
-                        if let Some(start_offset) = position_to_byte_offset(&doc, range.start)
-                            && let Some(end_offset) = position_to_byte_offset(&doc, range.end)
-                            && start_offset <= end_offset
-                        {
-                            doc.replace_range(start_offset..end_offset, &change.text);
-                            Ok(())
-                        } else {
-                            Err(format!("invalid range {range:?}"))
-                        }
-                    } else {
-                        Err("document not found".to_string())
-                    }
-                };
-
-                if let Err(e) = res {
-                    self.client
-                        .log_message(
-                            MessageType::WARNING,
-                            format!("Failed to apply incremental change: {e} for document {uri}"),
-                        )
-                        .await;
-                }
-            } else {
-                // Full sync (range is None)
-                self.document_map.insert(uri.clone(), change.text);
-            }
+        if let Err(e) = self
+            .document_manager
+            .apply_changes(&uri, version, params.content_changes)
+        {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("Failed to apply incremental change: {e} for document {uri}"),
+                )
+                .await;
         }
-        self.document_versions.insert(uri.clone(), version);
+
         self.client
             .log_message(MessageType::INFO, format!("textDocument/didChange: {uri}"))
             .await;
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = params.text_document.uri;
+        if self.document_manager.close(&uri).is_some() {
+            self.client
+                .log_message(MessageType::INFO, format!("textDocument/didClose: {uri}"))
+                .await;
+        } else {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("textDocument/didClose: document not found {uri}"),
+                )
+                .await;
+        }
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let prefix = {
-            let doc = self.document_map.get(&uri);
-            if doc.is_none() {
-                return Ok(None);
-            }
-            let text = doc.unwrap();
-
-            let offset = position_to_byte_offset(&text, position);
-            if offset.is_none() {
-                return Ok(None);
-            }
-            let offset = offset.unwrap();
-
-            // Find start of line
-            let line_start = text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
-            text[line_start..offset].to_string()
+        let prefix = match self.document_manager.get_line_prefix(&uri, position) {
+            Some(p) => p,
+            None => return Ok(None),
         };
 
         // Request completion from the daemon
@@ -227,7 +208,7 @@ impl LanguageServer for Backend {
                 .first()
                 .and_then(|v| serde_json::from_value::<Url>(v.clone()).ok())
         {
-            let content = self.document_map.get(&uri).map(|doc| doc.value().clone());
+            let content = self.document_manager.get_content(&uri);
             return Ok(Some(serde_json::to_value(content).unwrap()));
         }
         Ok(None)
