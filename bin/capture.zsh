@@ -36,7 +36,8 @@ while true; do
         $MSG_CHDIR*)
             # Change the current working directory in the pty
             local new_cwd=${message#$MSG_CHDIR}
-            zpty -w -n z "${KILL_BUFFER}cd ${(qq)new_cwd}${ACCEPT_LINE}"
+            zpty -w -n z "${KILL_BUFFER}cd ${(qq)new_cwd} && echo __cd_done__${ACCEPT_LINE}"
+            zpty -r -m z line '*__cd_done__'$'\r'
             continue
             ;;
         $MSG_INPUT*)
