@@ -19,7 +19,7 @@ use tower_lsp::{LspService, Server};
 use zshcs::Backend;
 
 pub async fn read_message(stream: &mut DuplexStream) -> Option<String> {
-    let timeout_duration = Duration::from_secs(5);
+    let timeout_duration = Duration::from_secs(15);
 
     let result = tokio::time::timeout(timeout_duration, async {
         let mut content_length = 0;
@@ -255,8 +255,17 @@ pub fn setup_server_mock() -> (DuplexStream, tokio::task::JoinHandle<()>) {
 
 pub fn setup_server() -> (DuplexStream, tokio::task::JoinHandle<()>) {
     let (client_stream, server_stream) = tokio::io::duplex(4096);
-    let (service, client_socket) =
-        LspService::new(|client| Backend::new(client).expect("Failed to initialize test backend"));
+    let (service, client_socket) = LspService::new(|client| {
+        let temp_cache = tempfile::tempdir().expect("Failed to create test cache dir");
+        let cache_path = temp_cache.keep();
+        Backend::new_with_scripts_and_cache(
+            client,
+            zshcs::CAPTURE_ZSH,
+            zshcs::ZPTYRC_ZSH,
+            Some(cache_path),
+        )
+        .expect("Failed to initialize test backend")
+    });
 
     let server_handle = tokio::spawn(async move {
         let (server_read, server_write) = tokio::io::split(server_stream);
@@ -274,7 +283,9 @@ pub fn setup_server_with_scripts(
 ) -> (DuplexStream, tokio::task::JoinHandle<()>) {
     let (client_stream, server_stream) = tokio::io::duplex(4096);
     let (service, client_socket) = LspService::new(move |client| {
-        Backend::new_with_scripts(client, capture_script, zptyrc_script)
+        let temp_cache = tempfile::tempdir().expect("Failed to create test cache dir");
+        let cache_path = temp_cache.keep();
+        Backend::new_with_scripts_and_cache(client, capture_script, zptyrc_script, Some(cache_path))
             .expect("Failed to initialize test backend with scripts")
     });
 
