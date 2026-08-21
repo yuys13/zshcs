@@ -1502,3 +1502,90 @@ async fn test_close_and_immediate_completion_race() {
     // Since document was closed, completion must safely return None
     assert!(res.is_none());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_async_server_initialization_handshake() {
+    use tower_lsp::{LspService, Server};
+    use zshcs::Backend;
+
+    let (client_stream, server_stream) = tokio::io::duplex(4096);
+    let (service, client_socket) = LspService::new(|client| {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                Backend::new_async(client)
+                    .await
+                    .expect("Failed to create async backend")
+            })
+        })
+    });
+
+    let _server_handle = tokio::spawn(async move {
+        let (server_read, server_write) = tokio::io::split(server_stream);
+        Server::new(server_read, server_write, client_socket)
+            .serve(service)
+            .await;
+    });
+
+    let mut client_stream_mut = client_stream;
+    let mut test_client = TestClient::new(&mut client_stream_mut);
+
+    let init_result: InitializeResult = test_client
+        .send_request::<Initialize>(InitializeParams::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        init_result.server_info.as_ref().unwrap().name,
+        "zshcs-language-server"
+    );
+
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+
+    let log1: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    let log2: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    assert!(log1.is_some());
+    assert!(log2.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_async_with_scripts_server_initialization() {
+    use tower_lsp::{LspService, Server};
+    use zshcs::Backend;
+
+    let (client_stream, server_stream) = tokio::io::duplex(4096);
+    let (service, client_socket) = LspService::new(|client| {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                Backend::new_with_scripts_async(
+                    client,
+                    common::MOCK_DUMMY_CAPTURE,
+                    common::MOCK_DUMMY_ZPTYRC,
+                )
+                .await
+                .expect("Failed to create async backend with scripts")
+            })
+        })
+    });
+
+    let _server_handle = tokio::spawn(async move {
+        let (server_read, server_write) = tokio::io::split(server_stream);
+        Server::new(server_read, server_write, client_socket)
+            .serve(service)
+            .await;
+    });
+
+    let mut client_stream_mut = client_stream;
+    let mut test_client = TestClient::new(&mut client_stream_mut);
+
+    let init_result: InitializeResult = test_client
+        .send_request::<Initialize>(InitializeParams::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        init_result.server_info.as_ref().unwrap().name,
+        "zshcs-language-server"
+    );
+}
