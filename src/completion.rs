@@ -10,7 +10,7 @@ use crate::error::{ZshcsError, ZshcsResult};
 
 pub const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
 pub const ZPTYRC_ZSH: &str = include_str!("../bin/zptyrc.zsh");
-pub const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
+pub const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_millis(5000);
 
 pub struct CompletionRequest {
     pub prefix: String,
@@ -26,9 +26,19 @@ struct DaemonProcess {
 }
 
 impl DaemonProcess {
-    fn spawn(script_path: &PathBuf, client: &Client) -> std::io::Result<Self> {
-        let mut child = tokio::process::Command::new("zsh")
-            .arg(script_path)
+    fn spawn(
+        script_path: &PathBuf,
+        cache_dir: Option<&PathBuf>,
+        client: &Client,
+    ) -> std::io::Result<Self> {
+        let mut cmd = tokio::process::Command::new("zsh");
+        cmd.arg(script_path);
+        if let Some(dir) = cache_dir {
+            std::fs::create_dir_all(dir)?;
+            cmd.env("ZSHCS_CACHE_DIR", dir);
+        }
+
+        let mut child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -80,6 +90,7 @@ impl DaemonProcess {
 
 pub async fn run_completion_daemon(
     script_path: PathBuf,
+    cache_dir: Option<PathBuf>,
     mut rx: mpsc::Receiver<CompletionRequest>,
     client: Client,
 ) {
@@ -105,7 +116,7 @@ pub async fn run_completion_daemon(
 
         // Spawn daemon if not currently running
         if daemon.is_none() {
-            match DaemonProcess::spawn(&script_path, &client) {
+            match DaemonProcess::spawn(&script_path, cache_dir.as_ref(), &client) {
                 Ok(p) => {
                     daemon = Some(p);
                 }

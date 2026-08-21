@@ -194,7 +194,7 @@ async fn test_daemon_crash_tolerance() {
 async fn test_daemon_timeout() {
     // Mock capture script that sleeps, preventing an immediate EOC response
     let (mut client_stream, _server_handle) = setup_server_with_scripts(
-        "#!/usr/bin/env zsh\nwhile read -r p; do sleep 5; done\n",
+        "#!/usr/bin/env zsh\nwhile read -r p; do sleep 10; done\n",
         "",
     );
     let mut test_client = common::TestClient::new(&mut client_stream);
@@ -217,7 +217,7 @@ async fn test_daemon_timeout() {
         .await;
 
     let elapsed = start.elapsed().as_millis();
-    assert!(elapsed >= 2500, "Completion should wait for the timeout");
+    assert!(elapsed >= 5000, "Completion should wait for the timeout");
 
     assert!(res.is_ok());
     assert!(res.unwrap().is_none());
@@ -1580,4 +1580,64 @@ async fn test_completion_rapid_directory_switching_stress() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn test_completion_custom_cache_directory_isolation() {
+    let custom_cache_temp = tempfile::tempdir().unwrap();
+    let custom_cache_path = custom_cache_temp.path().to_path_buf();
+
+    // Mock script that checks if ZSHCS_CACHE_DIR environment variable is passed
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    if [[ $line == input:* ]]; then
+        printf "cached_env:%s\tdesc\x01EOC\x01\n" "$ZSHCS_CACHE_DIR"
+    fi
+done
+"#;
+
+    let (client_stream, server_stream) = tokio::io::duplex(4096);
+    let cache_clone = custom_cache_path.clone();
+    let (service, client_socket) = tower_lsp::LspService::new(move |client| {
+        zshcs::Backend::new_with_scripts_and_cache(
+            client,
+            mock_script,
+            "",
+            Some(cache_clone.clone()),
+        )
+        .expect("Failed to initialize test backend with cache")
+    });
+
+    let _server_handle = tokio::spawn(async move {
+        let (server_read, server_write) = tokio::io::split(server_stream);
+        tower_lsp::Server::new(server_read, server_write, client_socket)
+            .serve(service)
+            .await;
+    });
+
+    let mut stream = client_stream;
+    let mut test_client = common::TestClient::new(&mut stream);
+    let doc_uri = Url::parse("file:///cache_test.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "echo ").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 5),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert_eq!(items.len(), 1);
+    let expected_label = format!("cached_env:{}", custom_cache_path.to_string_lossy());
+    assert_eq!(items[0].label, expected_label);
 }

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -32,6 +33,16 @@ impl Backend {
         capture_script: &str,
         zptyrc_script: &str,
     ) -> ZshcsResult<Self> {
+        Self::new_with_scripts_and_cache(client, capture_script, zptyrc_script, None)
+    }
+
+    /// Creates a new `Backend` instance synchronously with custom scripts and an optional cache directory.
+    pub fn new_with_scripts_and_cache(
+        client: Client,
+        capture_script: &str,
+        zptyrc_script: &str,
+        cache_dir: Option<PathBuf>,
+    ) -> ZshcsResult<Self> {
         let temp_dir = tempfile::tempdir()?;
         let capture_path = temp_dir.path().join("capture.zsh");
         let zptyrc_path = temp_dir.path().join("zptyrc.zsh");
@@ -42,7 +53,12 @@ impl Backend {
         let (tx, rx) = mpsc::channel(32);
 
         let client_clone = client.clone();
-        tokio::spawn(run_completion_daemon(capture_path, rx, client_clone));
+        tokio::spawn(run_completion_daemon(
+            capture_path,
+            cache_dir,
+            rx,
+            client_clone,
+        ));
 
         Ok(Backend {
             client,
@@ -63,6 +79,16 @@ impl Backend {
         capture_script: &str,
         zptyrc_script: &str,
     ) -> ZshcsResult<Self> {
+        Self::new_with_scripts_and_cache_async(client, capture_script, zptyrc_script, None).await
+    }
+
+    /// Creates a new `Backend` instance asynchronously with custom scripts, optional cache directory, and non-blocking async I/O.
+    pub async fn new_with_scripts_and_cache_async(
+        client: Client,
+        capture_script: &str,
+        zptyrc_script: &str,
+        cache_dir: Option<PathBuf>,
+    ) -> ZshcsResult<Self> {
         let temp_dir = tempfile::tempdir()?;
         let capture_path = temp_dir.path().join("capture.zsh");
         let zptyrc_path = temp_dir.path().join("zptyrc.zsh");
@@ -73,7 +99,12 @@ impl Backend {
         let (tx, rx) = mpsc::channel(32);
 
         let client_clone = client.clone();
-        tokio::spawn(run_completion_daemon(capture_path, rx, client_clone));
+        tokio::spawn(run_completion_daemon(
+            capture_path,
+            cache_dir,
+            rx,
+            client_clone,
+        ));
 
         Ok(Backend {
             client,
@@ -210,7 +241,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
-        let output_result = timeout(Duration::from_millis(3000), rx).await;
+        let output_result = timeout(Duration::from_millis(6000), rx).await;
 
         match output_result {
             Ok(Ok(Ok(items))) => Ok(Some(CompletionResponse::Array(items))),
