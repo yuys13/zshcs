@@ -40,10 +40,7 @@ impl Config {
 
         // 2. Try unwrapping `settings` wrapper: {"settings": {"zshcs": ...}}
         if let Some(settings_val) = val.get("settings") {
-            let conf = Self::from_value(Some(settings_val));
-            if conf.experimental_diagnostics() {
-                return conf;
-            }
+            return Self::from_value(Some(settings_val));
         }
 
         // 3. Try parsing root object directly: {"experimental": {"diagnostics": true}}
@@ -188,6 +185,30 @@ mod tests {
         let config = Config::from_value(Some(&val));
         assert!(config.experimental_diagnostics());
         assert!(extract_experimental_diagnostics(Some(&val)));
+
+        let val_false = json!({
+            "settings": {
+                "zshcs": {
+                    "experimental": {
+                        "diagnostics": false
+                    }
+                }
+            }
+        });
+        let config_false = Config::from_value(Some(&val_false));
+        assert!(!config_false.experimental_diagnostics());
+        assert!(!extract_experimental_diagnostics(Some(&val_false)));
+
+        let val_direct = json!({
+            "settings": {
+                "experimental": {
+                    "diagnostics": true
+                }
+            }
+        });
+        let config_direct = Config::from_value(Some(&val_direct));
+        assert!(config_direct.experimental_diagnostics());
+        assert!(extract_experimental_diagnostics(Some(&val_direct)));
     }
 
     #[test]

@@ -329,7 +329,7 @@ flowchart TD
     ```
   - Also tolerates flat `{ "experimental": { "diagnostics": true } }` payloads without panic or type failure.
 - **Asynchronous Syntax Verification Engine (`check_syntax`)**:
-  - Executes `zsh -n -c <text>` asynchronously with a 2000ms timeout guard (`DEFAULT_SYNTAX_CHECK_TIMEOUT`).
+  - Executes `zsh -n <temp_path>` asynchronously using temporary scripts with a 2000ms timeout guard (`DEFAULT_SYNTAX_CHECK_TIMEOUT`).
   - Pipes standard error output while discarding standard output, returning structured `Vec<Diagnostic>`.
 - **Diagnostic Error Parsing & Range Calculation (`parse_diagnostics`)**:
   - Parses standard error lines formatted as `zsh:<line>: <message>`, `/path/to/script:<line>: <message>`, or `zsh: <message>`.
@@ -416,7 +416,7 @@ sequenceDiagram
         Server->>Server: Spawn debounced task (150ms delay)
         Note over Server: Check doc.version == current_version
         Server->>Diag: check_syntax(text)
-        Diag->>Diag: Spawn `zsh -n -c <text>` (2s timeout)
+        Diag->>Diag: Spawn `zsh -n <temp_path>` (2s timeout)
         Diag->>Diag: parse_diagnostics(stderr, text)
         Diag-->>Server: Vec<Diagnostic>
         Server->>DocMgr: Verify doc.version == current_version
@@ -458,7 +458,7 @@ flowchart LR
 ### 4.1 Test Suites Overview
 
 1. **Rust Integration & Unit Test Suites**:
-   - `tests/diagnostics_test.rs` (6 tests): Validates experimental syntax diagnostics opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, syntax error reporting, error clearing on fix, buffer closing cleanup, and edit debouncing.
+   - `tests/diagnostics_test.rs` (9 tests): Validates experimental syntax diagnostics opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, syntax error reporting, error clearing on fix, buffer closing cleanup, and edit debouncing.
    - `tests/completion_test.rs` (37 tests): Validates LSP completions, consecutive requests, dynamic item kinds, working directory switching, crash recovery, timeout handling, and CRLF / multibyte buffers.
    - `tests/server_test.rs` (34 tests): Tests initialize handshake, capabilities negotiation, incremental synchronization, out-of-order versions, invalid ranges, document close cleanup, and custom execution commands.
    - `tests/logging_test.rs` (8 tests): Validates tracing subscriber initialization, `stderr` log routing, stdout JSON-RPC isolation, and dynamic `ZSHCS_LOG` / `RUST_LOG` filter evaluation.

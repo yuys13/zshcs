@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::process::Command;
+use std::sync::Mutex;
 use tempfile::tempdir;
 use zshcs::cli::{Cli, Commands};
 use zshcs::doctor::{
@@ -7,6 +8,8 @@ use zshcs::doctor::{
     check_zpty_module, check_zsh_executable, check_zutil_module, run_doctor, run_doctor_checks,
     run_doctor_with_writer,
 };
+
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 #[test]
 fn test_cli_parse_doctor_subcommand() {
@@ -117,6 +120,7 @@ fn test_check_cache_directory_custom_tempdir() {
 
 #[test]
 fn test_check_cache_directory_default_env() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let temp_dir = tempdir().unwrap();
     let cache_path = temp_dir.path().join("env_cache");
     // SAFETY: Single-threaded test execution scope for env var test
@@ -238,6 +242,7 @@ fn test_doctor_report_rendering_failure_without_warnings() {
 
 #[test]
 fn test_check_cache_directory_empty_env_vars() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let temp_dir = tempdir().unwrap();
     let home_path = temp_dir.path().join("home");
     std::fs::create_dir_all(&home_path).unwrap();
@@ -274,6 +279,7 @@ fn test_check_status_symbols_and_labels() {
 
 #[test]
 fn test_run_doctor_checks_returns_five_checks() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let report = run_doctor_checks();
     assert_eq!(report.checks.len(), 5);
     assert_eq!(report.checks[0].name, "Zsh Executable");
@@ -286,6 +292,7 @@ fn test_run_doctor_checks_returns_five_checks() {
 
 #[test]
 fn test_run_doctor_with_writer_writes_and_returns_true() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let mut buffer = Vec::new();
     let success = run_doctor_with_writer(&mut buffer);
     assert!(success);
@@ -297,6 +304,7 @@ fn test_run_doctor_with_writer_writes_and_returns_true() {
 
 #[test]
 fn test_run_doctor_function_returns_zero_exit_code() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let code = run_doctor();
     assert_eq!(code, 0);
 }

@@ -334,7 +334,6 @@ mod tests {
         script.push_str("if [[ ; then\n  echo fail\nfi\n");
 
         let diags = check_syntax(&script).await;
-        eprintln!("LARGE BUFFER DIAGS: {diags:#?}");
         assert!(!diags.is_empty());
         assert_eq!(diags[0].range.start.line, 5000);
         assert!(diags[0].message.contains("parse error"));
@@ -356,5 +355,37 @@ mod tests {
         let (line3, msg3) = extract_line_and_message("fatal syntax error");
         assert_eq!(line3, 1);
         assert_eq!(msg3, "fatal syntax error");
+    }
+
+    #[test]
+    fn test_parse_diagnostic_crlf() {
+        let stderr = "zsh:2: parse error near `;'";
+        let text = "echo hello\r\nif [[ ; then\r\n  echo bad\r\nfi\r\n";
+        let diags = parse_diagnostics(stderr, text);
+        assert_eq!(diags.len(), 1);
+        let diag = &diags[0];
+        assert_eq!(diag.range.start, Position::new(1, 0));
+        assert_eq!(diag.range.end, Position::new(1, 12));
+    }
+
+    #[test]
+    fn test_parse_diagnostic_no_trailing_newline() {
+        let stderr = "zsh:1: parse error near `then'";
+        let text = "if [[ ; then";
+        let diags = parse_diagnostics(stderr, text);
+        assert_eq!(diags.len(), 1);
+        let diag = &diags[0];
+        assert_eq!(diag.range.start, Position::new(0, 0));
+        assert_eq!(diag.range.end, Position::new(0, 12));
+    }
+
+    #[test]
+    fn test_parse_diagnostic_path_with_multiple_colons() {
+        let stderr = "/path:with:colons/file.zsh:7: parse error near `fi'";
+        let text = "1\n2\n3\n4\n5\n6\nfi\n8";
+        let diags = parse_diagnostics(stderr, text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].range.start, Position::new(6, 0));
+        assert_eq!(diags[0].message, "parse error near `fi'");
     }
 }
