@@ -1,9 +1,10 @@
 use clap::Parser;
 use tower_lsp::{LspService, Server};
-use zshcs::{Backend, Cli};
+use zshcs::{Backend, Cli, init_logging};
 
 #[tokio::main]
 async fn main() {
+    init_logging();
     let _cli = Cli::parse();
 
     let stdin = tokio::io::stdin();
@@ -11,6 +12,7 @@ async fn main() {
 
     let (service, socket) = LspService::new(|client| {
         Backend::new(client).unwrap_or_else(|err| {
+            tracing::error!("Failed to initialize zshcs backend: {err}");
             eprintln!("Failed to initialize zshcs backend: {err}");
             std::process::exit(1);
         })

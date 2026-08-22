@@ -18,6 +18,7 @@ flowchart TB
         LSPBackend["LSP Backend (`src/server.rs`)<br/>• LanguageServer Trait<br/>• Request Routing & Commands"]
         DocMgr["DocumentManager (`src/document.rs`)<br/>• In-Memory Arc&lt;DashMap&lt;Url, DocumentState&gt;&gt;<br/>• Incremental Sync & UTF-16/UTF-8 Mapping"]
         Supervisor["Daemon Supervisor (`src/completion.rs`)<br/>• run_completion_daemon<br/>• HoL Cancellation & Timeout Guard<br/>• Process Recovery & chdir Sync"]
+        Logging["Logging Subsystem (`src/logging.rs`)<br/>• tracing & tracing-subscriber<br/>• Stderr Destination & EnvFilter"]
         ErrHandling["Error Hierarchy (`src/error.rs`)<br/>• ZshcsError / ZshcsResult<br/>• Type-Safe Conversions"]
     end
 
@@ -26,9 +27,10 @@ flowchart TB
         ZptySubshell["Interactive Zsh Subshell (`zpty`)<br/>• zptyrc.zsh Configuration<br/>• compadd Interception Hook<br/>• Isolated Cache ($ZSHCS_CACHE_DIR)"]
     end
 
-    Editor <-->|LSP JSON-RPC / stdio| LSPBackend
+    Editor <-->|LSP JSON-RPC / stdio (stdout)| LSPBackend
     LSPBackend <-->|CRUD & Offset Conversion| DocMgr
     LSPBackend -->|mpsc / oneshot| Supervisor
+    RustServer -.->|Structured Logs (stderr)| Editor
     Supervisor <-->|Piped stdin/stdout (RPC: input / chdir)| CaptureScript
     CaptureScript <-->|PTY (C-U / C-I / C-J / \0 Delimiters)| ZptySubshell
 ```
@@ -221,6 +223,42 @@ classDiagram
 
 ---
 
+### 2.7 Logging & Observability Subsystem (`src/logging.rs`)
+
+`zshcs` integrates a structured, high-performance logging subsystem built on `tracing` and `tracing-subscriber`.
+
+```mermaid
+flowchart TD
+    AppInit["Server Startup (`src/main.rs`)"] --> CallInit["init_logging() / try_init_logging()"]
+    CallInit --> EnvCheck{"Evaluate Env Vars<br/>1. ZSHCS_LOG<br/>2. RUST_LOG<br/>3. Default: info"}
+    EnvCheck --> BuildFilter["Construct EnvFilter"]
+    BuildFilter --> FmtLayer["tracing_subscriber::fmt()<br/>• with_env_filter(filter)<br/>• with_writer(std::io::stderr)"]
+    FmtLayer --> StderrSink["stderr Stream (Diagnostics & Traces)"]
+    
+    LSPComm["LSP Server IO (`src/main.rs`)"] --> StdoutSink["stdout Stream (Strictly JSON-RPC Protocol)"]
+    
+    style StderrSink fill:#d4edda,stroke:#28a745,color:#155724
+    style StdoutSink fill:#cce5ff,stroke:#004085,color:#004085
+```
+
+- **Strict I/O Stream Segregation**:
+  - The LSP specification mandates that `stdio`-based servers exchange standard JSON-RPC framing over `stdout`. Any non-protocol bytes written to `stdout` corrupt client parsing and break editor integration.
+  - `zshcs` strictly routes all logging subscribers to `std::io::stderr` via `.with_writer(std::io::stderr)`.
+- **Dynamic Log Filtering (`create_env_filter`)**:
+  - Automatically parses log level directives from the environment with cascading precedence:
+    1. `ZSHCS_LOG` (dedicated application-level override, e.g., `ZSHCS_LOG=debug` or `ZSHCS_LOG=zshcs=trace`).
+    2. `RUST_LOG` (standard Rust ecosystem variable, e.g., `RUST_LOG=info`).
+    3. `info` (fallback default providing essential operational milestones without verbose noise).
+- **Idempotent & Test-Safe Initialization**:
+  - `init_logging()` wraps `try_init_logging()` to ensure safe multi-threaded test runs and repeated invocations without panics.
+- **Deep Instrumentation Coverage**:
+  - **Server Lifecycle**: `initialize` (negotiated client capabilities), `initialized`, and `shutdown`.
+  - **Buffer Synchronization**: `did_open`, `did_change` (tracks change counts and invalid ranges), `did_close`.
+  - **Completion Pipeline**: Request dispatching, cwd synchronization (`chdir`), response times, candidate counts, and cancellation discards.
+  - **Daemon Supervisor**: Child process spawning, stdout/stderr background streaming, crash recovery, and hung daemon timeout terminations (>5000ms).
+
+---
+
 ## 3. Detailed Data Flow & Protocols
 
 ### 3.1 Completion Request Lifecycle
@@ -305,6 +343,8 @@ flowchart LR
 1. **Rust Integration & Unit Test Suites**:
    - `tests/completion_test.rs` (37 tests): Validates LSP completions, consecutive requests, dynamic item kinds, working directory switching, crash recovery, timeout handling, and CRLF / multibyte buffers.
    - `tests/server_test.rs` (34 tests): Tests initialize handshake, capabilities negotiation, incremental synchronization, out-of-order versions, invalid ranges, document close cleanup, and custom execution commands.
+   - `tests/logging_test.rs` (8 tests): Validates tracing subscriber initialization, `stderr` log routing, stdout JSON-RPC isolation, and dynamic `ZSHCS_LOG` / `RUST_LOG` filter evaluation.
+   - `tests/cli_test.rs` (21 tests): Validates CLI flag parsing (`--stdio`, `--help`, `--version`), duplicate detection, and process lifecycle over stdio.
    - `tests/stress_test.rs` (20 tests): High-concurrency stress testing with 50 simultaneous clients, 10,000-candidate volume parsing, channel saturation, rapid interleaved edit/completion bursts, and deterministic PRNG fuzzing for Unicode boundaries and surrogate pairs.
 2. **Zsh Script Unit Test Harness (`tests/zsh/run_tests.zsh`)**:
    - Executes 12 standalone unit test cases validating `capture.zsh` and `zptyrc.zsh` syntax (`zsh -n`), module loading (`zsh/zpty`, `zsh/zutil`), isolated cache creation, directory synchronization helpers (`_zshcs_chdir`), `compadd` delegation and interception hooks, and pty end-to-end query processing.
