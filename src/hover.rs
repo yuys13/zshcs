@@ -883,6 +883,7 @@ mod tests {
         if let Some(HoverContents::Markup(markup)) = hover {
             assert_eq!(markup.kind, MarkupKind::Markdown);
             assert!(markup.value.starts_with("```text\n"));
+            assert!(markup.value.ends_with("\n```"));
             assert!(
                 markup.value.to_lowercase().contains("list directory")
                     || markup.value.to_lowercase().contains("ls")
@@ -971,5 +972,23 @@ mod tests {
         // Carriage return reset column
         let raw_cr = "hello\rworld";
         assert_eq!(clean_man_text(raw_cr), "world");
+    }
+
+    #[test]
+    fn test_clean_man_text_multibyte_and_form_feed() {
+        // Form feed reset column
+        let raw_ff = "hello\x0cworld";
+        assert_eq!(clean_man_text(raw_ff), "world");
+
+        // Multibyte character overstrike with underline
+        let raw_under_mb = "_\x08あ";
+        assert_eq!(clean_man_text(raw_under_mb), "あ");
+
+        let raw_mb_under = "あ\x08_";
+        assert_eq!(clean_man_text(raw_mb_under), "あ");
+
+        // Multibyte overwrite
+        let raw_overwrite = "あ\x08い";
+        assert_eq!(clean_man_text(raw_overwrite), "い");
     }
 }

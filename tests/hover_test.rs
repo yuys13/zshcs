@@ -668,6 +668,11 @@ async fn test_hover_path_qualified_and_special_builtins() {
         );
         if let HoverContents::Markup(markup) = hover_ls_val.contents {
             assert!(markup.value.starts_with("```text\n"));
+            assert!(markup.value.ends_with("\n```"));
+            assert!(
+                markup.value.to_lowercase().contains("list directory")
+                    || markup.value.to_lowercase().contains("ls")
+            );
         } else {
             panic!("Expected HoverContents::Markup");
         }
