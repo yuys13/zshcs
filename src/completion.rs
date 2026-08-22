@@ -226,6 +226,48 @@ pub async fn run_completion_daemon(
     }
 }
 
+/// Infers an intelligent `CompletionItemKind` based on candidate prefix and description.
+pub fn infer_completion_kind(label: &str, detail: Option<&str>) -> CompletionItemKind {
+    if label.starts_with('-') {
+        CompletionItemKind::KEYWORD
+    } else if label.starts_with('$') {
+        CompletionItemKind::VARIABLE
+    } else if label == "." || label == ".." || label == "~" || label.ends_with('/') {
+        CompletionItemKind::FOLDER
+    } else if let Some(d) = detail {
+        let d_lower = d.to_ascii_lowercase();
+        if d_lower.contains("command")
+            || d_lower.contains("builtin")
+            || d_lower.contains("function")
+            || d_lower.contains("alias")
+            || d_lower.contains("executable")
+        {
+            CompletionItemKind::FUNCTION
+        } else if d_lower.contains("option") || d_lower.contains("flag") {
+            CompletionItemKind::KEYWORD
+        } else if d_lower.contains("variable")
+            || d_lower.contains("parameter")
+            || d_lower.contains("env")
+        {
+            CompletionItemKind::VARIABLE
+        } else if d_lower.contains("directory") || d_lower.contains("folder") {
+            CompletionItemKind::FOLDER
+        } else if d_lower.contains("file") || d_lower.contains("archive") || label.contains('.') {
+            CompletionItemKind::FILE
+        } else if label.contains('/') {
+            CompletionItemKind::FOLDER
+        } else {
+            CompletionItemKind::TEXT
+        }
+    } else if label.contains('.') {
+        CompletionItemKind::FILE
+    } else if label.contains('/') {
+        CompletionItemKind::FOLDER
+    } else {
+        CompletionItemKind::TEXT
+    }
+}
+
 pub fn parse_candidate_line(line: &str, items: &mut Vec<CompletionItem>) {
     // ddc-source-shell_native style outputs `candidate\tdescription`
     let (label, detail) = match line.split_once('\t') {
@@ -240,9 +282,11 @@ pub fn parse_candidate_line(line: &str, items: &mut Vec<CompletionItem>) {
         None => (line.to_string(), None),
     };
 
+    let kind = infer_completion_kind(&label, detail.as_deref());
+
     items.push(CompletionItem {
         label,
-        kind: Some(CompletionItemKind::TEXT),
+        kind: Some(kind),
         insert_text: None,
         detail,
         ..Default::default()
@@ -534,7 +578,7 @@ mod tests {
     #[case(
         "--help\tshow help",
         "--help",
-        Some(CompletionItemKind::TEXT),
+        Some(CompletionItemKind::KEYWORD),
         None,
         Some("show help")
     )]
@@ -553,6 +597,69 @@ mod tests {
         assert_eq!(item.kind, expected_kind);
         assert_eq!(item.insert_text.as_deref(), expected_insert_text);
         assert_eq!(item.detail.as_deref(), expected_detail);
+    }
+
+    #[rstest]
+    // 1. Prefix options / flags -> KEYWORD
+    #[case("-v", None, CompletionItemKind::KEYWORD)]
+    #[case("--help", Some("show help"), CompletionItemKind::KEYWORD)]
+    #[case("-o:fmt", Some("output format"), CompletionItemKind::KEYWORD)]
+    #[case("--flag=value", None, CompletionItemKind::KEYWORD)]
+    // 2. Prefix variables -> VARIABLE
+    #[case("$HOME", None, CompletionItemKind::VARIABLE)]
+    #[case("${VAR:-default}", None, CompletionItemKind::VARIABLE)]
+    #[case("$PATH", Some("search path"), CompletionItemKind::VARIABLE)]
+    #[case("$?", Some("exit code"), CompletionItemKind::VARIABLE)]
+    // 3. Folders ending with / or dot directories -> FOLDER
+    #[case("src/", None, CompletionItemKind::FOLDER)]
+    #[case("path/to/dir/", None, CompletionItemKind::FOLDER)]
+    #[case("/etc/", Some("config dir"), CompletionItemKind::FOLDER)]
+    #[case("~/", None, CompletionItemKind::FOLDER)]
+    #[case(".", None, CompletionItemKind::FOLDER)]
+    #[case("..", None, CompletionItemKind::FOLDER)]
+    #[case("~", None, CompletionItemKind::FOLDER)]
+    // 4. Files containing dot -> FILE
+    #[case(".zshrc", None, CompletionItemKind::FILE)]
+    #[case("script.sh", None, CompletionItemKind::FILE)]
+    #[case("path/to/file.txt", None, CompletionItemKind::FILE)]
+    #[case("archive.tar.gz", Some("archive"), CompletionItemKind::FILE)]
+    // 5. Paths containing slash but no dot -> FOLDER
+    #[case("path/to/subdir", None, CompletionItemKind::FOLDER)]
+    #[case("/usr/local/bin", None, CompletionItemKind::FOLDER)]
+    // 6. Detail-based inference: commands, builtins, functions, aliases, executables -> FUNCTION
+    #[case("echo", Some("builtin command"), CompletionItemKind::FUNCTION)]
+    #[case("git", Some("command line tool"), CompletionItemKind::FUNCTION)]
+    #[case("my_func", Some("shell function"), CompletionItemKind::FUNCTION)]
+    #[case("ls", Some("builtin"), CompletionItemKind::FUNCTION)]
+    #[case("ll", Some("alias for ls -la"), CompletionItemKind::FUNCTION)]
+    #[case("cargo", Some("executable binary"), CompletionItemKind::FUNCTION)]
+    #[case("./my_func", Some("shell function"), CompletionItemKind::FUNCTION)]
+    // 7. Detail-based inference: options, flags -> KEYWORD
+    #[case("verbose", Some("verbose option"), CompletionItemKind::KEYWORD)]
+    #[case("debug", Some("debug flag"), CompletionItemKind::KEYWORD)]
+    // 8. Detail-based inference: variables, env -> VARIABLE
+    #[case("USER", Some("environment variable"), CompletionItemKind::VARIABLE)]
+    #[case("SHELL", Some("shell parameter"), CompletionItemKind::VARIABLE)]
+    #[case("PORT", Some("env configuration"), CompletionItemKind::VARIABLE)]
+    // 9. Detail-based inference: directory, folder -> FOLDER
+    #[case("mydir", Some("project directory"), CompletionItemKind::FOLDER)]
+    #[case("docs", Some("documentation folder"), CompletionItemKind::FOLDER)]
+    #[case("./mydir", Some("directory"), CompletionItemKind::FOLDER)]
+    // 10. Detail-based inference: file, archive -> FILE
+    #[case("LICENSE", Some("license file"), CompletionItemKind::FILE)]
+    #[case("README", Some("documentation file"), CompletionItemKind::FILE)]
+    #[case("bundle.zip", Some("compressed archive"), CompletionItemKind::FILE)]
+    // 11. Plain text fallback -> TEXT
+    #[case("checkout", Some("switch branch"), CompletionItemKind::TEXT)]
+    #[case("status", Some("show working tree status"), CompletionItemKind::TEXT)]
+    #[case("plain", None, CompletionItemKind::TEXT)]
+    fn test_infer_completion_kind(
+        #[case] label: &str,
+        #[case] detail: Option<&str>,
+        #[case] expected_kind: CompletionItemKind,
+    ) {
+        let kind = infer_completion_kind(label, detail);
+        assert_eq!(kind, expected_kind);
     }
 
     #[rstest]

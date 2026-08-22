@@ -1729,3 +1729,75 @@ done
         "Cancelled request was not skipped; daemon processed cancelled request"
     );
 }
+
+#[tokio::test]
+async fn test_completion_dynamic_item_kinds() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while read -r line; do
+    if [[ "$line" == input:* ]]; then
+        printf "%s\n" "--help	show help"
+        printf "%s\n" "\$MY_VAR	environment variable"
+        printf "%s\n" "scripts/	scripts directory"
+        printf "%s\n" "main.rs	Rust source file"
+        printf "%s\n" "run_job	shell function"
+        printf "%s\n" "plain_word	simple text"
+        printf "\x01EOC\x01\n"
+    fi
+done
+"#;
+
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///kinds_test.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "cmd ").await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert_eq!(items.len(), 6);
+
+    let item_map: std::collections::HashMap<_, _> = items
+        .into_iter()
+        .map(|item| (item.label, item.kind))
+        .collect();
+
+    assert_eq!(
+        item_map.get("--help").copied().flatten(),
+        Some(tower_lsp::lsp_types::CompletionItemKind::KEYWORD)
+    );
+    assert_eq!(
+        item_map.get("$MY_VAR").copied().flatten(),
+        Some(tower_lsp::lsp_types::CompletionItemKind::VARIABLE)
+    );
+    assert_eq!(
+        item_map.get("scripts/").copied().flatten(),
+        Some(tower_lsp::lsp_types::CompletionItemKind::FOLDER)
+    );
+    assert_eq!(
+        item_map.get("main.rs").copied().flatten(),
+        Some(tower_lsp::lsp_types::CompletionItemKind::FILE)
+    );
+    assert_eq!(
+        item_map.get("run_job").copied().flatten(),
+        Some(tower_lsp::lsp_types::CompletionItemKind::FUNCTION)
+    );
+    assert_eq!(
+        item_map.get("plain_word").copied().flatten(),
+        Some(tower_lsp::lsp_types::CompletionItemKind::TEXT)
+    );
+}

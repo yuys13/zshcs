@@ -1,8 +1,8 @@
 use std::time::Instant;
-use zshcs::completion::parse_candidate_line;
+use zshcs::completion::{infer_completion_kind, parse_candidate_line};
 
 fn main() {
-    println!("=== zshcs Candidate Parser Benchmark ===");
+    println!("=== zshcs Candidate Parser & Kind Inference Benchmark ===");
 
     let sample_lines = [
         "status\tshow working tree status",
@@ -10,6 +10,7 @@ fn main() {
         "$HOME\tuser home directory",
         "/usr/local/bin/\texecutable search directory",
         ".zshrc\tzsh configuration file",
+        "my_func\tshell function",
         "plain_text_candidate",
     ];
 
@@ -39,6 +40,26 @@ fn main() {
 
     println!(
         "parse_candidate_line: {} ops in {:?} ({:.2} ns/op, {:.2} ops/sec)",
+        total_ops, elapsed, ns_per_op, ops_per_sec
+    );
+
+    // Benchmark infer_completion_kind
+    let start = Instant::now();
+    for _ in 0..iterations {
+        for line in &sample_lines {
+            let (label, detail) = match line.split_once('\t') {
+                Some((lbl, dtl)) => (lbl, Some(dtl)),
+                None => (*line, None),
+            };
+            let _ = infer_completion_kind(label, detail);
+        }
+    }
+    let elapsed = start.elapsed();
+    let ns_per_op = elapsed.as_nanos() as f64 / total_ops as f64;
+    let ops_per_sec = total_ops as f64 / elapsed.as_secs_f64();
+
+    println!(
+        "infer_completion_kind: {} ops in {:?} ({:.2} ns/op, {:.2} ops/sec)",
         total_ops, elapsed, ns_per_op, ops_per_sec
     );
 
