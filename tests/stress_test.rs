@@ -24,7 +24,7 @@ fn test_fuzz_parse_candidate_line_null_bytes() {
     parse_candidate_line(line, &mut items);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].label, "cand\0part1\0part2");
-    assert_eq!(items[0].insert_text.as_deref(), Some("cand\0part1\0part2"));
+    assert_eq!(items[0].insert_text.as_deref(), None);
     assert_eq!(items[0].detail.as_deref(), Some("desc\0part1\0part2"));
 
     // Only null bytes

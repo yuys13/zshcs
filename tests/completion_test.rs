@@ -1,12 +1,17 @@
 mod common;
 
 use common::{get_completion_items, setup_server, setup_server_with_scripts};
+use std::sync::Arc;
+use std::time::Duration;
+use tower_lsp::LanguageServer;
 use tower_lsp::lsp_types::{
-    CompletionParams, DidChangeTextDocumentParams, Position, Range, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
+    CompletionParams, CompletionResponse, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    Position, Range, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
     notification::{DidChangeTextDocument, LogMessage},
     request,
 };
+use zshcs::Backend;
 
 #[tokio::test]
 async fn test_completion() {
@@ -1640,4 +1645,87 @@ done
     assert_eq!(items.len(), 1);
     let expected_label = format!("cached_env:{}", custom_cache_path.to_string_lossy());
     assert_eq!(items[0].label, expected_label);
+}
+
+#[tokio::test]
+async fn test_completion_cancellation_skips_daemon() {
+    let mock_script = r#"#!/usr/bin/env zsh
+counter=0
+while read -r line; do
+    if [[ "$line" == input:* ]]; then
+        counter=$((counter + 1))
+        if [[ $counter -eq 1 ]]; then
+            sleep 0.2
+        fi
+        echo "item_$counter\x01EOC\x01"
+    fi
+done
+"#;
+
+    let mut client_opt = None;
+    let (_service, _socket) = tower_lsp::LspService::new(|client| {
+        client_opt = Some(client.clone());
+        Backend::new_with_scripts(client, mock_script, "").unwrap()
+    });
+    let client = client_opt.unwrap();
+    let backend = Arc::new(Backend::new_with_scripts(client, mock_script, "").unwrap());
+
+    let doc_uri = Url::parse("file:///cancel_test.zsh").unwrap();
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: doc_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: "echo \n".to_string(),
+            },
+        })
+        .await;
+
+    let params = |pos: u32| CompletionParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: doc_uri.clone(),
+            },
+            position: Position::new(0, pos),
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+        context: None,
+    };
+
+    // 1. Send active request 1 (will sleep 0.2s in daemon)
+    let b1 = Arc::clone(&backend);
+    let p1 = params(4);
+    let req1_handle = tokio::spawn(async move { b1.completion(p1).await });
+
+    // Ensure request 1 has entered the daemon before queuing request 2
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 2. Send request 2 with short timeout so it drops the completion future and receiver
+    let b2 = Arc::clone(&backend);
+    let p2 = params(4);
+    let _ = tokio::time::timeout(Duration::from_millis(30), b2.completion(p2)).await;
+
+    // Wait for request 1 to finish
+    let res1 = req1_handle.await.unwrap().unwrap().unwrap();
+    let items1 = match res1 {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    assert_eq!(items1.len(), 1);
+    assert_eq!(items1[0].label, "item_1");
+
+    // 3. Send active request 3 - since request 2 was cancelled and skipped by daemon,
+    // the mock script's counter must now increment to 2 (NOT 3).
+    let res3 = backend.completion(params(4)).await.unwrap().unwrap();
+    let items3 = match res3 {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    assert_eq!(items3.len(), 1);
+    assert_eq!(
+        items3[0].label, "item_2",
+        "Cancelled request was not skipped; daemon processed cancelled request"
+    );
 }
