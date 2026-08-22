@@ -179,6 +179,8 @@ test_capture_script_e2e() {
     ')
 
     [[ "$result" == *$'\x01EOC\x01'* ]] || { print -u2 "capture.zsh output missing EOC marker: $result"; return 1; }
+    [[ "$result" == *"alpha.txt"* ]] || { print -u2 "capture.zsh output missing alpha.txt candidate: $result"; return 1; }
+    [[ "$result" == *"beta.sh"* ]] || { print -u2 "capture.zsh output missing beta.sh candidate: $result"; return 1; }
     return 0
 }
 
@@ -237,34 +239,85 @@ test_capture_script_sequential_queries() {
 }
 
 # ------------------------------------------------------------------------------
-# Test 9: compadd Direct Delegation with -A / -O / -D Flags
+# Test 9: compadd Direct Delegation and Candidate Interception
 # ------------------------------------------------------------------------------
 test_compadd_hook_delegation() {
+    local zptyrc="$ZPTYRC_SCRIPT"
     ZSHCS_CACHE_DIR="$TEST_TMPDIR/cache" zsh --no-rcs -c '
-        source "'"$ZPTYRC_SCRIPT"'"
+        source "$1"
 
         # Verify compadd is defined as a shell function
         typeset -f compadd >/dev/null || exit 1
 
-        # Test the delegation matching pattern used in compadd hook
-        check_delegation() {
-            [[ ${@[1,(i)(-|--)]} == *-(O|A|D)\ * ]]
+        # Mock builtin to intercept and verify direct function invocation
+        typeset -a delegated_calls
+        builtin() {
+            delegated_calls+=("$*")
         }
 
-        # Delegated flags before --
-        check_delegation -A hits -- "c1" "c2" || exit 2
-        check_delegation -O hits -- "c1" "c2" || exit 3
-        check_delegation -D dscr -- "c1" "c2" || exit 4
-        check_delegation -M match -A hits -- "c1" || exit 5
+        # 1. Verify -A delegates to builtin compadd
+        compadd -A hits -- "cand1" "cand2"
+        [[ "${delegated_calls[-1]}" == "compadd -A hits -- cand1 cand2" ]] || exit 2
 
-        # Non-delegated flags (should NOT delegate)
-        check_delegation -a hits -- "c1" && exit 6
-        check_delegation -d dscr -- "c1" && exit 7
-        check_delegation -- -A "c1" && exit 8
-        check_delegation -f -- "c1" && exit 9
+        # 2. Verify -O delegates to builtin compadd
+        compadd -O hits -- "cand1" "cand2"
+        [[ "${delegated_calls[-1]}" == "compadd -O hits -- cand1 cand2" ]] || exit 3
+
+        # 3. Verify -D delegates to builtin compadd
+        compadd -D dscr -- "cand1" "cand2"
+        [[ "${delegated_calls[-1]}" == "compadd -D dscr -- cand1 cand2" ]] || exit 4
+
+        # 4. Verify -M match -A hits delegates
+        compadd -M match -A hits -- "cand1"
+        [[ "${delegated_calls[-1]}" == "compadd -M match -A hits -- cand1" ]] || exit 5
+
+        # 5. Verify non-delegating compadd intercepts and formats candidates
+        builtin() {
+            if [[ "$1" == "compadd" && "$*" == *"-A __hits"* ]]; then
+                __hits=("item1" "item2")
+                __dscr=("First description" "Second description")
+            fi
+        }
+
+        local out
+        out=$(compadd -d desc -f -- "item1" "item2")
+        [[ "$out" == *item1*$'\t'*First\ description* ]] || exit 6
+        [[ "$out" == *item2*$'\t'*Second\ description* ]] || exit 7
 
         exit 0
-    '
+    ' _zshcs_subshell "$zptyrc"
+}
+
+# ------------------------------------------------------------------------------
+# Test 10: Directory Sync with Spaces and Quotes
+# ------------------------------------------------------------------------------
+test_chdir_with_spaces_and_quotes() {
+    local capture_cache="$TEST_TMPDIR/spaces_cache"
+    mkdir -p "$capture_cache"
+
+    local special_dir="$TEST_TMPDIR/special dir with spaces and 'quotes'"
+    mkdir -p "$special_dir"
+    touch "$special_dir/special_file.txt"
+
+    local result
+    result=$(ZSHCS_CACHE_DIR="$capture_cache" zsh --no-rcs -c '
+        coproc zsh "'"$CAPTURE_SCRIPT"'"
+        print -p "chdir:'"$special_dir"'"
+        print -p "input:ls "
+        local line=""
+        local collected=""
+        while IFS= read -r -p line; do
+            collected+="$line"$'"'\n'"'
+            if [[ "$line" == *$'"'\x01EOC\x01'"'* ]]; then
+                break
+            fi
+        done
+        print -r -- "$collected"
+    ')
+
+    [[ "$result" == *$'\x01EOC\x01'* ]] || { print -u2 "Special path missing EOC marker: $result"; return 1; }
+    [[ "$result" == *"special_file.txt"* ]] || { print -u2 "Special path missing candidate: $result"; return 1; }
+    return 0
 }
 
 # ------------------------------------------------------------------------------
@@ -285,7 +338,8 @@ main() {
     run_test_case "Interactive zpty completion capture (E2E)" test_capture_script_e2e
     run_test_case "Invalid message error handling" test_capture_script_invalid_message
     run_test_case "Sequential queries over pty" test_capture_script_sequential_queries
-    run_test_case "compadd delegation flags (-A/-O/-D)" test_compadd_hook_delegation
+    run_test_case "compadd delegation and interception" test_compadd_hook_delegation
+    run_test_case "Directory sync with spaces and quotes" test_chdir_with_spaces_and_quotes
 
     print -P "%F{cyan}-----------------------------------------------------%f"
     print -P "Total:  $TESTS_RUN"

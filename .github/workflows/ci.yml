@@ -42,7 +42,7 @@ jobs:
       - name: Install dependencies for tests (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install zsh || true
+          which zsh || HOMEBREW_NO_AUTO_UPDATE=1 brew install zsh
       - name: Run tests
         run: cargo test --all-targets
       - name: Run Zsh script unit tests

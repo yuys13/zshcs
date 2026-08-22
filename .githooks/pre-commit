@@ -10,6 +10,9 @@
 
 set -euo pipefail
 
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$REPO_ROOT"
+
 echo "=== Running zshcs pre-commit checks ==="
 
 echo "[1/5] Checking formatting (cargo fmt --check)..."

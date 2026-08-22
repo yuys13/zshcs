@@ -65,7 +65,7 @@ locally. These are the same checks that run in our CI pipeline.
 4. **Run tests:**
 
    ```bash
-   cargo test
+   cargo test --all-targets
    ```
 
 5. **Run Zsh script unit tests:**
