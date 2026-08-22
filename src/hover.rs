@@ -929,4 +929,47 @@ mod tests {
         // We verify that it does not panic or hang
         let _ = hover;
     }
+
+    #[tokio::test]
+    async fn test_get_man_page_edge_cases() {
+        // Empty target
+        assert!(get_man_page("", Duration::from_secs(1)).await.is_none());
+        // Leading hyphen (option-like argument)
+        assert!(get_man_page("-la", Duration::from_secs(1)).await.is_none());
+        // Command injection attempt or invalid characters
+        assert!(
+            get_man_page("ls; rm -rf /", Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+        assert!(
+            get_man_page("cat $(whoami)", Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+        // Excessively long target name (> 256 characters)
+        let long_name = "a".repeat(300);
+        assert!(
+            get_man_page(&long_name, Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+        // Non-existent command
+        assert!(
+            get_man_page("nonexistent_command_xyz123_456789", Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_clean_man_text_tabs_and_cr() {
+        // Tab stop expansion (every 8 columns)
+        let raw_tabs = "a\tb";
+        assert_eq!(clean_man_text(raw_tabs), "a       b");
+
+        // Carriage return reset column
+        let raw_cr = "hello\rworld";
+        assert_eq!(clean_man_text(raw_cr), "world");
+    }
 }
