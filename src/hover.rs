@@ -46,39 +46,20 @@ pub fn is_word_char(c: char) -> bool {
 /// Safely handles multi-byte UTF-8 sequences and UTF-16 surrogate pairs.
 /// Returns `None` if the cursor is not positioned on a valid word or if the position is out of bounds.
 pub fn extract_word_at_position(text: &str, position: Position) -> Option<(&str, Range)> {
-    let target_line = position.line as usize;
+    let mut line_start = 0;
+    for _ in 0..position.line {
+        line_start = text[line_start..].find('\n')? + line_start + 1;
+    }
+    let mut line_end = text[line_start..]
+        .find('\n')
+        .map(|idx| line_start + idx)
+        .unwrap_or(text.len());
+    if line_end > line_start && text.as_bytes()[line_end - 1] == b'\r' {
+        line_end -= 1;
+    }
+
+    let line_str = &text[line_start..line_end];
     let target_char = position.character as usize;
-
-    // Locate the line start and end byte offsets
-    let mut current_line = 0;
-    let mut line_start_byte = 0;
-    let mut line_end_byte = text.len();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if current_line == target_line {
-            line_start_byte = i;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            line_end_byte = i;
-            if line_end_byte > line_start_byte && bytes[line_end_byte - 1] == b'\r' {
-                line_end_byte -= 1;
-            }
-            break;
-        }
-        if bytes[i] == b'\n' {
-            current_line += 1;
-        }
-        i += 1;
-    }
-
-    if current_line != target_line {
-        return None;
-    }
-
-    let line_str = &text[line_start_byte..line_end_byte];
 
     // Find token spans in line (byte offsets and UTF-16 code unit offsets)
     struct TokenSpan {
@@ -99,14 +80,14 @@ pub fn extract_word_at_position(text: &str, position: Position) -> Option<(&str,
         if is_word_char(c) {
             if !in_word {
                 in_word = true;
-                word_start_byte = line_start_byte + byte_idx;
+                word_start_byte = line_start + byte_idx;
                 word_start_u16 = current_u16;
             }
         } else if in_word {
             in_word = false;
             tokens.push(TokenSpan {
                 start_byte: word_start_byte,
-                end_byte: line_start_byte + byte_idx,
+                end_byte: line_start + byte_idx,
                 start_u16: word_start_u16,
                 end_u16: current_u16,
             });
@@ -117,18 +98,18 @@ pub fn extract_word_at_position(text: &str, position: Position) -> Option<(&str,
     if in_word {
         tokens.push(TokenSpan {
             start_byte: word_start_byte,
-            end_byte: line_end_byte,
+            end_byte: line_end,
             start_u16: word_start_u16,
             end_u16: current_u16,
         });
     }
 
-    if target_char > current_u16 {
+    if target_char >= current_u16 {
         return None;
     }
 
     for token in tokens {
-        if target_char >= token.start_u16 && target_char <= token.end_u16 {
+        if target_char >= token.start_u16 && target_char < token.end_u16 {
             let word_str = &text[token.start_byte..token.end_byte];
             let range = Range {
                 start: Position::new(position.line, token.start_u16 as u32),
@@ -144,74 +125,108 @@ pub fn extract_word_at_position(text: &str, position: Position) -> Option<(&str,
 /// Cleans raw manual page output by removing backspace overstrikes and ANSI escapes.
 pub fn clean_man_text(raw: &str) -> String {
     let mut cleaned = String::with_capacity(raw.len());
+
     for line in raw.lines() {
-        let chars: Vec<char> = line.chars().collect();
-        let mut line_buf: Vec<char> = Vec::with_capacity(chars.len());
+        // Strip ANSI escape sequences first
+        let mut chars = Vec::with_capacity(line.len());
+        let line_chars: Vec<char> = line.chars().collect();
         let mut i = 0;
-        while i < chars.len() {
-            // Check for ANSI escape sequences: \x1b[...m
-            if chars[i] == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '[' {
+        while i < line_chars.len() {
+            if line_chars[i] == '\x1b' && i + 1 < line_chars.len() && line_chars[i + 1] == '[' {
                 i += 2;
-                while i < chars.len() && !chars[i].is_ascii_alphabetic() {
+                while i < line_chars.len() && !line_chars[i].is_ascii_alphabetic() {
                     i += 1;
                 }
-                if i < chars.len() {
+                if i < line_chars.len() {
                     i += 1;
                 }
                 continue;
             }
-
-            // Check for backspace overstrikes: c1 \b c2
-            if i + 1 < chars.len() && chars[i + 1] == '\x08' {
-                if i + 2 < chars.len() {
-                    let c1 = chars[i];
-                    let c2 = chars[i + 2];
-                    if c1 == '_' {
-                        line_buf.push(c2);
-                    } else {
-                        line_buf.push(c1);
-                    }
-                    i += 3;
-                    continue;
-                } else {
-                    i += 2;
-                    continue;
-                }
-            }
-
-            if chars[i] != '\x08' {
-                line_buf.push(chars[i]);
-            }
+            chars.push(line_chars[i]);
             i += 1;
         }
+
+        // Apply backspace and overstrike resolution (col -b emulation)
+        let mut line_buf: Vec<char> = Vec::with_capacity(chars.len());
+        let mut col: usize = 0;
+
+        for c in chars {
+            if c == '\x08' {
+                col = col.saturating_sub(1);
+            } else if c == '\t' {
+                let tab_stop = (col / 8 + 1) * 8;
+                while col < tab_stop {
+                    if col < line_buf.len() {
+                        line_buf[col] = ' ';
+                    } else {
+                        line_buf.push(' ');
+                    }
+                    col += 1;
+                }
+            } else if c == '\r' || c == '\x0c' {
+                col = 0;
+            } else {
+                let norm_c = match c {
+                    '\u{2212}' => '-', // Unicode minus sign
+                    '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' => '-',
+                    '\u{00a0}' => ' ', // Non-breaking space
+                    _ => c,
+                };
+
+                if col < line_buf.len() {
+                    if line_buf[col] == '_' && norm_c != '_' {
+                        line_buf[col] = norm_c;
+                    } else if line_buf[col] != '_' && norm_c == '_' {
+                        // preserve existing non-underscore character
+                    } else {
+                        line_buf[col] = norm_c;
+                    }
+                } else {
+                    while line_buf.len() < col {
+                        line_buf.push(' ');
+                    }
+                    line_buf.push(norm_c);
+                }
+                col += 1;
+            }
+        }
+
         let line_string: String = line_buf.into_iter().collect();
-        cleaned.push_str(&line_string);
+        cleaned.push_str(line_string.trim_end());
         cleaned.push('\n');
     }
+
     cleaned.trim_end().to_string()
 }
 
 /// Retrieves the manual page for an external command asynchronously with a timeout.
 pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
-    if word.is_empty() || word.len() > 256 || word.starts_with('-') {
+    let target = if let Some(slash_idx) = word.rfind('/') {
+        &word[slash_idx + 1..]
+    } else {
+        word
+    };
+
+    if target.is_empty() || target.len() > 256 || target.starts_with('-') {
         return None;
     }
 
     // Only allow alphanumeric and safe command characters
-    if !word
+    if !target
         .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '/'))
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
     {
         return None;
     }
 
     let mut cmd = tokio::process::Command::new("man");
-    cmd.arg(word)
+    cmd.arg(target)
         .env("MANPAGER", "cat")
         .env("PAGER", "cat")
         .env("TERM", "dumb")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
 
     let child_output = tokio::time::timeout(timeout_dur, cmd.output()).await;
 
@@ -467,13 +482,29 @@ pub async fn get_hover_info(word: &str) -> Option<HoverContents> {
 ///
 /// Priority:
 /// 1. Zsh builtins & reserved words static Markdown dictionary.
-/// 2. External command `man` page full text in a ````text ... ```` code block.
+/// 2. External command `man` page full text in a code block.
 pub async fn get_hover_info_with_timeout(
     word: &str,
     timeout_dur: Duration,
 ) -> Option<HoverContents> {
-    // 1. Check static dictionary
+    // 1. Check static dictionary for word or basename
     if let Some(doc) = get_builtin_or_reserved_doc(word) {
+        return Some(HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: doc.to_string(),
+        }));
+    }
+
+    let target = if let Some(slash_idx) = word.rfind('/') {
+        &word[slash_idx + 1..]
+    } else {
+        word
+    };
+
+    if !target.is_empty()
+        && target != word
+        && let Some(doc) = get_builtin_or_reserved_doc(target)
+    {
         return Some(HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
             value: doc.to_string(),
@@ -486,7 +517,12 @@ pub async fn get_hover_info_with_timeout(
         return None;
     }
 
-    let markdown = format!("```text\n{}\n```", man_text);
+    let mut fence_len = 3;
+    while man_text.contains(&"`".repeat(fence_len)) {
+        fence_len += 1;
+    }
+    let fence = "`".repeat(fence_len);
+    let markdown = format!("{fence}text\n{man_text}\n{fence}");
     Some(HoverContents::Markup(MarkupContent {
         kind: MarkupKind::Markdown,
         value: markdown,
@@ -502,31 +538,37 @@ mod tests {
     // 1. Basic word extraction on single line
     #[case("echo hello world", 0, 0, Some(("echo", 0, 4)))]
     #[case("echo hello world", 0, 2, Some(("echo", 0, 4)))]
-    #[case("echo hello world", 0, 4, Some(("echo", 0, 4)))]
+    #[case("echo hello world", 0, 3, Some(("echo", 0, 4)))]
+    #[case("echo hello world", 0, 4, None)] // space after echo
     #[case("echo hello world", 0, 5, Some(("hello", 5, 10)))]
     #[case("echo hello world", 0, 8, Some(("hello", 5, 10)))]
-    #[case("echo hello world", 0, 10, Some(("hello", 5, 10)))]
+    #[case("echo hello world", 0, 9, Some(("hello", 5, 10)))]
+    #[case("echo hello world", 0, 10, None)] // space after hello
     #[case("echo hello world", 0, 11, Some(("world", 11, 16)))]
-    #[case("echo hello world", 0, 16, Some(("world", 11, 16)))]
+    #[case("echo hello world", 0, 15, Some(("world", 11, 16)))]
+    #[case("echo hello world", 0, 16, None)] // end of line
     #[case("echo hello world", 0, 17, None)]
     // 2. Spaces and gaps
     #[case("   cd   /tmp   ", 0, 0, None)]
     #[case("   cd   /tmp   ", 0, 2, None)]
     #[case("   cd   /tmp   ", 0, 3, Some(("cd", 3, 5)))]
     #[case("   cd   /tmp   ", 0, 4, Some(("cd", 3, 5)))]
-    #[case("   cd   /tmp   ", 0, 5, Some(("cd", 3, 5)))]
+    #[case("   cd   /tmp   ", 0, 5, None)] // space after cd
     #[case("   cd   /tmp   ", 0, 6, None)]
     #[case("   cd   /tmp   ", 0, 8, Some(("/tmp", 8, 12)))]
     // 3. Multi-line extraction
     #[case("line1\nsetopt promptsubst\nline3", 1, 0, Some(("setopt", 0, 6)))]
     #[case("line1\nsetopt promptsubst\nline3", 1, 3, Some(("setopt", 0, 6)))]
-    #[case("line1\nsetopt promptsubst\nline3", 1, 6, Some(("setopt", 0, 6)))]
+    #[case("line1\nsetopt promptsubst\nline3", 1, 5, Some(("setopt", 0, 6)))]
+    #[case("line1\nsetopt promptsubst\nline3", 1, 6, None)] // space after setopt
     #[case("line1\nsetopt promptsubst\nline3", 1, 7, Some(("promptsubst", 7, 18)))]
-    #[case("line1\nsetopt promptsubst\nline3", 1, 18, Some(("promptsubst", 7, 18)))]
+    #[case("line1\nsetopt promptsubst\nline3", 1, 17, Some(("promptsubst", 7, 18)))]
+    #[case("line1\nsetopt promptsubst\nline3", 1, 18, None)]
     #[case("line1\nsetopt promptsubst\nline3", 2, 2, Some(("line3", 0, 5)))]
     // 4. Out of bounds lines
     #[case("single line", 1, 0, None)]
     #[case("single line", 10, 0, None)]
+    #[case("first\n", 1, 0, None)] // empty trailing line
     fn test_extract_word_at_position_basic(
         #[case] text: &str,
         #[case] line: u32,
@@ -551,16 +593,23 @@ mod tests {
     #[rstest]
     // 1. Delimiters and operators: pipes, redirects, quotes, semicolons
     #[case("cat file | grep foo", 0, 9, None)] // on '|'
-    #[case("cat file | grep foo", 0, 11, Some(("grep", 11, 15)))]
+    #[case("cat file|grep foo", 0, 8, None)] // on '|' without space
+    #[case("cat file|grep foo", 0, 7, Some(("file", 4, 8)))]
+    #[case("cat file|grep foo", 0, 9, Some(("grep", 9, 13)))]
     #[case("echo \"hello\"; ls", 0, 5, None)] // on '"'
     #[case("echo \"hello\"; ls", 0, 6, Some(("hello", 6, 11)))]
+    #[case("echo \"hello\"; ls", 0, 11, None)] // on closing '"'
     #[case("echo \"hello\"; ls", 0, 12, None)] // on ';'
     #[case("echo \"hello\"; ls", 0, 14, Some(("ls", 14, 16)))]
+    #[case("echo;ls", 0, 4, None)] // on ';' without space
+    #[case("echo;ls", 0, 3, Some(("echo", 0, 4)))]
+    #[case("echo;ls", 0, 5, Some(("ls", 5, 7)))]
     #[case("(autoload -Uz compinit)", 0, 0, None)] // on '('
     #[case("(autoload -Uz compinit)", 0, 1, Some(("autoload", 1, 9)))]
+    #[case("(autoload -Uz compinit)", 0, 9, None)] // space
     #[case("(autoload -Uz compinit)", 0, 10, Some(("-Uz", 10, 13)))]
-    #[case("(autoload -Uz compinit)", 0, 22, Some(("compinit", 14, 22)))] // end of 'compinit'
-    #[case("(autoload -Uz compinit)", 0, 23, None)] // on ')'
+    #[case("(autoload -Uz compinit)", 0, 21, Some(("compinit", 14, 22)))] // last char of 'compinit'
+    #[case("(autoload -Uz compinit)", 0, 22, None)] // on ')'
     // 2. Words with hyphens and underscores
     #[case("zsh-lovers --all-targets test_func", 0, 3, Some(("zsh-lovers", 0, 10)))]
     #[case("zsh-lovers --all-targets test_func", 0, 15, Some(("--all-targets", 11, 24)))]
@@ -593,18 +642,19 @@ mod tests {
     // 1. Multibyte Japanese characters ("日本語" is 3 chars, 3 UTF-16 units)
     #[case("echo 日本語 echo", 0, 5, Some(("日本語", 5, 8)))]
     #[case("echo 日本語 echo", 0, 7, Some(("日本語", 5, 8)))]
-    #[case("echo 日本語 echo", 0, 8, Some(("日本語", 5, 8)))]
+    #[case("echo 日本語 echo", 0, 8, None)] // space after 日本語
     #[case("echo 日本語 echo", 0, 9, Some(("echo", 9, 13)))]
-    #[case("echo 日本語 echo", 0, 13, Some(("echo", 9, 13)))]
-    #[case("echo 日本語 echo", 0, 14, None)]
+    #[case("echo 日本語 echo", 0, 12, Some(("echo", 9, 13)))]
+    #[case("echo 日本語 echo", 0, 13, None)]
     // 2. Surrogate pairs SIP/SMP ('𩸽' is 1 char, 2 UTF-16 code units)
     #[case("echo 𩸽 echo", 0, 5, Some(("𩸽", 5, 7)))]
     #[case("echo 𩸽 echo", 0, 6, Some(("𩸽", 5, 7)))]
-    #[case("echo 𩸽 echo", 0, 7, Some(("𩸽", 5, 7)))]
+    #[case("echo 𩸽 echo", 0, 7, None)] // space after 𩸽
     #[case("echo 𩸽 echo", 0, 8, Some(("echo", 8, 12)))]
     // 3. Emojis
     #[case("echo 🎉🎊 test", 0, 5, Some(("🎉🎊", 5, 9)))]
-    #[case("echo 🎉🎊 test", 0, 7, Some(("🎉🎊", 5, 9)))]
+    #[case("echo 🎉🎊 test", 0, 8, Some(("🎉🎊", 5, 9)))]
+    #[case("echo 🎉🎊 test", 0, 9, None)] // space after emojis
     fn test_extract_word_at_position_unicode(
         #[case] text: &str,
         #[case] line: u32,
@@ -631,6 +681,8 @@ mod tests {
         assert!(extract_word_at_position("", Position::new(0, 0)).is_none());
         assert!(extract_word_at_position("   ", Position::new(0, 1)).is_none());
         assert!(extract_word_at_position("echo\n", Position::new(0, 100)).is_none());
+        assert!(extract_word_at_position("echo\n", Position::new(1, 0)).is_none());
+        assert!(extract_word_at_position("echo\r\n", Position::new(0, 3)).is_some());
     }
 
     #[test]
@@ -639,13 +691,25 @@ mod tests {
         let raw_bold = "N\x08NA\x08AM\x08ME\x08E";
         assert_eq!(clean_man_text(raw_bold), "NAME");
 
+        // Triple overstrike: c\bc\bc
+        let raw_triple = "c\x08c\x08c";
+        assert_eq!(clean_man_text(raw_triple), "c");
+
         // Underline overstrike: _\bf _\bo _\bo
         let raw_underline = "_\x08f_\x08o_\x08o";
         assert_eq!(clean_man_text(raw_underline), "foo");
 
+        // Underlined bold: _\bc\bc
+        let raw_under_bold = "_\x08c\x08c";
+        assert_eq!(clean_man_text(raw_under_bold), "c");
+
         // ANSI color escape: \x1b[32mhello\x1b[0m
         let raw_ansi = "\x1b[32mhello\x1b[0m world";
         assert_eq!(clean_man_text(raw_ansi), "hello world");
+
+        // Unicode minus normalization
+        let raw_unicode = "grep \u{2212}v pattern";
+        assert_eq!(clean_man_text(raw_unicode), "grep -v pattern");
 
         // Plain text
         let raw_plain = "Simple line\nSecond line\n";
@@ -805,6 +869,36 @@ mod tests {
                 markup.value.to_lowercase().contains("list directory")
                     || markup.value.to_lowercase().contains("ls")
             );
+        } else {
+            panic!("Expected HoverContents::Markup");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_hover_info_path_command() {
+        // '/bin/ls' should resolve to 'ls' man page rather than opening binary
+        let hover = get_hover_info("/bin/ls").await;
+        assert!(hover.is_some());
+        if let Some(HoverContents::Markup(markup)) = hover {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.starts_with("```text\n"));
+            assert!(
+                markup.value.to_lowercase().contains("list directory")
+                    || markup.value.to_lowercase().contains("ls")
+            );
+        } else {
+            panic!("Expected HoverContents::Markup");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_hover_info_path_builtin() {
+        // '/bin/echo' should resolve to echo builtin documentation
+        let hover = get_hover_info("/bin/echo").await;
+        assert!(hover.is_some());
+        if let Some(HoverContents::Markup(markup)) = hover {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.contains("`echo` (Zsh Builtin)"));
         } else {
             panic!("Expected HoverContents::Markup");
         }

@@ -392,7 +392,25 @@ async fn test_hover_whitespace_and_boundary_conditions() {
         .unwrap();
     assert!(hover_space.is_none());
 
-    // 3. Hover on gap between cd and /tmp (line 1, char 6)
+    // 3. Hover on space immediately after 'cd' (line 1, char 5)
+    let hover_after_word = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(1, 5),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        hover_after_word.is_none(),
+        "Hover on space immediately following a word must return None"
+    );
+
+    // 4. Hover on gap between cd and /tmp (line 1, char 6)
     let hover_gap = test_client
         .send_request::<HoverRequest>(HoverParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -407,7 +425,7 @@ async fn test_hover_whitespace_and_boundary_conditions() {
         .unwrap();
     assert!(hover_gap.is_none());
 
-    // 4. Hover out of line bounds (line 10, char 0)
+    // 5. Hover out of line bounds (line 10, char 0)
     let hover_oob_line = test_client
         .send_request::<HoverRequest>(HoverParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -422,7 +440,7 @@ async fn test_hover_whitespace_and_boundary_conditions() {
         .unwrap();
     assert!(hover_oob_line.is_none());
 
-    // 5. Hover on unopened document
+    // 6. Hover on unopened document
     let unopened_uri = Url::parse("file:///not_opened.zsh").unwrap();
     let hover_unopened = test_client
         .send_request::<HoverRequest>(HoverParams {
