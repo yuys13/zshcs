@@ -46,7 +46,7 @@ The entry point and server backend coordinate command-line argument parsing, LSP
 - **CLI Argument Parsing (`src/cli.rs`)**:
   - Employs `clap` (derive macro) to provide type-safe, declarative command-line parsing.
   - Supports standard flags: `--stdio` (default mode for stdio-based LSP communication), `--version` / `-V`, and `--help` / `-h`.
-  - Structured cleanly to accommodate future subcommand extensions (such as diagnostic health checks).
+  - Supports the `doctor` subcommand (`zshcs doctor`) to inspect runtime prerequisites and environment health.
 - **Capabilities Negotiation (`initialize`)**:
   - **Text Document Sync**: `TextDocumentSyncKind::INCREMENTAL` for fine-grained, low-latency diff synchronization.
   - **Trigger Characters**: Registers `["-", "$", "/", "~", ".", " "]` to trigger completions immediately upon typing flags, variables, directory paths, hidden files, or subcommands.
@@ -259,6 +259,53 @@ flowchart TD
 
 ---
 
+### 2.8 Diagnostic Health Check Subsystem (`src/doctor.rs`, `zshcs doctor`)
+
+`zshcs` provides a dedicated diagnostic command (`zshcs doctor`) designed to verify runtime prerequisites, shell modules, filesystem permissions, and completion engine integrity prior to LSP client integration.
+
+```mermaid
+flowchart TD
+    DoctorCmd["CLI Invocation (`zshcs doctor`)"] --> RunChecks["run_doctor_checks() (`src/doctor.rs`)"]
+    
+    subgraph Checks [Sequential Diagnostic Pipeline]
+        C1["1. check_zsh_executable<br/>• Verify `zsh` in PATH<br/>• Execute `zsh --version`<br/>• Extract version string"]
+        C2["2. check_zpty_module<br/>• Execute `zsh -c 'zmodload zsh/zpty'`<br/>• Validate pseudo-terminal support"]
+        C3["3. check_zutil_module<br/>• Execute `zsh -c 'zmodload zsh/zutil'`<br/>• Validate zparseopts support"]
+        C4["4. check_cache_directory<br/>• Resolve `$ZSHCS_CACHE_DIR` / XDG / HOME<br/>• Test `create_dir_all`<br/>• Test write permissions via temp file"]
+        C5["5. check_capture_dry_run<br/>• Write embedded scripts to temp dir<br/>• Spawn PTY subshell in worker thread<br/>• Send `input:echo \n`<br/>• Validate candidate stream & EOC (5s timeout)"]
+    end
+    
+    RunChecks --> C1 --> C2 --> C3 --> C4 --> C5
+    C5 --> BuildReport["DoctorReport Compilation<br/>• Vec&lt;CheckResult&gt;<br/>• CheckStatus: Pass [✓], Warn [!], Fail [✗]"]
+    BuildReport --> Render["DoctorReport::render<br/>• Format Pass/Fail/Warn icons & messages<br/>• Print summary count"]
+    Render --> ExitCheck{"All Checks Passed?"}
+    ExitCheck -- Yes --> Exit0["Exit Code: 0 (Success)"]
+    ExitCheck -- No --> Exit1["Exit Code: 1 (Failure)"]
+```
+
+- **Diagnostic Scope & Methodology**:
+  1. **Zsh Executable Verification (`check_zsh_executable`)**:
+     - Confirms `zsh` binary exists in the system `PATH` and is executable.
+     - Executes `zsh --version` and records the reported shell version.
+  2. **PTY Module Availability (`check_zpty_module`)**:
+     - Executes `zsh -c "zmodload zsh/zpty"` to verify dynamic module loading of `zsh/zpty`.
+     - Ensures the host environment can spawn interactive pseudo-terminals required by `capture.zsh`.
+  3. **Utility Module Availability (`check_zutil_module`)**:
+     - Executes `zsh -c "zmodload zsh/zutil"` to verify availability of `zparseopts` used for option/flag parsing in `zptyrc.zsh`.
+  4. **Isolated Cache Verification (`check_cache_directory`)**:
+     - Resolves the target cache directory with standard fallback hierarchy: `$ZSHCS_CACHE_DIR` $\to$ `$XDG_CACHE_HOME/zshcs/zsh` $\to$ `$HOME/.cache/zshcs/zsh` $\to$ temporary directory.
+     - Verifies directory creation (`std::fs::create_dir_all`) and write permissions by writing and deleting a timestamped probe file.
+  5. **Completion Engine Dry-Run (`check_capture_dry_run`)**:
+     - Writes compile-time embedded `CAPTURE_ZSH` and `ZPTYRC_ZSH` to a temporary directory.
+     - Spawns the interactive `capture.zsh` process in an isolated worker thread guarded by a 5-second timeout.
+     - Submits a test completion query (`input:echo \n`), consumes the candidate stream, verifies reception of the `\x01EOC\x01` marker, and cleanly tears down the child process.
+- **Reporting & Exit Code Semantics**:
+  - `DoctorReport` structures outcomes across `CheckStatus::Pass` (`[✓]`), `CheckStatus::Warn` (`[!]`), and `CheckStatus::Fail` (`[✗]`).
+  - Outputs a clear, formatted summary to standard output.
+  - Returns exit code `0` when all mandatory diagnostic checks pass, and exit code `1` if any check fails, allowing seamless integration into installation scripts and CI verification.
+
+---
+
 ## 3. Detailed Data Flow & Protocols
 
 ### 3.1 Completion Request Lifecycle
@@ -344,7 +391,8 @@ flowchart LR
    - `tests/completion_test.rs` (37 tests): Validates LSP completions, consecutive requests, dynamic item kinds, working directory switching, crash recovery, timeout handling, and CRLF / multibyte buffers.
    - `tests/server_test.rs` (34 tests): Tests initialize handshake, capabilities negotiation, incremental synchronization, out-of-order versions, invalid ranges, document close cleanup, and custom execution commands.
    - `tests/logging_test.rs` (8 tests): Validates tracing subscriber initialization, `stderr` log routing, stdout JSON-RPC isolation, and dynamic `ZSHCS_LOG` / `RUST_LOG` filter evaluation.
-   - `tests/cli_test.rs` (21 tests): Validates CLI flag parsing (`--stdio`, `--help`, `--version`), duplicate detection, and process lifecycle over stdio.
+   - `tests/cli_test.rs` (22 tests): Validates CLI flag parsing (`--stdio`, `--help`, `--version`), doctor subcommand parsing, duplicate detection, and process lifecycle over stdio.
+   - `tests/doctor_test.rs` (24 tests): Validates the `doctor` health check subsystem, individual diagnostic checks (Zsh executable, zpty, zutil, cache dir permissions, capture dry-run), report formatting, and exit codes.
    - `tests/stress_test.rs` (20 tests): High-concurrency stress testing with 50 simultaneous clients, 10,000-candidate volume parsing, channel saturation, rapid interleaved edit/completion bursts, and deterministic PRNG fuzzing for Unicode boundaries and surrogate pairs.
 2. **Zsh Script Unit Test Harness (`tests/zsh/run_tests.zsh`)**:
    - Executes 12 standalone unit test cases validating `capture.zsh` and `zptyrc.zsh` syntax (`zsh -n`), module loading (`zsh/zpty`, `zsh/zutil`), isolated cache creation, directory synchronization helpers (`_zshcs_chdir`), `compadd` delegation and interception hooks, and pty end-to-end query processing.
