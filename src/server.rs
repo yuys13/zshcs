@@ -1,15 +1,18 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::time::timeout;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::completion::{CAPTURE_ZSH, CompletionRequest, ZPTYRC_ZSH, run_completion_daemon};
+use crate::config::Config;
+use crate::diagnostics::check_syntax;
 use crate::document::DocumentManager;
 use crate::error::{ZshcsError, ZshcsResult};
 
@@ -19,6 +22,7 @@ pub struct Backend {
     document_manager: DocumentManager,
     _temp_dir: TempDir,
     completion_tx: mpsc::Sender<CompletionRequest>,
+    config: Arc<RwLock<Config>>,
 }
 
 impl Backend {
@@ -65,6 +69,7 @@ impl Backend {
             document_manager: DocumentManager::new(),
             _temp_dir: temp_dir,
             completion_tx: tx,
+            config: Arc::new(RwLock::new(Config::default())),
         })
     }
 
@@ -111,11 +116,20 @@ impl Backend {
             document_manager: DocumentManager::new(),
             _temp_dir: temp_dir,
             completion_tx: tx,
+            config: Arc::new(RwLock::new(Config::default())),
         })
     }
 
     pub fn document_manager(&self) -> &DocumentManager {
         &self.document_manager
+    }
+
+    pub fn config(&self) -> Arc<RwLock<Config>> {
+        Arc::clone(&self.config)
+    }
+
+    pub async fn is_diagnostics_enabled(&self) -> bool {
+        self.config.read().await.experimental_diagnostics()
     }
 }
 
@@ -129,6 +143,15 @@ impl LanguageServer for Backend {
             capabilities = ?params.capabilities,
             "Client initialization parameters"
         );
+
+        if let Some(options) = &params.initialization_options {
+            let initial_config = Config::from_value(Some(options));
+            tracing::info!(
+                experimental_diagnostics = initial_config.experimental_diagnostics(),
+                "Parsed initial server configuration"
+            );
+            *self.config.write().await = initial_config;
+        }
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
@@ -183,6 +206,56 @@ impl LanguageServer for Backend {
         Ok(())
     }
 
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        tracing::info!("workspace/didChangeConfiguration received");
+        let new_config = Config::from_value(Some(&params.settings));
+        let was_enabled;
+        let is_enabled = new_config.experimental_diagnostics();
+        {
+            let mut conf = self.config.write().await;
+            was_enabled = conf.experimental_diagnostics();
+            *conf = new_config;
+        }
+
+        tracing::info!(
+            was_enabled,
+            is_enabled,
+            "Updated server configuration from didChangeConfiguration"
+        );
+
+        if was_enabled && !is_enabled {
+            // Clear all diagnostics for all open documents
+            for item in self.document_manager.iter() {
+                let uri = item.key().clone();
+                let version = item.value().version();
+                self.client
+                    .publish_diagnostics(uri, vec![], Some(version))
+                    .await;
+            }
+        } else if !was_enabled && is_enabled {
+            // Trigger diagnostics for all open documents
+            for item in self.document_manager.iter() {
+                let uri = item.key().clone();
+                let version = item.value().version();
+                let text = item.value().text().to_string();
+                let client = self.client.clone();
+                let doc_mgr = self.document_manager.clone();
+                let config = Arc::clone(&self.config);
+                tokio::spawn(async move {
+                    let diagnostics = check_syntax(&text).await;
+                    if let Some(doc) = doc_mgr.get(&uri)
+                        && doc.version() == version
+                        && config.read().await.experimental_diagnostics()
+                    {
+                        client
+                            .publish_diagnostics(uri, diagnostics, Some(version))
+                            .await;
+                    }
+                });
+            }
+        }
+    }
+
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
@@ -191,10 +264,29 @@ impl LanguageServer for Backend {
         tracing::info!(uri = %uri, version, "textDocument/didOpen");
         tracing::trace!(text_len = text.len(), "Document content opened");
 
-        self.document_manager.open(uri.clone(), version, text);
+        self.document_manager
+            .open(uri.clone(), version, text.clone());
         self.client
             .log_message(MessageType::INFO, format!("textDocument/didOpen: {uri}"))
             .await;
+
+        if self.is_diagnostics_enabled().await {
+            let client = self.client.clone();
+            let uri_clone = uri.clone();
+            let doc_mgr = self.document_manager.clone();
+            let config = Arc::clone(&self.config);
+            tokio::spawn(async move {
+                let diagnostics = check_syntax(&text).await;
+                if let Some(doc) = doc_mgr.get(&uri_clone)
+                    && doc.version() == version
+                    && config.read().await.experimental_diagnostics()
+                {
+                    client
+                        .publish_diagnostics(uri_clone, diagnostics, Some(version))
+                        .await;
+                }
+            });
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -225,6 +317,61 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, format!("textDocument/didChange: {uri}"))
             .await;
+
+        if self.is_diagnostics_enabled().await {
+            let client = self.client.clone();
+            let uri_clone = uri.clone();
+            let doc_mgr = self.document_manager.clone();
+            let config = Arc::clone(&self.config);
+            tokio::spawn(async move {
+                // Debounce delay to coalesce rapid keystrokes
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                if let Some(doc) = doc_mgr.get(&uri_clone)
+                    && doc.version() == version
+                    && config.read().await.experimental_diagnostics()
+                {
+                    let text = doc.text().to_string();
+                    drop(doc);
+                    let diagnostics = check_syntax(&text).await;
+                    if let Some(doc_after) = doc_mgr.get(&uri_clone)
+                        && doc_after.version() == version
+                        && config.read().await.experimental_diagnostics()
+                    {
+                        client
+                            .publish_diagnostics(uri_clone, diagnostics, Some(version))
+                            .await;
+                    }
+                }
+            });
+        }
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri;
+        tracing::info!(uri = %uri, "textDocument/didSave");
+
+        if self.is_diagnostics_enabled().await
+            && let Some(doc) = self.document_manager.get(&uri)
+        {
+            let version = doc.version();
+            let text = doc.text().to_string();
+            drop(doc);
+            let client = self.client.clone();
+            let uri_clone = uri.clone();
+            let doc_mgr = self.document_manager.clone();
+            let config = Arc::clone(&self.config);
+            tokio::spawn(async move {
+                let diagnostics = check_syntax(&text).await;
+                if let Some(doc_after) = doc_mgr.get(&uri_clone)
+                    && doc_after.version() == version
+                    && config.read().await.experimental_diagnostics()
+                {
+                    client
+                        .publish_diagnostics(uri_clone, diagnostics, Some(version))
+                        .await;
+                }
+            });
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -234,6 +381,9 @@ impl LanguageServer for Backend {
             self.client
                 .log_message(MessageType::INFO, format!("textDocument/didClose: {uri}"))
                 .await;
+            if self.is_diagnostics_enabled().await {
+                self.client.publish_diagnostics(uri, vec![], None).await;
+            }
         } else {
             tracing::warn!(uri = %uri, "textDocument/didClose: document not found");
             self.client
