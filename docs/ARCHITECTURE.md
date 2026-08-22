@@ -309,5 +309,3 @@ flowchart LR
 4. **Pre-Commit Hook & CI Enforcement**:
    - Git native pre-commit hook (`.githooks/pre-commit`) configured via `git config core.hooksPath .githooks`.
    - CI pipeline (`.github/workflows/ci.yml`) enforces zero warnings on Linux and macOS, accompanied by `cargo-llvm-cov` and an Octocov 85% code coverage threshold gate.
-
-
