@@ -37,10 +37,14 @@ flowchart TB
 
 ## 2. Core Components & Subsystems
 
-### 2.1 LSP Server & Backend (`src/server.rs`, `src/lib.rs`, `src/main.rs`)
+### 2.1 CLI Interface & LSP Server Backend (`src/cli.rs`, `src/server.rs`, `src/lib.rs`, `src/main.rs`)
 
-The server backend is implemented using `tower-lsp`. It coordinates LSP request routing, manages document lifecycle notifications, dispatches completion requests to the daemon supervisor, and provides extension commands.
+The entry point and server backend coordinate command-line argument parsing, LSP request routing, document lifecycle notifications, completion dispatching, and custom extension commands.
 
+- **CLI Argument Parsing (`src/cli.rs`)**:
+  - Employs `clap` (derive macro) to provide type-safe, declarative command-line parsing.
+  - Supports standard flags: `--stdio` (default mode for stdio-based LSP communication), `--version` / `-V`, and `--help` / `-h`.
+  - Structured cleanly to accommodate future subcommand extensions (such as diagnostic health checks).
 - **Capabilities Negotiation (`initialize`)**:
   - **Text Document Sync**: `TextDocumentSyncKind::INCREMENTAL` for fine-grained, low-latency diff synchronization.
   - **Trigger Characters**: Registers `["-", "$", "/", "~", ".", " "]` to trigger completions immediately upon typing flags, variables, directory paths, hidden files, or subcommands.
