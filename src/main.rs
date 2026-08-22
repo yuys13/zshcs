@@ -1,8 +1,11 @@
+use clap::Parser;
 use tower_lsp::{LspService, Server};
-use zshcs::Backend;
+use zshcs::{Backend, Cli};
 
 #[tokio::main]
 async fn main() {
+    let _cli = Cli::parse();
+
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 

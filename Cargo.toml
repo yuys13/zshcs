@@ -13,6 +13,7 @@ futures = "0.3" # Added for asynchronous processing in tests
 dashmap = "6.2.1"
 tempfile = "3.27.0"
 thiserror = "2.0"
+clap = { version = "=4.5.20", features = ["derive"] }
 
 [dev-dependencies]
 rstest = "0.26.1"
