@@ -172,6 +172,21 @@ fn test_cli_struct_traits() {
     let debug_str = format!("{cli1:?}");
     assert!(debug_str.contains("Cli"));
     assert!(debug_str.contains("stdio: true"));
+
+    let cli_doc = Cli {
+        stdio: false,
+        command: Some(zshcs::Commands::Doctor),
+    };
+    let cli_doc_clone = cli_doc.clone();
+    assert_eq!(cli_doc, cli_doc_clone);
+    assert!(format!("{cli_doc:?}").contains("Doctor"));
+}
+
+#[test]
+fn test_cli_parse_doctor_subcommand_in_cli_test() {
+    let cli = Cli::try_parse_from(["zshcs", "doctor"]).expect("Failed to parse doctor subcommand");
+    assert!(!cli.stdio);
+    assert_eq!(cli.command, Some(zshcs::Commands::Doctor));
 }
 
 #[test]
@@ -192,7 +207,7 @@ fn test_cli_parse_case_sensitivity() {
 fn test_cli_parse_empty_positional_arg() {
     let res = Cli::try_parse_from(["zshcs", ""]);
     assert!(res.is_err());
-    assert_eq!(res.unwrap_err().kind(), ErrorKind::UnknownArgument);
+    assert_eq!(res.unwrap_err().kind(), ErrorKind::InvalidSubcommand);
 }
 
 #[test]

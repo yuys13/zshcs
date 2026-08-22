@@ -30,7 +30,8 @@ pub struct Cli {
 /// Supported subcommands for `zshcs`.
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Commands {
-    // Reserved for future subcommands (e.g. doctor, check)
+    /// Check health of the environment, zsh installation, modules, and cache
+    Doctor,
 }
 
 #[cfg(test)]
@@ -52,6 +53,14 @@ mod tests {
         let cli = Cli::try_parse_from(args).expect("Should parse with --stdio");
         assert!(cli.stdio);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn test_cli_doctor_subcommand() {
+        let args = ["zshcs", "doctor"];
+        let cli = Cli::try_parse_from(args).expect("Should parse doctor subcommand");
+        assert!(!cli.stdio);
+        assert_eq!(cli.command, Some(Commands::Doctor));
     }
 
     #[test]
@@ -81,6 +90,6 @@ mod tests {
     #[test]
     fn test_cli_unexpected_positional_argument() {
         let err = Cli::try_parse_from(["zshcs", "invalid-subcommand"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert_eq!(err.kind(), ErrorKind::InvalidSubcommand);
     }
 }
