@@ -51,14 +51,27 @@ return {
   cmd = { "zshcs" },
   filetypes = { "zsh" },
   root_markers = { ".git" },
+  -- Optional: Enable experimental syntax diagnostics (zsh -n)
+  settings = {
+    zshcs = {
+      experimental = {
+        diagnostics = true,
+      },
+    },
+  },
 }
 ```
 
-1. Enable it in your `init.lua`:
+2. Enable it in your `init.lua`:
 
 ```lua
 vim.lsp.enable("zshcs")
 ```
+
+### Experimental Features
+
+- **Syntax Diagnostics (`zsh -n`)**: By default, diagnostics are disabled to avoid unnecessary process overhead. You can opt-in by configuring `settings.zshcs.experimental.diagnostics = true` in your LSP client configuration or `initializationOptions`.
+
 
 ## How It Works
 

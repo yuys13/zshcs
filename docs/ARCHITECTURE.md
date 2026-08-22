@@ -16,7 +16,9 @@ flowchart TB
 
     subgraph RustServer [Rust LSP Server Process (zshcs)]
         LSPBackend["LSP Backend (`src/server.rs`)<br/>• LanguageServer Trait<br/>• Request Routing & Commands"]
+        ConfigMgr["Config Subsystem (`src/config.rs`)<br/>• Opt-In Schema Parsing<br/>• Experimental Diagnostics Flag"]
         DocMgr["DocumentManager (`src/document.rs`)<br/>• In-Memory Arc&lt;DashMap&lt;Url, DocumentState&gt;&gt;<br/>• Incremental Sync & UTF-16/UTF-8 Mapping"]
+        DiagEngine["Diagnostics Engine (`src/diagnostics.rs`)<br/>• Non-blocking `zsh -n` Runner<br/>• Debounced Stderr Parser"]
         Supervisor["Daemon Supervisor (`src/completion.rs`)<br/>• run_completion_daemon<br/>• HoL Cancellation & Timeout Guard<br/>• Process Recovery & chdir Sync"]
         Logging["Logging Subsystem (`src/logging.rs`)<br/>• tracing & tracing-subscriber<br/>• Stderr Destination & EnvFilter"]
         ErrHandling["Error Hierarchy (`src/error.rs`)<br/>• ZshcsError / ZshcsResult<br/>• Type-Safe Conversions"]
@@ -28,7 +30,10 @@ flowchart TB
     end
 
     Editor <-->|LSP JSON-RPC / stdio (stdout)| LSPBackend
+    LSPBackend <-->|Config State| ConfigMgr
     LSPBackend <-->|CRUD & Offset Conversion| DocMgr
+    LSPBackend -->|Debounced Syntax Validation| DiagEngine
+    DiagEngine -.->|publishDiagnostics| Editor
     LSPBackend -->|mpsc / oneshot| Supervisor
     RustServer -.->|Structured Logs (stderr)| Editor
     Supervisor <-->|Piped stdin/stdout (RPC: input / chdir)| CaptureScript
@@ -306,6 +311,40 @@ flowchart TD
 
 ---
 
+### 2.9 Experimental Syntax Diagnostics Subsystem (`src/diagnostics.rs`, `src/config.rs`)
+
+`zshcs` provides an opt-in, non-blocking syntax diagnostics engine powered by `zsh -n` validation.
+
+- **Experimental Opt-In Configuration (`src/config.rs`)**:
+  - Disabled by default (`diagnostics: false`) to guarantee zero process spawning overhead for standard completion-only usage.
+  - Dynamically configured via LSP `initializationOptions` (startup) or `workspace/didChangeConfiguration` (runtime) using the schema:
+    ```json
+    {
+      "zshcs": {
+        "experimental": {
+          "diagnostics": true
+        }
+      }
+    }
+    ```
+  - Also tolerates flat `{ "experimental": { "diagnostics": true } }` payloads without panic or type failure.
+- **Asynchronous Syntax Verification Engine (`check_syntax`)**:
+  - Executes `zsh -n -c <text>` asynchronously with a 2000ms timeout guard (`DEFAULT_SYNTAX_CHECK_TIMEOUT`).
+  - Pipes standard error output while discarding standard output, returning structured `Vec<Diagnostic>`.
+- **Diagnostic Error Parsing & Range Calculation (`parse_diagnostics`)**:
+  - Parses standard error lines formatted as `zsh:<line>: <message>`, `/path/to/script:<line>: <message>`, or `zsh: <message>`.
+  - Converts 1-indexed Zsh line numbers into 0-indexed LSP `Position`s with full UTF-16 code unit line bounds.
+  - Safely clamps out-of-bounds line numbers (e.g. trailing syntax errors or empty documents) without panicking.
+  - Sets `severity: DiagnosticSeverity::ERROR` and `source: "zshcs"`.
+- **Debouncing & Stale Run Elimination**:
+  - Debounces `did_change` notifications by 150ms to coalesce rapid keystrokes during active typing.
+  - Compares document version tokens before spawning validation and before publishing results to drop obsolete diagnostic results.
+- **Dynamic Configuration Transitions & Buffer Cleanup**:
+  - Transitioning `diagnostics` from enabled to disabled immediately broadcasts empty diagnostic arrays (`vec![]`) to all open buffers.
+  - Closing a document (`did_close`) immediately publishes `vec![]` to clear diagnostic squiggles in the editor.
+
+---
+
 ## 3. Detailed Data Flow & Protocols
 
 ### 3.1 Completion Request Lifecycle
@@ -357,6 +396,37 @@ sequenceDiagram
 
 ---
 
+### 3.2 Experimental Syntax Diagnostics Lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Editor User
+    participant Client as LSP Client
+    participant Server as Backend (`src/server.rs`)
+    participant DocMgr as DocumentManager (`src/document.rs`)
+    participant Diag as Diagnostics Engine (`src/diagnostics.rs`)
+
+    User->>Client: Edit buffer (didChange / didOpen / didSave)
+    Client->>Server: textDocument/didChange (uri, version, changes)
+    Server->>DocMgr: apply_changes(uri, version, changes)
+    alt Experimental Diagnostics Disabled (default)
+        Note over Server: No tasks spawned, zero subprocess overhead
+    else Experimental Diagnostics Enabled
+        Server->>Server: Spawn debounced task (150ms delay)
+        Note over Server: Check doc.version == current_version
+        Server->>Diag: check_syntax(text)
+        Diag->>Diag: Spawn `zsh -n -c <text>` (2s timeout)
+        Diag->>Diag: parse_diagnostics(stderr, text)
+        Diag-->>Server: Vec<Diagnostic>
+        Server->>DocMgr: Verify doc.version == current_version
+        Server->>Client: textDocument/publishDiagnostics (uri, diagnostics, version)
+        Client-->>User: Display syntax error squiggles
+    end
+```
+
+---
+
 ## 4. Testing, QA & Quality Gates
 
 `zshcs` enforces quality assurance through a multi-tier testing and verification architecture:
@@ -388,6 +458,7 @@ flowchart LR
 ### 4.1 Test Suites Overview
 
 1. **Rust Integration & Unit Test Suites**:
+   - `tests/diagnostics_test.rs` (6 tests): Validates experimental syntax diagnostics opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, syntax error reporting, error clearing on fix, buffer closing cleanup, and edit debouncing.
    - `tests/completion_test.rs` (37 tests): Validates LSP completions, consecutive requests, dynamic item kinds, working directory switching, crash recovery, timeout handling, and CRLF / multibyte buffers.
    - `tests/server_test.rs` (34 tests): Tests initialize handshake, capabilities negotiation, incremental synchronization, out-of-order versions, invalid ranges, document close cleanup, and custom execution commands.
    - `tests/logging_test.rs` (8 tests): Validates tracing subscriber initialization, `stderr` log routing, stdout JSON-RPC isolation, and dynamic `ZSHCS_LOG` / `RUST_LOG` filter evaluation.

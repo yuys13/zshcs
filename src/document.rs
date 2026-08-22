@@ -170,6 +170,11 @@ impl DocumentManager {
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
     }
+
+    /// Returns an iterator over all open documents.
+    pub fn iter(&self) -> dashmap::iter::Iter<'_, Url, DocumentState> {
+        self.documents.iter()
+    }
 }
 
 /// Converts an LSP `Position` (line and UTF-16 character offset) to a byte offset within `text`.
