@@ -169,7 +169,7 @@ test_capture_script_e2e() {
         print -p "input:ls "
         local line=""
         local collected=""
-        while IFS= read -r -p line; do
+        while IFS= read -t 10 -r -p line; do
             collected+="$line"$'"'\n'"'
             if [[ "$line" == *$'"'\x01EOC\x01'"'* ]]; then
                 break
@@ -196,7 +196,7 @@ test_capture_script_invalid_message() {
         coproc zsh "'"$CAPTURE_SCRIPT"'" 2>&1
         print -p "invalid_message_prefix"
         local line=""
-        while IFS= read -r -p line; do
+        while IFS= read -t 10 -r -p line; do
             print -r -- "$line"
         done
     ' 2>&1 || true)
@@ -218,14 +218,14 @@ test_capture_script_sequential_queries() {
         print -p "input:ls "
         local line=""
         local eoc_count=0
-        while IFS= read -r -p line; do
+        while IFS= read -t 10 -r -p line; do
             if [[ "$line" == *$'"'\x01EOC\x01'"'* ]]; then
                 eoc_count=$((eoc_count + 1))
                 break
             fi
         done
         print -p "input:cd "
-        while IFS= read -r -p line; do
+        while IFS= read -t 10 -r -p line; do
             if [[ "$line" == *$'"'\x01EOC\x01'"'* ]]; then
                 eoc_count=$((eoc_count + 1))
                 break
@@ -306,7 +306,7 @@ test_chdir_with_spaces_and_quotes() {
         print -p "input:ls "
         local line=""
         local collected=""
-        while IFS= read -r -p line; do
+        while IFS= read -t 10 -r -p line; do
             collected+="$line"$'"'\n'"'
             if [[ "$line" == *$'"'\x01EOC\x01'"'* ]]; then
                 break
