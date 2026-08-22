@@ -344,7 +344,7 @@ flowchart LR
    - `tests/completion_test.rs` (37 tests): Validates LSP completions, consecutive requests, dynamic item kinds, working directory switching, crash recovery, timeout handling, and CRLF / multibyte buffers.
    - `tests/server_test.rs` (34 tests): Tests initialize handshake, capabilities negotiation, incremental synchronization, out-of-order versions, invalid ranges, document close cleanup, and custom execution commands.
    - `tests/logging_test.rs` (8 tests): Validates tracing subscriber initialization, `stderr` log routing, stdout JSON-RPC isolation, and dynamic `ZSHCS_LOG` / `RUST_LOG` filter evaluation.
-   - `tests/cli_test.rs` (17 tests): Validates CLI flag parsing (`--stdio`, `--help`, `--version`), duplicate detection, and process lifecycle over stdio.
+   - `tests/cli_test.rs` (21 tests): Validates CLI flag parsing (`--stdio`, `--help`, `--version`), duplicate detection, and process lifecycle over stdio.
    - `tests/stress_test.rs` (20 tests): High-concurrency stress testing with 50 simultaneous clients, 10,000-candidate volume parsing, channel saturation, rapid interleaved edit/completion bursts, and deterministic PRNG fuzzing for Unicode boundaries and surrogate pairs.
 2. **Zsh Script Unit Test Harness (`tests/zsh/run_tests.zsh`)**:
    - Executes 12 standalone unit test cases validating `capture.zsh` and `zptyrc.zsh` syntax (`zsh -n`), module loading (`zsh/zpty`, `zsh/zutil`), isolated cache creation, directory synchronization helpers (`_zshcs_chdir`), `compadd` delegation and interception hooks, and pty end-to-end query processing.
