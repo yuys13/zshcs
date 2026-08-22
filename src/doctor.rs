@@ -186,7 +186,9 @@ fn run_command_with_timeout(
     mut cmd: Command,
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let start = std::time::Instant::now();
 
@@ -230,7 +232,13 @@ pub fn check_zsh_executable(zsh_binary: Option<&str>) -> CheckResult {
     cmd.arg("--version");
     match run_command_with_timeout(cmd, DEFAULT_COMMAND_TIMEOUT) {
         Ok(output) if output.status.success() => {
-            let version_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let version_str = stdout_str
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let version = if version_str.is_empty() {
                 format!("'{}' executable found (empty version output)", bin)
             } else {
@@ -239,7 +247,13 @@ pub fn check_zsh_executable(zsh_binary: Option<&str>) -> CheckResult {
             CheckResult::new("Zsh Executable", CheckStatus::Pass, version)
         }
         Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr_str
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let msg = if stderr.is_empty() {
                 format!("'{} --version' exited with status {}", bin, output.status)
             } else {
@@ -268,7 +282,13 @@ pub fn check_zpty_module(zsh_binary: Option<&str>) -> CheckResult {
             "Module 'zsh/zpty' loaded successfully",
         ),
         Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr_str
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let msg = if stderr.is_empty() {
                 format!(
                     "Failed to load 'zsh/zpty' module (exit code {})",
@@ -300,7 +320,13 @@ pub fn check_zutil_module(zsh_binary: Option<&str>) -> CheckResult {
             "Module 'zsh/zutil' loaded successfully",
         ),
         Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr_str
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let msg = if stderr.is_empty() {
                 format!(
                     "Failed to load 'zsh/zutil' module (exit code {})",
@@ -472,6 +498,17 @@ pub fn check_capture_dry_run(
             }
         };
 
+        let stderr = child.stderr.take();
+        let stderr_handle = std::thread::spawn(move || {
+            if let Some(mut err) = stderr {
+                let mut buf = String::new();
+                let _ = std::io::Read::read_to_string(&mut err, &mut buf);
+                buf
+            } else {
+                String::new()
+            }
+        });
+
         if let Ok(mut lock) = child_holder_worker.lock() {
             *lock = Some(child);
         }
@@ -479,6 +516,7 @@ pub fn check_capture_dry_run(
         if let Err(e) = stdin.write_all(b"input:echo \n") {
             let _ = tx.send(Err(format!("Failed to write input to capture script: {e}")));
             reap_worker();
+            let _ = stderr_handle.join();
             return;
         }
         let _ = stdin.flush();
@@ -505,15 +543,24 @@ pub fn check_capture_dry_run(
                 Err(e) => {
                     let _ = tx.send(Err(format!("Error reading from capture script: {e}")));
                     reap_worker();
+                    let _ = stderr_handle.join();
                     return;
                 }
             }
         }
 
         reap_worker();
+        let stderr_output = stderr_handle.join().unwrap_or_default();
+        let stderr_trimmed = stderr_output.trim();
 
         if saw_eoc {
             let _ = tx.send(Ok(candidate_count));
+        } else if !stderr_trimmed.is_empty() {
+            let first_err_line = stderr_trimmed
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or(stderr_trimmed);
+            let _ = tx.send(Err(format!("Capture script failed: {first_err_line}")));
         } else {
             let _ = tx.send(Err(
                 "Capture script closed stream without EOC token".to_string()

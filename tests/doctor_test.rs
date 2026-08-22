@@ -300,3 +300,57 @@ fn test_run_doctor_function_returns_zero_exit_code() {
     let code = run_doctor();
     assert_eq!(code, 0);
 }
+
+#[test]
+fn test_doctor_report_warning_only_rendering() {
+    let checks = vec![
+        CheckResult::new("Zsh Executable", CheckStatus::Pass, "zsh 5.9"),
+        CheckResult::new("Zpty Module", CheckStatus::Pass, "module loaded"),
+        CheckResult::new(
+            "Cache Directory",
+            CheckStatus::Warn,
+            "sub-optimal directory",
+        ),
+    ];
+    let report = DoctorReport::new(checks);
+    assert!(report.is_all_passed());
+    assert_eq!(report.pass_count(), 2);
+    assert_eq!(report.fail_count(), 0);
+    assert_eq!(report.warn_count(), 1);
+
+    let mut output = Vec::new();
+    report.render(&mut output).unwrap();
+    let rendered = String::from_utf8(output).unwrap();
+
+    assert!(rendered.contains("[!] Cache Directory: sub-optimal directory"));
+    assert!(
+        rendered.contains(
+            "Result: 2/3 checks passed, 1 warning(s). Your environment is ready for zshcs!"
+        )
+    );
+}
+
+#[test]
+fn test_doctor_report_single_failure_zero_passes() {
+    let checks = vec![CheckResult::new(
+        "Zsh Executable",
+        CheckStatus::Fail,
+        "missing zsh",
+    )];
+    let report = DoctorReport::new(checks);
+    assert!(!report.is_all_passed());
+    assert_eq!(report.pass_count(), 0);
+    assert_eq!(report.fail_count(), 1);
+    assert_eq!(report.warn_count(), 0);
+
+    let mut output = Vec::new();
+    report.render(&mut output).unwrap();
+    let rendered = String::from_utf8(output).unwrap();
+
+    assert!(rendered.contains("[✗] Zsh Executable: missing zsh"));
+    assert!(
+        rendered.contains(
+            "Result: 0/1 checks passed, 1 failed. Please address the failed items above."
+        )
+    );
+}
