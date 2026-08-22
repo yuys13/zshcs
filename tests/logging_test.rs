@@ -89,6 +89,14 @@ fn test_create_env_filter_invalid_and_empty_edge_cases() {
     let filter3 = create_env_filter();
     assert_eq!(filter3.to_string(), "info");
 
+    // Whitespace padded string is trimmed
+    unsafe {
+        std::env::set_var("ZSHCS_LOG", "  trace  ");
+        std::env::remove_var("RUST_LOG");
+    }
+    let filter4 = create_env_filter();
+    assert_eq!(filter4.to_string(), "trace");
+
     unsafe {
         std::env::remove_var("ZSHCS_LOG");
     }

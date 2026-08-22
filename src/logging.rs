@@ -18,14 +18,14 @@ use tracing_subscriber::EnvFilter;
 pub fn create_env_filter() -> EnvFilter {
     if let Ok(val) = std::env::var("ZSHCS_LOG")
         && !val.trim().is_empty()
-        && let Ok(filter) = EnvFilter::try_new(&val)
+        && let Ok(filter) = EnvFilter::try_new(val.trim())
     {
         return filter;
     }
 
     if let Ok(val) = std::env::var("RUST_LOG")
         && !val.trim().is_empty()
-        && let Ok(filter) = EnvFilter::try_new(&val)
+        && let Ok(filter) = EnvFilter::try_new(val.trim())
     {
         return filter;
     }
@@ -189,6 +189,21 @@ mod tests {
         unsafe {
             std::env::remove_var("ZSHCS_LOG");
             std::env::remove_var("RUST_LOG");
+        }
+    }
+
+    #[test]
+    fn test_create_env_filter_whitespace_padded() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("ZSHCS_LOG", "  debug  ");
+            std::env::remove_var("RUST_LOG");
+        }
+        let filter = create_env_filter();
+        let filter_str = filter.to_string();
+        assert_eq!(filter_str, "debug");
+        unsafe {
+            std::env::remove_var("ZSHCS_LOG");
         }
     }
 
