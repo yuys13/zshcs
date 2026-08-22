@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -27,10 +27,16 @@ struct DaemonProcess {
 
 impl DaemonProcess {
     fn spawn(
-        script_path: &PathBuf,
-        cache_dir: Option<&PathBuf>,
+        script_path: &Path,
+        cache_dir: Option<&Path>,
         client: &Client,
     ) -> std::io::Result<Self> {
+        tracing::info!(
+            script = ?script_path,
+            ?cache_dir,
+            "Spawning completion daemon process"
+        );
+
         let mut cmd = tokio::process::Command::new("zsh");
         cmd.arg(script_path);
         if let Some(dir) = cache_dir {
@@ -46,12 +52,15 @@ impl DaemonProcess {
             .spawn()?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
+            tracing::error!("Failed to open stdin for completion daemon");
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to open stdin")
         })?;
         let stdout = child.stdout.take().ok_or_else(|| {
+            tracing::error!("Failed to open stdout for completion daemon");
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to open stdout")
         })?;
         let mut stderr = child.stderr.take().ok_or_else(|| {
+            tracing::error!("Failed to open stderr for completion daemon");
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to open stderr")
         })?;
 
@@ -64,10 +73,12 @@ impl DaemonProcess {
                 if len == 0 {
                     break;
                 }
+                let trimmed = line.trim_end();
+                tracing::warn!(stderr = %trimmed, "capture.zsh stderr output");
                 client_for_stderr
                     .log_message(
                         MessageType::WARNING,
-                        format!("capture.zsh stderr: {}", line.trim_end()),
+                        format!("capture.zsh stderr: {trimmed}"),
                     )
                     .await;
                 line.clear();
@@ -94,10 +105,15 @@ pub async fn run_completion_daemon(
     mut rx: mpsc::Receiver<CompletionRequest>,
     client: Client,
 ) {
+    tracing::info!("Starting completion daemon supervisor loop");
     let mut daemon: Option<DaemonProcess> = None;
 
     while let Some(req) = rx.recv().await {
         if req.responder.is_closed() {
+            tracing::debug!(
+                prefix = %req.prefix,
+                "Completion request cancelled by client; discarding"
+            );
             continue;
         }
 
@@ -105,6 +121,7 @@ pub async fn run_completion_daemon(
         if let Some(proc) = daemon.as_mut()
             && !proc.is_alive()
         {
+            tracing::warn!("Completion daemon process terminated, restarting...");
             client
                 .log_message(
                     MessageType::WARNING,
@@ -116,11 +133,13 @@ pub async fn run_completion_daemon(
 
         // Spawn daemon if not currently running
         if daemon.is_none() {
-            match DaemonProcess::spawn(&script_path, cache_dir.as_ref(), &client) {
+            match DaemonProcess::spawn(&script_path, cache_dir.as_deref(), &client) {
                 Ok(p) => {
+                    tracing::info!("Completion daemon process spawned successfully");
                     daemon = Some(p);
                 }
                 Err(e) => {
+                    tracing::error!(error = %e, "Failed to spawn completion daemon");
                     client
                         .log_message(
                             MessageType::ERROR,
@@ -146,6 +165,7 @@ pub async fn run_completion_daemon(
                     None => true,
                 };
                 if need_chdir {
+                    tracing::debug!(?target_cwd, "Changing daemon working directory");
                     let sanitized_cwd = target_cwd.to_string_lossy().replace(['\r', '\n'], "");
                     let chdir_msg = format!("chdir:{sanitized_cwd}\n");
                     proc.stdin.write_all(chdir_msg.as_bytes()).await?;
@@ -155,6 +175,7 @@ pub async fn run_completion_daemon(
 
             // Send input message to daemon (sanitizing newlines)
             let sanitized_prefix = req.prefix.replace(['\r', '\n'], "");
+            tracing::trace!(prefix = %sanitized_prefix, "Sending input to completion daemon");
             let msg = format!("input:{sanitized_prefix}\n");
             proc.stdin.write_all(msg.as_bytes()).await?;
 
@@ -173,6 +194,7 @@ pub async fn run_completion_daemon(
                 }
 
                 let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                tracing::trace!(line = %trimmed, "Received line from completion daemon stdout");
                 if trimmed.ends_with("\x01EOC\x01") {
                     let content = trimmed.trim_end_matches("\x01EOC\x01");
                     if !content.is_empty() {
@@ -185,6 +207,10 @@ pub async fn run_completion_daemon(
                 }
             }
 
+            tracing::debug!(
+                item_count = items.len(),
+                "Completed candidate stream parsing"
+            );
             Ok(items)
         })
         .await;
@@ -194,6 +220,7 @@ pub async fn run_completion_daemon(
                 let _ = req.responder.send(Ok(items));
             }
             Ok(Err(e)) => {
+                tracing::error!(error = %e, "Completion daemon I/O failure; killing process");
                 client
                     .log_message(
                         MessageType::ERROR,
@@ -206,6 +233,10 @@ pub async fn run_completion_daemon(
                 let _ = req.responder.send(Err(ZshcsError::Io(e)));
             }
             Err(_) => {
+                tracing::error!(
+                    timeout_ms = DAEMON_REQUEST_TIMEOUT.as_millis(),
+                    "Completion request timed out; terminating hung daemon"
+                );
                 client
                     .log_message(
                         MessageType::ERROR,

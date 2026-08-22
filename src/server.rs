@@ -121,7 +121,15 @@ impl Backend {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        tracing::info!("LSP initialize request received");
+        tracing::debug!(
+            process_id = ?params.process_id,
+            root_uri = ?params.root_uri,
+            capabilities = ?params.capabilities,
+            "Client initialization parameters"
+        );
+
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "zshcs-language-server".to_string(),
@@ -155,6 +163,10 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            "LSP server initialized successfully"
+        );
         self.client
             .log_message(MessageType::INFO, "server initialized!")
             .await;
@@ -167,6 +179,7 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        tracing::info!("LSP server shutting down");
         Ok(())
     }
 
@@ -174,6 +187,10 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
         let version = params.text_document.version;
+
+        tracing::info!(uri = %uri, version, "textDocument/didOpen");
+        tracing::trace!(text_len = text.len(), "Document content opened");
+
         self.document_manager.open(uri.clone(), version, text);
         self.client
             .log_message(MessageType::INFO, format!("textDocument/didOpen: {uri}"))
@@ -183,12 +200,20 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
+        let changes_count = params.content_changes.len();
+
+        tracing::debug!(uri = %uri, version, changes_count, "textDocument/didChange");
 
         if let Err(e) = self
             .document_manager
             .apply_changes(&uri, version, params.content_changes)
         {
             let err: ZshcsError = e.into();
+            tracing::warn!(
+                uri = %uri,
+                error = %err,
+                "Failed to apply incremental change"
+            );
             self.client
                 .log_message(
                     MessageType::WARNING,
@@ -205,10 +230,12 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         if self.document_manager.close(&uri).is_some() {
+            tracing::info!(uri = %uri, "textDocument/didClose");
             self.client
                 .log_message(MessageType::INFO, format!("textDocument/didClose: {uri}"))
                 .await;
         } else {
+            tracing::warn!(uri = %uri, "textDocument/didClose: document not found");
             self.client
                 .log_message(
                     MessageType::WARNING,
@@ -222,15 +249,27 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
+        tracing::debug!(
+            uri = %uri,
+            line = position.line,
+            character = position.character,
+            "Completion request received"
+        );
+
         let prefix = match self.document_manager.get_line_prefix(&uri, position) {
             Some(p) => p,
-            None => return Ok(None),
+            None => {
+                tracing::debug!(uri = %uri, "No line prefix found at position; returning None");
+                return Ok(None);
+            }
         };
 
         let cwd = uri
             .to_file_path()
             .ok()
             .and_then(|p| p.parent().map(|parent| parent.to_path_buf()));
+
+        tracing::trace!(prefix = %prefix, ?cwd, "Dispatching completion request to daemon");
 
         // Request completion from the daemon
         let (tx, rx) = oneshot::channel();
@@ -242,6 +281,7 @@ impl LanguageServer for Backend {
 
         if let Err(e) = self.completion_tx.send(req).await {
             let err = ZshcsError::DaemonChannel(e.to_string());
+            tracing::error!(error = %err, "Failed to send request to completion daemon");
             self.client
                 .log_message(MessageType::ERROR, format!("{err}"))
                 .await;
@@ -251,8 +291,15 @@ impl LanguageServer for Backend {
         let output_result = timeout(Duration::from_millis(6000), rx).await;
 
         match output_result {
-            Ok(Ok(Ok(items))) => Ok(Some(CompletionResponse::Array(items))),
+            Ok(Ok(Ok(items))) => {
+                tracing::debug!(
+                    count = items.len(),
+                    "Completion items retrieved successfully"
+                );
+                Ok(Some(CompletionResponse::Array(items)))
+            }
             Ok(Ok(Err(e))) => {
+                tracing::error!(error = %e, "Completion daemon returned error");
                 self.client
                     .log_message(MessageType::ERROR, format!("Daemon returned error: {e}"))
                     .await;
@@ -260,6 +307,7 @@ impl LanguageServer for Backend {
             }
             Ok(Err(e)) => {
                 let err = ZshcsError::RequestCancelled(e);
+                tracing::warn!(error = %err, "Completion request cancelled or responder dropped");
                 self.client
                     .log_message(MessageType::ERROR, format!("{err}"))
                     .await;
@@ -267,6 +315,7 @@ impl LanguageServer for Backend {
             }
             Err(e) => {
                 let err = ZshcsError::Timeout(e);
+                tracing::error!(error = %err, "Completion request timed out");
                 self.client
                     .log_message(MessageType::ERROR, format!("{err}"))
                     .await;
@@ -276,6 +325,9 @@ impl LanguageServer for Backend {
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
+        tracing::info!(command = %params.command, "execute_command invoked");
+        tracing::debug!(args_count = params.arguments.len(), "Command arguments");
+
         if params.command == "zshcs/getDocumentContent"
             && let Some(uri) = params
                 .arguments
