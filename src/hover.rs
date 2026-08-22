@@ -220,13 +220,20 @@ pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
     }
 
     let mut cmd = tokio::process::Command::new("man");
-    cmd.arg(target)
+    cmd.arg("-P")
+        .arg("cat")
+        .arg(target)
+        .stdin(std::process::Stdio::null())
         .env("MANPAGER", "cat")
         .env("PAGER", "cat")
         .env("TERM", "dumb")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+
+    if let Ok(manpath) = std::env::var("MANPATH") {
+        cmd.env("MANPATH", manpath);
+    }
 
     let child_output = tokio::time::timeout(timeout_dur, cmd.output()).await;
 
@@ -240,7 +247,22 @@ pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
                 Some(cleaned)
             }
         }
-        _ => None,
+        Ok(Ok(output)) => {
+            eprintln!(
+                "man command exited with status: {:?}, stderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            None
+        }
+        Ok(Err(e)) => {
+            eprintln!("Failed to execute man command: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("man command timed out");
+            None
+        }
     }
 }
 
@@ -858,41 +880,43 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_hover_info_man_page_fallback() {
-        // 'ls' is a standard Unix command with a man page
-        let hover = get_hover_info("ls").await;
+        // 'git' is a standard tool included in nativeBuildInputs with a man page
+        let hover = get_hover_info("git").await;
+        assert!(
+            hover.is_some(),
+            "Expected hover info for 'git' via man page"
+        );
         if let Some(HoverContents::Markup(markup)) = hover {
             assert_eq!(markup.kind, MarkupKind::Markdown);
             assert!(markup.value.starts_with("```text\n"));
             assert!(markup.value.ends_with("\n```"));
             assert!(
-                markup.value.to_lowercase().contains("list directory")
-                    || markup.value.to_lowercase().contains("ls")
+                markup.value.to_lowercase().contains("git")
+                    || markup.value.to_lowercase().contains("repository")
             );
         } else {
-            // In isolated environments (e.g. Nix build sandbox, minimal container), man or man pages may not be installed.
-            eprintln!(
-                "Skipping man page assertion: 'man ls' is not available in this environment."
-            );
+            panic!("Expected HoverContents::Markup");
         }
     }
 
     #[tokio::test]
     async fn test_get_hover_info_path_command() {
-        // '/bin/ls' should resolve to 'ls' man page rather than opening binary
-        let hover = get_hover_info("/bin/ls").await;
+        // '/usr/bin/git' should resolve to 'git' man page rather than opening binary
+        let hover = get_hover_info("/usr/bin/git").await;
+        assert!(
+            hover.is_some(),
+            "Expected hover info for '/usr/bin/git' via man page"
+        );
         if let Some(HoverContents::Markup(markup)) = hover {
             assert_eq!(markup.kind, MarkupKind::Markdown);
             assert!(markup.value.starts_with("```text\n"));
             assert!(markup.value.ends_with("\n```"));
             assert!(
-                markup.value.to_lowercase().contains("list directory")
-                    || markup.value.to_lowercase().contains("ls")
+                markup.value.to_lowercase().contains("git")
+                    || markup.value.to_lowercase().contains("repository")
             );
         } else {
-            // In isolated environments (e.g. Nix build sandbox, minimal container), man or man pages may not be installed.
-            eprintln!(
-                "Skipping man page assertion: 'man ls' is not available in this environment."
-            );
+            panic!("Expected HoverContents::Markup");
         }
     }
 

@@ -280,14 +280,14 @@ async fn test_hover_enabled_man_page_fallback() {
                 uri: doc_uri.clone(),
                 language_id: "zsh".to_string(),
                 version: 1,
-                text: "ls -la /tmp\n".to_string(),
+                text: "git status\n".to_string(),
             },
         })
         .await;
     let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
-    // Hover on 'ls' (external command with man page)
-    let hover_ls = test_client
+    // Hover on 'git' (external command with man page)
+    let hover_git = test_client
         .send_request::<HoverRequest>(HoverParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
@@ -300,27 +300,27 @@ async fn test_hover_enabled_man_page_fallback() {
         .await
         .unwrap();
 
-    if let Some(hover_ls_val) = hover_ls {
-        assert_eq!(
-            hover_ls_val.range,
-            Some(Range {
-                start: Position::new(0, 0),
-                end: Position::new(0, 2),
-            })
+    assert!(
+        hover_git.is_some(),
+        "Expected hover info for 'git' via man page"
+    );
+    let hover_git_val = hover_git.unwrap();
+    assert_eq!(
+        hover_git_val.range,
+        Some(Range {
+            start: Position::new(0, 0),
+            end: Position::new(0, 3),
+        })
+    );
+    if let HoverContents::Markup(markup) = hover_git_val.contents {
+        assert!(markup.value.starts_with("```text\n"));
+        assert!(markup.value.ends_with("\n```"));
+        assert!(
+            markup.value.to_lowercase().contains("git")
+                || markup.value.to_lowercase().contains("repository")
         );
-        if let HoverContents::Markup(markup) = hover_ls_val.contents {
-            assert!(markup.value.starts_with("```text\n"));
-            assert!(markup.value.ends_with("\n```"));
-            assert!(
-                markup.value.to_lowercase().contains("list directory")
-                    || markup.value.to_lowercase().contains("ls")
-            );
-        } else {
-            panic!("Expected HoverContents::Markup");
-        }
     } else {
-        // In isolated environments (e.g. Nix build sandbox, minimal container), man or man pages may not be installed.
-        eprintln!("Skipping man page assertion: 'man ls' is not available in this environment.");
+        panic!("Expected HoverContents::Markup");
     }
 }
 
@@ -611,7 +611,7 @@ async fn test_hover_path_qualified_and_special_builtins() {
                 uri: doc_uri.clone(),
                 language_id: "zsh".to_string(),
                 version: 1,
-                text: "/bin/echo 'hello'\n/bin/ls -la\n: 'noop'\n. ./script.sh\nnonexistent_xyz123 --flag\n".to_string(),
+                text: "/bin/echo 'hello'\n/usr/bin/git status\n: 'noop'\n. ./script.sh\nnonexistent_xyz123 --flag\n".to_string(),
             },
         })
         .await;
@@ -645,42 +645,40 @@ async fn test_hover_path_qualified_and_special_builtins() {
         panic!("Expected HoverContents::Markup");
     }
 
-    // 2. Hover on `/bin/ls` (line 1, char 6 on 'ls') -> resolves to `ls` man page
-    let hover_ls = test_client
+    // 2. Hover on `/usr/bin/git` (line 1, char 10 on 'git') -> resolves to `git` man page
+    let hover_git = test_client
         .send_request::<HoverRequest>(HoverParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
                     uri: doc_uri.clone(),
                 },
-                position: Position::new(1, 6),
+                position: Position::new(1, 10),
             },
             work_done_progress_params: Default::default(),
         })
         .await
         .unwrap();
-    if let Some(hover_ls_val) = hover_ls {
-        assert_eq!(
-            hover_ls_val.range,
-            Some(Range {
-                start: Position::new(1, 0),
-                end: Position::new(1, 7),
-            })
+    assert!(
+        hover_git.is_some(),
+        "Expected hover info for '/usr/bin/git' via man page"
+    );
+    let hover_git_val = hover_git.unwrap();
+    assert_eq!(
+        hover_git_val.range,
+        Some(Range {
+            start: Position::new(1, 0),
+            end: Position::new(1, 12),
+        })
+    );
+    if let HoverContents::Markup(markup) = hover_git_val.contents {
+        assert!(markup.value.starts_with("```text\n"));
+        assert!(markup.value.ends_with("\n```"));
+        assert!(
+            markup.value.to_lowercase().contains("git")
+                || markup.value.to_lowercase().contains("repository")
         );
-        if let HoverContents::Markup(markup) = hover_ls_val.contents {
-            assert!(markup.value.starts_with("```text\n"));
-            assert!(markup.value.ends_with("\n```"));
-            assert!(
-                markup.value.to_lowercase().contains("list directory")
-                    || markup.value.to_lowercase().contains("ls")
-            );
-        } else {
-            panic!("Expected HoverContents::Markup");
-        }
     } else {
-        // In isolated environments (e.g. Nix build sandbox, minimal container), man or man pages may not be installed.
-        eprintln!(
-            "Skipping man page assertion for /bin/ls: 'man ls' is not available in this environment."
-        );
+        panic!("Expected HoverContents::Markup");
     }
 
     // 3. Hover on `:` builtin (line 2, char 0)

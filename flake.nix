@@ -70,10 +70,12 @@
               pkgs.git
               pkgs.man-db
               pkgs.man-pages
+              pkgs.coreutils
             ];
 
             preCheck = ''
               export HOME=$TMPDIR
+              export MANPATH="${pkgs.coreutils}/share/man:${pkgs.man-pages}/share/man:$MANPATH"
             '';
 
           };
