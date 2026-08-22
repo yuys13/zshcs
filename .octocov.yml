@@ -1,5 +1,6 @@
 coverage:
   if: true
+  acceptable: 85%
   paths:
     - lcov.info
 testExecutionTime:
@@ -7,6 +8,7 @@ testExecutionTime:
   steps:
     - Test with coverage
 diff:
+  acceptable: 0%
   datastores:
     - artifact://${GITHUB_REPOSITORY}
 comment:

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# .githooks/pre-commit
+#
+# Git native pre-commit hook for zshcs.
+# Configured via `git config core.hooksPath .githooks`.
+# Ensures formatting, clippy linting, builds, Rust tests, and Zsh script unit
+# tests pass before allowing commits.
+# ==============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$REPO_ROOT"
+
+echo "=== Running zshcs pre-commit checks ==="
+
+echo "[1/5] Checking formatting (cargo fmt --check)..."
+cargo fmt --check
+
+echo "[2/5] Running Clippy linter (cargo clippy)..."
+cargo clippy --no-deps --all-targets -- -D warnings
+
+echo "[3/5] Building project (cargo build)..."
+cargo build
+
+echo "[4/5] Running Rust test suite (cargo test --all-targets)..."
+cargo test --all-targets
+
+if command -v zsh >/dev/null 2>&1 && [[ -f "tests/zsh/run_tests.zsh" ]]; then
+    echo "[5/5] Running Zsh script unit tests (tests/zsh/run_tests.zsh)..."
+    zsh tests/zsh/run_tests.zsh
+fi
+
+echo "=== All pre-commit checks passed successfully! ==="

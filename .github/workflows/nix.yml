@@ -18,7 +18,6 @@ jobs:
       - name: Flake Check
         run: nix flake check --no-build --all-systems --keep-going
   build:
-    needs: flake-check
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
@@ -46,3 +45,15 @@ jobs:
         run: nix develop --command cargo test
       - name: Nix Build
         run: nix build
+  nix-all-checks:
+    if: always()
+    needs: [flake-check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all Nix CI checks passed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "Some checks failed or were cancelled."
+            exit 1
+          fi
+          echo "All Nix CI checks passed."

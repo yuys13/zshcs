@@ -9,7 +9,11 @@ env:
   CARGO_TERM_COLOR: always
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Rust
@@ -31,11 +35,18 @@ jobs:
         run: cargo clippy --no-deps --all-targets -- -D warnings
       - name: Build
         run: cargo build --release
-      - name: Install dependencies for tests
+      - name: Install dependencies for tests (Linux)
+        if: runner.os == 'Linux'
         run: |
-          sudo apt-get install -y --no-install-recommends zsh
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
+      - name: Install dependencies for tests (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          which zsh || HOMEBREW_NO_AUTO_UPDATE=1 brew install zsh
       - name: Run tests
-        run: cargo test
+        run: cargo test --all-targets
+      - name: Run Zsh script unit tests
+        run: zsh tests/zsh/run_tests.zsh
   coverage:
     runs-on: ubuntu-latest
     permissions:
@@ -50,8 +61,20 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
       - name: Install dependencies for tests
-        run: sudo apt-get install -y --no-install-recommends zsh
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
       - name: Test with coverage
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
       - name: Run octocov
         uses: k1LoW/octocov-action@a167dc0dee441b7ffc45e1b862ab55ec0d87f278 # v1.5.2
+  rust-all-checks:
+    if: always()
+    needs: [build, coverage]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all Rust CI checks passed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "Some checks failed or were cancelled."
+            exit 1
+          fi
+          echo "All Rust CI checks passed."

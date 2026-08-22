@@ -1801,3 +1801,30 @@ done
         Some(tower_lsp::lsp_types::CompletionItemKind::TEXT)
     );
 }
+
+#[tokio::test]
+async fn test_zsh_script_unit_test_harness() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let script_path = std::path::Path::new(&manifest_dir).join("tests/zsh/run_tests.zsh");
+
+    let timeout_duration = std::time::Duration::from_secs(30);
+    let output = tokio::time::timeout(
+        timeout_duration,
+        tokio::process::Command::new("zsh")
+            .arg(&script_path)
+            .current_dir(&manifest_dir)
+            .output(),
+    )
+    .await
+    .expect("Zsh script unit test harness timed out after 30 seconds")
+    .expect("Failed to execute zsh test runner");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "Zsh script unit test harness failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("All Zsh unit tests passed successfully!"));
+}
