@@ -66,3 +66,15 @@ jobs:
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
       - name: Run octocov
         uses: k1LoW/octocov-action@a167dc0dee441b7ffc45e1b862ab55ec0d87f278 # v1.5.2
+  rust-all-checks:
+    if: always()
+    needs: [build, coverage]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all Rust CI checks passed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "Some checks failed or were cancelled."
+            exit 1
+          fi
+          echo "All Rust CI checks passed."
