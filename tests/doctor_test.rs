@@ -208,7 +208,56 @@ fn test_doctor_report_rendering_with_failures_and_warnings() {
     assert!(rendered.contains("[✓] Zsh Executable: zsh 5.9"));
     assert!(rendered.contains("[✗] Zpty Module: module not found"));
     assert!(rendered.contains("[!] Custom Check: deprecated config"));
-    assert!(rendered.contains("Result: 1/3 checks passed, 1 failed"));
+    assert!(rendered.contains("Result: 1/3 checks passed, 1 failed, 1 warning(s)"));
+}
+
+#[test]
+fn test_doctor_report_rendering_failure_without_warnings() {
+    let checks = vec![
+        CheckResult::new("Zsh Executable", CheckStatus::Pass, "zsh 5.9"),
+        CheckResult::new("Zpty Module", CheckStatus::Fail, "module not found"),
+    ];
+    let report = DoctorReport::new(checks);
+    assert!(!report.is_all_passed());
+    assert_eq!(report.pass_count(), 1);
+    assert_eq!(report.fail_count(), 1);
+    assert_eq!(report.warn_count(), 0);
+
+    let mut output = Vec::new();
+    report.render(&mut output).unwrap();
+    let rendered = String::from_utf8(output).unwrap();
+
+    assert!(rendered.contains("[✓] Zsh Executable: zsh 5.9"));
+    assert!(rendered.contains("[✗] Zpty Module: module not found"));
+    assert!(
+        rendered.contains(
+            "Result: 1/2 checks passed, 1 failed. Please address the failed items above."
+        )
+    );
+}
+
+#[test]
+fn test_check_cache_directory_empty_env_vars() {
+    let temp_dir = tempdir().unwrap();
+    let home_path = temp_dir.path().join("home");
+    std::fs::create_dir_all(&home_path).unwrap();
+
+    // Set empty strings for ZSHCS_CACHE_DIR and XDG_CACHE_HOME, valid HOME
+    unsafe {
+        std::env::set_var("ZSHCS_CACHE_DIR", "");
+        std::env::set_var("XDG_CACHE_HOME", "");
+        std::env::set_var("HOME", &home_path);
+    }
+
+    let res = check_cache_directory(None);
+    assert_eq!(res.status, CheckStatus::Pass);
+    assert_eq!(res.name, "Cache Directory");
+    assert!(home_path.join(".cache/zshcs/zsh").exists());
+
+    unsafe {
+        std::env::remove_var("ZSHCS_CACHE_DIR");
+        std::env::remove_var("XDG_CACHE_HOME");
+    }
 }
 
 #[test]

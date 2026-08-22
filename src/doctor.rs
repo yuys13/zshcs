@@ -160,12 +160,18 @@ impl DoctorReport {
                 warn_suffix
             )?;
         } else {
+            let warn_suffix = if self.warn_count() > 0 {
+                format!(", {} warning(s)", self.warn_count())
+            } else {
+                String::new()
+            };
             writeln!(
                 writer,
-                "Result: {}/{} checks passed, {} failed. Please address the failed items above.",
+                "Result: {}/{} checks passed, {} failed{}. Please address the failed items above.",
                 self.pass_count(),
                 self.checks.len(),
-                self.fail_count()
+                self.fail_count(),
+                warn_suffix
             )?;
         }
 
@@ -173,11 +179,56 @@ impl DoctorReport {
     }
 }
 
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Executes a command with a timeout guard, returning an error if execution exceeds the timeout.
+fn run_command_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let start = std::time::Instant::now();
+
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = std::io::Read::read_to_end(&mut out, &mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_end(&mut err, &mut stderr);
+                }
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            None => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("Command timed out after {} seconds", timeout.as_secs()),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 /// Diagnoses the existence, executability, and version of the `zsh` binary.
 #[must_use]
 pub fn check_zsh_executable(zsh_binary: Option<&str>) -> CheckResult {
     let bin = zsh_binary.unwrap_or("zsh");
-    match Command::new(bin).arg("--version").output() {
+    let mut cmd = Command::new(bin);
+    cmd.arg("--version");
+    match run_command_with_timeout(cmd, DEFAULT_COMMAND_TIMEOUT) {
         Ok(output) if output.status.success() => {
             let version_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let version = if version_str.is_empty() {
@@ -208,7 +259,9 @@ pub fn check_zsh_executable(zsh_binary: Option<&str>) -> CheckResult {
 #[must_use]
 pub fn check_zpty_module(zsh_binary: Option<&str>) -> CheckResult {
     let bin = zsh_binary.unwrap_or("zsh");
-    match Command::new(bin).args(["-c", "zmodload zsh/zpty"]).output() {
+    let mut cmd = Command::new(bin);
+    cmd.args(["-c", "zmodload zsh/zpty"]);
+    match run_command_with_timeout(cmd, DEFAULT_COMMAND_TIMEOUT) {
         Ok(output) if output.status.success() => CheckResult::new(
             "Zpty Module",
             CheckStatus::Pass,
@@ -238,10 +291,9 @@ pub fn check_zpty_module(zsh_binary: Option<&str>) -> CheckResult {
 #[must_use]
 pub fn check_zutil_module(zsh_binary: Option<&str>) -> CheckResult {
     let bin = zsh_binary.unwrap_or("zsh");
-    match Command::new(bin)
-        .args(["-c", "zmodload zsh/zutil"])
-        .output()
-    {
+    let mut cmd = Command::new(bin);
+    cmd.args(["-c", "zmodload zsh/zutil"]);
+    match run_command_with_timeout(cmd, DEFAULT_COMMAND_TIMEOUT) {
         Ok(output) if output.status.success() => CheckResult::new(
             "Zutil Module",
             CheckStatus::Pass,
@@ -272,11 +324,11 @@ pub fn check_zutil_module(zsh_binary: Option<&str>) -> CheckResult {
 pub fn check_cache_directory(custom_cache_dir: Option<&Path>) -> CheckResult {
     let cache_dir = if let Some(dir) = custom_cache_dir {
         dir.to_path_buf()
-    } else if let Some(dir) = std::env::var_os("ZSHCS_CACHE_DIR") {
+    } else if let Some(dir) = std::env::var_os("ZSHCS_CACHE_DIR").filter(|s| !s.is_empty()) {
         PathBuf::from(dir)
-    } else if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+    } else if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
         PathBuf::from(xdg).join("zshcs/zsh")
-    } else if let Some(home) = std::env::var_os("HOME") {
+    } else if let Some(home) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
         PathBuf::from(home).join(".cache/zshcs/zsh")
     } else {
         std::env::temp_dir().join("zshcs/zsh")
@@ -366,8 +418,21 @@ pub fn check_capture_dry_run(
     let bin_str = bin.to_string();
     let capture_path_buf = capture_path.clone();
     let cache_dir_buf = custom_cache_dir.map(PathBuf::from);
-
     let (tx, rx) = std::sync::mpsc::channel();
+    let child_holder = std::sync::Arc::new(std::sync::Mutex::new(None::<std::process::Child>));
+    let child_holder_worker = std::sync::Arc::clone(&child_holder);
+
+    let reap_worker = {
+        let child_holder_worker = std::sync::Arc::clone(&child_holder_worker);
+        move || {
+            if let Ok(mut lock) = child_holder_worker.lock()
+                && let Some(mut child) = lock.take()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    };
 
     let worker = std::thread::spawn(move || {
         let mut cmd = Command::new(&bin_str);
@@ -392,6 +457,7 @@ pub fn check_capture_dry_run(
             None => {
                 let _ = tx.send(Err("Failed to open stdin to capture script".to_string()));
                 let _ = child.kill();
+                let _ = child.wait();
                 return;
             }
         };
@@ -401,13 +467,18 @@ pub fn check_capture_dry_run(
             None => {
                 let _ = tx.send(Err("Failed to open stdout from capture script".to_string()));
                 let _ = child.kill();
+                let _ = child.wait();
                 return;
             }
         };
 
+        if let Ok(mut lock) = child_holder_worker.lock() {
+            *lock = Some(child);
+        }
+
         if let Err(e) = stdin.write_all(b"input:echo \n") {
             let _ = tx.send(Err(format!("Failed to write input to capture script: {e}")));
-            let _ = child.kill();
+            reap_worker();
             return;
         }
         let _ = stdin.flush();
@@ -433,14 +504,13 @@ pub fn check_capture_dry_run(
                 }
                 Err(e) => {
                     let _ = tx.send(Err(format!("Error reading from capture script: {e}")));
-                    let _ = child.kill();
+                    reap_worker();
                     return;
                 }
             }
         }
 
-        let _ = child.kill();
-        let _ = child.wait();
+        reap_worker();
 
         if saw_eoc {
             let _ = tx.send(Ok(candidate_count));
@@ -451,7 +521,7 @@ pub fn check_capture_dry_run(
         }
     });
 
-    match rx.recv_timeout(Duration::from_secs(5)) {
+    match rx.recv_timeout(DEFAULT_COMMAND_TIMEOUT) {
         Ok(Ok(count)) => {
             let _ = worker.join();
             CheckResult::new(
@@ -466,11 +536,23 @@ pub fn check_capture_dry_run(
             let _ = worker.join();
             CheckResult::new("Capture Script Dry-Run", CheckStatus::Fail, err_msg)
         }
-        Err(_) => CheckResult::new(
-            "Capture Script Dry-Run",
-            CheckStatus::Fail,
-            "Interactive completion dry-run timed out after 5 seconds".to_string(),
-        ),
+        Err(_) => {
+            if let Ok(mut lock) = child_holder.lock()
+                && let Some(mut child) = lock.take()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = worker.join();
+            CheckResult::new(
+                "Capture Script Dry-Run",
+                CheckStatus::Fail,
+                format!(
+                    "Interactive completion dry-run timed out after {} seconds",
+                    DEFAULT_COMMAND_TIMEOUT.as_secs()
+                ),
+            )
+        }
     }
 }
 
@@ -539,5 +621,26 @@ mod tests {
         assert_eq!(r.pass_count(), 2);
         assert_eq!(r.fail_count(), 0);
         assert_eq!(r.warn_count(), 1);
+    }
+
+    #[test]
+    fn test_run_command_with_timeout_success() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("hello");
+        let res = run_command_with_timeout(cmd, Duration::from_secs(2));
+        assert!(res.is_ok());
+        let output = res.unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
+    }
+
+    #[test]
+    fn test_run_command_with_timeout_expired() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("2");
+        let res = run_command_with_timeout(cmd, Duration::from_millis(50));
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 }
