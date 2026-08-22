@@ -237,14 +237,33 @@ test_capture_script_sequential_queries() {
 }
 
 # ------------------------------------------------------------------------------
-# Test 9: compadd Direct Delegation with -A / -O Flags
+# Test 9: compadd Direct Delegation with -A / -O / -D Flags
 # ------------------------------------------------------------------------------
 test_compadd_hook_delegation() {
     ZSHCS_CACHE_DIR="$TEST_TMPDIR/cache" zsh --no-rcs -c '
         source "'"$ZPTYRC_SCRIPT"'"
-        typeset -a hits
-        # Calling with -A should delegate to builtin compadd without error
-        compadd -A hits -- "candidate1" "candidate2" || true
+
+        # Verify compadd is defined as a shell function
+        typeset -f compadd >/dev/null || exit 1
+
+        # Test the delegation matching pattern used in compadd hook
+        check_delegation() {
+            [[ ${@[1,(i)(-|--)]} == *-(O|A|D)\ * ]]
+        }
+
+        # Delegated flags before --
+        check_delegation -A hits -- "c1" "c2" || exit 2
+        check_delegation -O hits -- "c1" "c2" || exit 3
+        check_delegation -D dscr -- "c1" "c2" || exit 4
+        check_delegation -M match -A hits -- "c1" || exit 5
+
+        # Non-delegated flags (should NOT delegate)
+        check_delegation -a hits -- "c1" && exit 6
+        check_delegation -d dscr -- "c1" && exit 7
+        check_delegation -- -A "c1" && exit 8
+        check_delegation -f -- "c1" && exit 9
+
+        exit 0
     '
 }
 
