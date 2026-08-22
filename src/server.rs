@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::diagnostics::check_syntax;
 use crate::document::DocumentManager;
 use crate::error::{ZshcsError, ZshcsResult};
+use crate::hover::{extract_word_at_position, get_hover_info};
 
 #[derive(Debug)]
 pub struct Backend {
@@ -131,6 +132,10 @@ impl Backend {
     pub async fn is_diagnostics_enabled(&self) -> bool {
         self.config.read().await.experimental_diagnostics()
     }
+
+    pub async fn is_hover_enabled(&self) -> bool {
+        self.config.read().await.experimental_hover()
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -148,6 +153,7 @@ impl LanguageServer for Backend {
             let initial_config = Config::from_value(Some(options));
             tracing::info!(
                 experimental_diagnostics = initial_config.experimental_diagnostics(),
+                experimental_hover = initial_config.experimental_hover(),
                 "Parsed initial server configuration"
             );
             *self.config.write().await = initial_config;
@@ -162,6 +168,7 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL, // Support Incremental sync
                 )),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
                     trigger_characters: Some(vec![
@@ -469,6 +476,61 @@ impl LanguageServer for Backend {
                 self.client
                     .log_message(MessageType::ERROR, format!("{err}"))
                     .await;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        if !self.is_hover_enabled().await {
+            tracing::debug!("Hover requested but experimental hover is disabled");
+            return Ok(None);
+        }
+
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        tracing::debug!(
+            uri = %uri,
+            line = position.line,
+            character = position.character,
+            "Hover request received"
+        );
+
+        let doc_text = match self.document_manager.get_content(&uri) {
+            Some(t) => t,
+            None => {
+                tracing::debug!(uri = %uri, "Document not found in document_manager for hover");
+                return Ok(None);
+            }
+        };
+
+        let (word, range) = match extract_word_at_position(&doc_text, position) {
+            Some((w, r)) => (w, r),
+            None => {
+                tracing::debug!(
+                    uri = %uri,
+                    line = position.line,
+                    character = position.character,
+                    "No word found at position for hover"
+                );
+                return Ok(None);
+            }
+        };
+
+        tracing::debug!(
+            word,
+            ?range,
+            "Extracted word for hover; querying hover info"
+        );
+
+        match get_hover_info(word).await {
+            Some(contents) => Ok(Some(Hover {
+                contents,
+                range: Some(range),
+            })),
+            None => {
+                tracing::debug!(word, "No hover documentation found for word");
                 Ok(None)
             }
         }

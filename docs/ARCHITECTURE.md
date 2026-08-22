@@ -16,9 +16,10 @@ flowchart TB
 
     subgraph RustServer [Rust LSP Server Process (zshcs)]
         LSPBackend["LSP Backend (`src/server.rs`)<br/>• LanguageServer Trait<br/>• Request Routing & Commands"]
-        ConfigMgr["Config Subsystem (`src/config.rs`)<br/>• Opt-In Schema Parsing<br/>• Experimental Diagnostics Flag"]
+        ConfigMgr["Config Subsystem (`src/config.rs`)<br/>• Opt-In Schema Parsing<br/>• Experimental Diagnostics & Hover Flags"]
         DocMgr["DocumentManager (`src/document.rs`)<br/>• In-Memory Arc&lt;DashMap&lt;Url, DocumentState&gt;&gt;<br/>• Incremental Sync & UTF-16/UTF-8 Mapping"]
         DiagEngine["Diagnostics Engine (`src/diagnostics.rs`)<br/>• Non-blocking `zsh -n` Runner<br/>• Debounced Stderr Parser"]
+        HoverEngine["Hover Engine (`src/hover.rs`)<br/>• Word Extraction & Range Mapping<br/>• Builtin & Reserved Words Dictionary<br/>• Async manpage Full-Text Retrieval"]
         Supervisor["Daemon Supervisor (`src/completion.rs`)<br/>• run_completion_daemon<br/>• HoL Cancellation & Timeout Guard<br/>• Process Recovery & chdir Sync"]
         Logging["Logging Subsystem (`src/logging.rs`)<br/>• tracing & tracing-subscriber<br/>• Stderr Destination & EnvFilter"]
         ErrHandling["Error Hierarchy (`src/error.rs`)<br/>• ZshcsError / ZshcsResult<br/>• Type-Safe Conversions"]
@@ -34,6 +35,7 @@ flowchart TB
     LSPBackend <-->|CRUD & Offset Conversion| DocMgr
     LSPBackend -->|Debounced Syntax Validation| DiagEngine
     DiagEngine -.->|publishDiagnostics| Editor
+    LSPBackend -->|Cursor Word Hover Query| HoverEngine
     LSPBackend -->|mpsc / oneshot| Supervisor
     RustServer -.->|Structured Logs (stderr)| Editor
     Supervisor <-->|Piped stdin/stdout (RPC: input / chdir)| CaptureScript
@@ -54,6 +56,7 @@ The entry point and server backend coordinate command-line argument parsing, LSP
   - Supports the `doctor` subcommand (`zshcs doctor`) to inspect runtime prerequisites and environment health.
 - **Capabilities Negotiation (`initialize`)**:
   - **Text Document Sync**: `TextDocumentSyncKind::INCREMENTAL` for fine-grained, low-latency diff synchronization.
+  - **Hover Provider**: `HoverProviderCapability::Simple(true)` providing on-demand documentation lookups.
   - **Trigger Characters**: Registers `["-", "$", "/", "~", ".", " "]` to trigger completions immediately upon typing flags, variables, directory paths, hidden files, or subcommands.
   - **Execute Command Provider**: Exposes custom command `zshcs/getDocumentContent` for internal document state inspection and integration testing.
 - **Dual Initialization Pathways**:
@@ -345,6 +348,39 @@ flowchart TD
 
 ---
 
+### 2.10 Experimental Hover Documentation Subsystem (`src/hover.rs`, `src/config.rs`)
+
+`zshcs` provides an opt-in, non-blocking hover documentation engine (`textDocument/hover`) delivering structured documentation for Zsh builtins, reserved words, and external commands.
+
+- **Experimental Opt-In Configuration (`src/config.rs`)**:
+  - Disabled by default (`hover: false`) to ensure zero subprocess and extraction overhead for standard completion-only setups.
+  - Dynamically configured via LSP `initializationOptions` (startup) or `workspace/didChangeConfiguration` (runtime) using the schema:
+    ```json
+    {
+      "zshcs": {
+        "experimental": {
+          "hover": true
+        }
+      }
+    }
+    ```
+  - Also accepts flat `{ "experimental": { "hover": true } }` payloads.
+- **Accurate Word Extraction & Coordinate Mapping (`extract_word_at_position`)**:
+  - Extracts the exact shell word/token at the cursor position and computes its LSP `Range` in 0-indexed UTF-16 coordinates.
+  - Respects shell syntax delimiters (whitespace, `;`, `|`, `&`, `(`, `)`, `<`, `>`, `"`, `'`, '`', `\`, `{`, `}`, `[`, `]`, `$`, `,`, `#`, `=`, `!`, `~`, `^`, `*`, `?`).
+  - Safely handles multibyte UTF-8 characters (CJK ideographs) and UTF-16 surrogate pairs (SMP emoji, rare Kanji) without slicing mid-character.
+  - Returns `None` immediately if the cursor rests on whitespace, delimiters, or out-of-bounds positions.
+- **Two-Tier Documentation Resolution**:
+  1. **Zsh Builtins & Reserved Words Markdown Dictionary (`get_builtin_or_reserved_doc`)**:
+     - Fast static lookup containing curated, formatted Markdown documentation for over 50 builtins (`cd`, `echo`, `export`, `set`, `setopt`, `unsetopt`, `autoload`, `compadd`, `typeset`, `print`, `printf`, `source`, `eval`, `alias`, `read`, `return`, `exit`, `shift`, `test`, `trap`, `unset`, `local`, `declare`, `which`, `where`, `whence`, `type`, `bindkey`, `zstyle`, `zmodload`, `zpty`, `zparseopts`, `pushd`, `popd`, `dirs`, `pwd`, `history`, `fc`, `bg`, `fg`, `jobs`, `kill`, `wait`, `disown`, `exec`, `hash`, `rehash`, `umask`, `true`, `false`, `:`) and 20 reserved words (`if`, `then`, `elif`, `else`, `fi`, `for`, `do`, `done`, `while`, `until`, `case`, `esac`, `select`, `function`, `repeat`, `time`, `coproc`, `nocorrect`, `foreach`, `end`).
+  2. **Asynchronous `man` Page Retrieval Engine (`get_man_page`)**:
+     - For external commands not in the static dictionary, spawns `man <word>` asynchronously with `MANPAGER=cat`, `PAGER=cat`, and `TERM=dumb`.
+     - Guarded by a 2000ms timeout (`DEFAULT_HOVER_MAN_TIMEOUT`) to prevent subprocess deadlocks.
+     - Strips backspace overstrikes (bold `c\bc`, underline `_\bc`) and ANSI escape sequences via `clean_man_text`.
+     - Formats the plain text in Markdown code blocks (````text ... ````) matching Vim/Neovim standard behavior.
+
+---
+
 ## 3. Detailed Data Flow & Protocols
 
 ### 3.1 Completion Request Lifecycle
@@ -427,6 +463,50 @@ sequenceDiagram
 
 ---
 
+### 3.3 Experimental Hover Request Lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Editor User
+    participant Client as LSP Client
+    participant Server as Backend (`src/server.rs`)
+    participant DocMgr as DocumentManager (`src/document.rs`)
+    participant Hover as Hover Engine (`src/hover.rs`)
+    participant OS as Operating System (`man`)
+
+    User->>Client: Trigger hover at cursor position
+    Client->>Server: textDocument/hover (uri, position)
+    alt Experimental Hover Disabled (default)
+        Server-->>Client: Ok(None) (Zero overhead)
+    else Experimental Hover Enabled
+        Server->>DocMgr: get_content(uri)
+        DocMgr-->>Server: Some(doc_text)
+        Server->>Hover: extract_word_at_position(doc_text, position)
+        alt Cursor on whitespace or delimiter
+            Hover-->>Server: None
+            Server-->>Client: Ok(None)
+        else Word extracted
+            Hover-->>Server: Some((word, range))
+            Server->>Hover: get_hover_info(word)
+            alt Builtin / Reserved Word Match
+                Hover-->>Server: Some(MarkupContent { Markdown doc })
+            else External Command with man page
+                Hover->>OS: Spawn `man <word>` (2s timeout)
+                OS-->>Hover: stdout (man text)
+                Hover->>Hover: clean_man_text(stdout)
+                Hover-->>Server: Some(MarkupContent { ````text ... ```` })
+            else Not found / Error
+                Hover-->>Server: None
+            end
+            Server-->>Client: Ok(Some(Hover { contents, range }))
+            Client-->>User: Render hover popup
+        end
+    end
+```
+
+---
+
 ## 4. Testing, QA & Quality Gates
 
 `zshcs` enforces quality assurance through a multi-tier testing and verification architecture:
@@ -458,6 +538,7 @@ flowchart LR
 ### 4.1 Test Suites Overview
 
 1. **Rust Integration & Unit Test Suites**:
+   - `tests/hover_test.rs` (6 tests): Validates experimental hover documentation opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, builtin/reserved word markdown rendering, external command `man` page retrieval in code blocks, and whitespace/out-of-bounds cursor handling.
    - `tests/diagnostics_test.rs` (9 tests): Validates experimental syntax diagnostics opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, syntax error reporting, error clearing on fix, buffer closing cleanup, and edit debouncing.
    - `tests/completion_test.rs` (37 tests): Validates LSP completions, consecutive requests, dynamic item kinds, working directory switching, crash recovery, timeout handling, and CRLF / multibyte buffers.
    - `tests/server_test.rs` (34 tests): Tests initialize handshake, capabilities negotiation, incremental synchronization, out-of-order versions, invalid ranges, document close cleanup, and custom execution commands.
