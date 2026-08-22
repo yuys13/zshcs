@@ -68,6 +68,8 @@
             nativeBuildInputs = [
               pkgs.zsh
               pkgs.git
+              pkgs.man-db
+              pkgs.man-pages
             ];
 
             preCheck = ''
