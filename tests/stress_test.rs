@@ -24,7 +24,7 @@ fn test_fuzz_parse_candidate_line_null_bytes() {
     parse_candidate_line(line, &mut items);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].label, "cand\0part1\0part2");
-    assert_eq!(items[0].insert_text.as_deref(), Some("cand\0part1\0part2"));
+    assert_eq!(items[0].insert_text.as_deref(), None);
     assert_eq!(items[0].detail.as_deref(), Some("desc\0part1\0part2"));
 
     // Only null bytes
@@ -900,4 +900,154 @@ async fn test_stress_did_change_malformed_ranges_and_split_surrogates() {
     assert!(content.is_some());
     let doc_str = content.unwrap();
     assert_eq!(doc_str, "A𩸽XB\nC🚀D\n");
+}
+
+#[test]
+fn test_fuzz_infer_completion_kind_arbitrary_inputs() {
+    use tower_lsp::lsp_types::CompletionItemKind;
+    use zshcs::completion::infer_completion_kind;
+
+    let test_cases = [
+        ("", None, CompletionItemKind::TEXT),
+        ("-", None, CompletionItemKind::KEYWORD),
+        ("--", None, CompletionItemKind::KEYWORD),
+        ("$", None, CompletionItemKind::VARIABLE),
+        ("${}", None, CompletionItemKind::VARIABLE),
+        (".", None, CompletionItemKind::FOLDER),
+        ("..", None, CompletionItemKind::FOLDER),
+        ("~", None, CompletionItemKind::FOLDER),
+        ("/", None, CompletionItemKind::FOLDER),
+        ("./", None, CompletionItemKind::FOLDER),
+        ("../", None, CompletionItemKind::FOLDER),
+        ("~/", None, CompletionItemKind::FOLDER),
+        ("a/", None, CompletionItemKind::FOLDER),
+        (".hidden", None, CompletionItemKind::FILE),
+        ("file.ext", None, CompletionItemKind::FILE),
+        ("a/b/c", None, CompletionItemKind::FOLDER),
+        ("cmd", Some("BUILTIN command"), CompletionItemKind::FUNCTION),
+        ("opt", Some("OPTION flag"), CompletionItemKind::KEYWORD),
+        ("var", Some("ENV variable"), CompletionItemKind::VARIABLE),
+        ("dir", Some("project DIRECTORY"), CompletionItemKind::FOLDER),
+        ("doc", Some("text FILE"), CompletionItemKind::FILE),
+        ("any", Some("unknown description"), CompletionItemKind::TEXT),
+        ("\0\0\0", Some("\0"), CompletionItemKind::TEXT),
+        ("🚀", Some("emoji"), CompletionItemKind::TEXT),
+        ("-🚀", Some("flag"), CompletionItemKind::KEYWORD),
+        ("$🚀", Some("var"), CompletionItemKind::VARIABLE),
+    ];
+
+    for (label, detail, expected) in test_cases {
+        let kind = infer_completion_kind(label, detail);
+        assert_eq!(
+            kind, expected,
+            "Failed for label: {:?}, detail: {:?}",
+            label, detail
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_stress_concurrent_cancellation_and_active_completions() {
+    use std::time::Duration;
+    use tower_lsp::{LanguageServer, LspService};
+    use zshcs::Backend;
+
+    let mock_script = r#"#!/usr/bin/env zsh
+while read -r line; do
+    if [[ "$line" == input:* ]]; then
+        input_data=${line#input:}
+        echo "cand_${input_data}\tdesc\x01EOC\x01"
+    fi
+done
+"#;
+
+    let mut client_opt = None;
+    let (_service, _socket) = LspService::new(|client| {
+        client_opt = Some(client.clone());
+        Backend::new_with_scripts(client, mock_script, "").unwrap()
+    });
+    let client = client_opt.unwrap();
+    let backend = Arc::new(Backend::new_with_scripts(client, mock_script, "").unwrap());
+
+    let doc_uri = Url::parse("file:///concurrent_cancel_test.zsh").unwrap();
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: doc_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: "test cmd\n".to_string(),
+            },
+        })
+        .await;
+
+    let total_tasks = 40;
+    let barrier = Arc::new(Barrier::new(total_tasks));
+    let mut handles = Vec::new();
+
+    for i in 0..total_tasks {
+        let b = Arc::clone(&backend);
+        let uri = doc_uri.clone();
+        let bar = Arc::clone(&barrier);
+        let should_cancel = i % 2 == 0;
+
+        handles.push(tokio::spawn(async move {
+            bar.wait().await;
+            let params = CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position::new(0, 4),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            };
+
+            if should_cancel {
+                // Drop future immediately or after tiny delay
+                let _ = tokio::time::timeout(Duration::from_millis(1), b.completion(params)).await;
+                None
+            } else {
+                let res = b.completion(params).await.unwrap();
+                Some(res)
+            }
+        }));
+    }
+
+    let mut active_success_count = 0;
+    for handle in handles {
+        if let Some(Some(comp_res)) = handle.await.unwrap() {
+            let items = match comp_res {
+                tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+                tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+            };
+            assert_eq!(items.len(), 1);
+            active_success_count += 1;
+        }
+    }
+
+    assert_eq!(active_success_count, 20);
+
+    // Verify backend is still fully functional after concurrent cancellation storm
+    let final_res = backend
+        .completion(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let final_items = match final_res {
+        tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+        tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+    };
+    assert_eq!(final_items.len(), 1);
 }

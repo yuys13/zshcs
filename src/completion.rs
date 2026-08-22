@@ -226,20 +226,68 @@ pub async fn run_completion_daemon(
     }
 }
 
+/// Infers an intelligent `CompletionItemKind` based on candidate prefix and description.
+pub fn infer_completion_kind(label: &str, detail: Option<&str>) -> CompletionItemKind {
+    if label.starts_with('-') {
+        CompletionItemKind::KEYWORD
+    } else if label.starts_with('$') {
+        CompletionItemKind::VARIABLE
+    } else if label == "." || label == ".." || label == "~" || label.ends_with('/') {
+        CompletionItemKind::FOLDER
+    } else if let Some(d) = detail {
+        let d_lower = d.to_ascii_lowercase();
+        if d_lower.contains("command")
+            || d_lower.contains("builtin")
+            || d_lower.contains("function")
+            || d_lower.contains("alias")
+            || d_lower.contains("executable")
+        {
+            CompletionItemKind::FUNCTION
+        } else if d_lower.contains("option") || d_lower.contains("flag") {
+            CompletionItemKind::KEYWORD
+        } else if d_lower.contains("variable")
+            || d_lower.contains("parameter")
+            || d_lower.contains("env")
+        {
+            CompletionItemKind::VARIABLE
+        } else if d_lower.contains("directory") || d_lower.contains("folder") {
+            CompletionItemKind::FOLDER
+        } else if d_lower.contains("file") || d_lower.contains("archive") || label.contains('.') {
+            CompletionItemKind::FILE
+        } else if label.contains('/') {
+            CompletionItemKind::FOLDER
+        } else {
+            CompletionItemKind::TEXT
+        }
+    } else if label.contains('.') {
+        CompletionItemKind::FILE
+    } else if label.contains('/') {
+        CompletionItemKind::FOLDER
+    } else {
+        CompletionItemKind::TEXT
+    }
+}
+
 pub fn parse_candidate_line(line: &str, items: &mut Vec<CompletionItem>) {
     // ddc-source-shell_native style outputs `candidate\tdescription`
-    let parts: Vec<&str> = line.splitn(2, '\t').collect();
-    let label = parts[0].to_string();
-    let detail = if parts.len() > 1 && !parts[1].trim().is_empty() {
-        Some(parts[1].to_string())
-    } else {
-        None
+    let (label, detail) = match line.split_once('\t') {
+        Some((lbl, dtl)) => {
+            let detail_opt = if !dtl.trim().is_empty() {
+                Some(dtl.to_string())
+            } else {
+                None
+            };
+            (lbl.to_string(), detail_opt)
+        }
+        None => (line.to_string(), None),
     };
 
+    let kind = infer_completion_kind(&label, detail.as_deref());
+
     items.push(CompletionItem {
-        label: label.clone(),
-        kind: Some(CompletionItemKind::TEXT),
-        insert_text: Some(label),
+        label,
+        kind: Some(kind),
+        insert_text: None,
         detail,
         ..Default::default()
     });
@@ -277,23 +325,23 @@ mod tests {
 
     #[rstest]
     // 1. Empty string
-    #[case("", "", None, Some(""), Some(CompletionItemKind::TEXT))]
+    #[case("", "", None, None, Some(CompletionItemKind::TEXT))]
     // 2. Whitespace only
-    #[case("   ", "   ", None, Some("   "), Some(CompletionItemKind::TEXT))]
+    #[case("   ", "   ", None, None, Some(CompletionItemKind::TEXT))]
     // 3. Single tab only
-    #[case("\t", "", None, Some(""), Some(CompletionItemKind::TEXT))]
+    #[case("\t", "", None, None, Some(CompletionItemKind::TEXT))]
     // 4. Tab with whitespace
-    #[case("\t   ", "", None, Some(""), Some(CompletionItemKind::TEXT))]
-    #[case("   \t   ", "   ", None, Some("   "), Some(CompletionItemKind::TEXT))]
+    #[case("\t   ", "", None, None, Some(CompletionItemKind::TEXT))]
+    #[case("   \t   ", "   ", None, None, Some(CompletionItemKind::TEXT))]
     // 5. Consecutive tabs only
-    #[case("\t\t", "", None, Some(""), Some(CompletionItemKind::TEXT))]
-    #[case("\t\t\t", "", None, Some(""), Some(CompletionItemKind::TEXT))]
+    #[case("\t\t", "", None, None, Some(CompletionItemKind::TEXT))]
+    #[case("\t\t\t", "", None, None, Some(CompletionItemKind::TEXT))]
     // 6. Empty label with description
     #[case(
         "\tdescription only",
         "",
         Some("description only"),
-        Some(""),
+        None,
         Some(CompletionItemKind::TEXT)
     )]
     fn test_parse_candidate_line_empty_and_whitespace(
@@ -523,21 +571,15 @@ mod tests {
         "checkout\tswitch branch",
         "checkout",
         Some(CompletionItemKind::TEXT),
-        Some("checkout"),
+        None,
         Some("switch branch")
     )]
-    #[case(
-        "commit",
-        "commit",
-        Some(CompletionItemKind::TEXT),
-        Some("commit"),
-        None
-    )]
+    #[case("commit", "commit", Some(CompletionItemKind::TEXT), None, None)]
     #[case(
         "--help\tshow help",
         "--help",
-        Some(CompletionItemKind::TEXT),
-        Some("--help"),
+        Some(CompletionItemKind::KEYWORD),
+        None,
         Some("show help")
     )]
     fn test_parse_candidate_line_item_properties(
@@ -555,6 +597,69 @@ mod tests {
         assert_eq!(item.kind, expected_kind);
         assert_eq!(item.insert_text.as_deref(), expected_insert_text);
         assert_eq!(item.detail.as_deref(), expected_detail);
+    }
+
+    #[rstest]
+    // 1. Prefix options / flags -> KEYWORD
+    #[case("-v", None, CompletionItemKind::KEYWORD)]
+    #[case("--help", Some("show help"), CompletionItemKind::KEYWORD)]
+    #[case("-o:fmt", Some("output format"), CompletionItemKind::KEYWORD)]
+    #[case("--flag=value", None, CompletionItemKind::KEYWORD)]
+    // 2. Prefix variables -> VARIABLE
+    #[case("$HOME", None, CompletionItemKind::VARIABLE)]
+    #[case("${VAR:-default}", None, CompletionItemKind::VARIABLE)]
+    #[case("$PATH", Some("search path"), CompletionItemKind::VARIABLE)]
+    #[case("$?", Some("exit code"), CompletionItemKind::VARIABLE)]
+    // 3. Folders ending with / or dot directories -> FOLDER
+    #[case("src/", None, CompletionItemKind::FOLDER)]
+    #[case("path/to/dir/", None, CompletionItemKind::FOLDER)]
+    #[case("/etc/", Some("config dir"), CompletionItemKind::FOLDER)]
+    #[case("~/", None, CompletionItemKind::FOLDER)]
+    #[case(".", None, CompletionItemKind::FOLDER)]
+    #[case("..", None, CompletionItemKind::FOLDER)]
+    #[case("~", None, CompletionItemKind::FOLDER)]
+    // 4. Files containing dot -> FILE
+    #[case(".zshrc", None, CompletionItemKind::FILE)]
+    #[case("script.sh", None, CompletionItemKind::FILE)]
+    #[case("path/to/file.txt", None, CompletionItemKind::FILE)]
+    #[case("archive.tar.gz", Some("archive"), CompletionItemKind::FILE)]
+    // 5. Paths containing slash but no dot -> FOLDER
+    #[case("path/to/subdir", None, CompletionItemKind::FOLDER)]
+    #[case("/usr/local/bin", None, CompletionItemKind::FOLDER)]
+    // 6. Detail-based inference: commands, builtins, functions, aliases, executables -> FUNCTION
+    #[case("echo", Some("builtin command"), CompletionItemKind::FUNCTION)]
+    #[case("git", Some("command line tool"), CompletionItemKind::FUNCTION)]
+    #[case("my_func", Some("shell function"), CompletionItemKind::FUNCTION)]
+    #[case("ls", Some("builtin"), CompletionItemKind::FUNCTION)]
+    #[case("ll", Some("alias for ls -la"), CompletionItemKind::FUNCTION)]
+    #[case("cargo", Some("executable binary"), CompletionItemKind::FUNCTION)]
+    #[case("./my_func", Some("shell function"), CompletionItemKind::FUNCTION)]
+    // 7. Detail-based inference: options, flags -> KEYWORD
+    #[case("verbose", Some("verbose option"), CompletionItemKind::KEYWORD)]
+    #[case("debug", Some("debug flag"), CompletionItemKind::KEYWORD)]
+    // 8. Detail-based inference: variables, env -> VARIABLE
+    #[case("USER", Some("environment variable"), CompletionItemKind::VARIABLE)]
+    #[case("SHELL", Some("shell parameter"), CompletionItemKind::VARIABLE)]
+    #[case("PORT", Some("env configuration"), CompletionItemKind::VARIABLE)]
+    // 9. Detail-based inference: directory, folder -> FOLDER
+    #[case("mydir", Some("project directory"), CompletionItemKind::FOLDER)]
+    #[case("docs", Some("documentation folder"), CompletionItemKind::FOLDER)]
+    #[case("./mydir", Some("directory"), CompletionItemKind::FOLDER)]
+    // 10. Detail-based inference: file, archive -> FILE
+    #[case("LICENSE", Some("license file"), CompletionItemKind::FILE)]
+    #[case("README", Some("documentation file"), CompletionItemKind::FILE)]
+    #[case("bundle.zip", Some("compressed archive"), CompletionItemKind::FILE)]
+    // 11. Plain text fallback -> TEXT
+    #[case("checkout", Some("switch branch"), CompletionItemKind::TEXT)]
+    #[case("status", Some("show working tree status"), CompletionItemKind::TEXT)]
+    #[case("plain", None, CompletionItemKind::TEXT)]
+    fn test_infer_completion_kind(
+        #[case] label: &str,
+        #[case] detail: Option<&str>,
+        #[case] expected_kind: CompletionItemKind,
+    ) {
+        let kind = infer_completion_kind(label, detail);
+        assert_eq!(kind, expected_kind);
     }
 
     #[rstest]
@@ -581,5 +686,79 @@ mod tests {
             assert_eq!(item.label, exp_label);
             assert_eq!(item.detail.as_deref(), exp_detail);
         }
+    }
+
+    #[tokio::test]
+    async fn test_completion_daemon_skips_cancelled_request() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let script_path = temp_dir.path().join("mock_daemon.zsh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/zsh\nwhile read -r line; do\n  if [[ \"$line\" == input:* ]]; then\n    echo \"success\\x01EOC\\x01\"\n  fi\ndone\n",
+        )
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel(16);
+        let mut client_opt = None;
+        let (_service, _socket) = tower_lsp::LspService::new(|client| {
+            client_opt = Some(client.clone());
+            crate::Backend::new(client).unwrap()
+        });
+        let client = client_opt.unwrap();
+
+        let daemon_handle = tokio::spawn(run_completion_daemon(script_path, None, rx, client));
+
+        // 1. Send cancelled request (drop receiver immediately)
+        let (tx_resp1, rx_resp1) = oneshot::channel();
+        drop(rx_resp1);
+        tx.send(CompletionRequest {
+            prefix: "cancelled".to_string(),
+            cwd: None,
+            responder: tx_resp1,
+        })
+        .await
+        .unwrap();
+
+        // 2. Send active request
+        let (tx_resp2, rx_resp2) = oneshot::channel();
+        tx.send(CompletionRequest {
+            prefix: "active".to_string(),
+            cwd: None,
+            responder: tx_resp2,
+        })
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(3), rx_resp2)
+            .await
+            .expect("Did not timeout waiting for active request")
+            .expect("Channel not closed")
+            .expect("Daemon returned success");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].label, "success");
+
+        drop(tx);
+        let _ = daemon_handle.await;
+    }
+
+    #[test]
+    fn test_parse_candidate_line_throughput() {
+        let sample_line = "status\tshow working tree status";
+        let iterations = 50_000;
+        let mut items = Vec::with_capacity(1000);
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            items.clear();
+            parse_candidate_line(sample_line, &mut items);
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "status");
+        assert_eq!(items[0].detail.as_deref(), Some("show working tree status"));
+        assert_eq!(items[0].insert_text, None);
+        assert!(elapsed.as_secs() < 5);
     }
 }

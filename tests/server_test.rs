@@ -41,6 +41,41 @@ async fn test_initialize() {
         result.capabilities.completion_provider.is_some(),
         "Server should support completion"
     );
+    let completion_opts = result.capabilities.completion_provider.unwrap();
+    let expected_triggers = vec![
+        "-".to_string(),
+        "$".to_string(),
+        "/".to_string(),
+        "~".to_string(),
+        ".".to_string(),
+        " ".to_string(),
+    ];
+    assert_eq!(completion_opts.trigger_characters, Some(expected_triggers));
+}
+
+#[tokio::test]
+async fn test_initialize_trigger_characters_present() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let initialize_params = InitializeParams::default();
+    let result = test_client
+        .send_request::<Initialize>(initialize_params)
+        .await
+        .unwrap();
+
+    let trigger_chars = result
+        .capabilities
+        .completion_provider
+        .and_then(|p| p.trigger_characters)
+        .expect("Expected trigger_characters to be configured");
+
+    assert!(trigger_chars.contains(&"-".to_string()));
+    assert!(trigger_chars.contains(&"$".to_string()));
+    assert!(trigger_chars.contains(&"/".to_string()));
+    assert!(trigger_chars.contains(&"~".to_string()));
+    assert!(trigger_chars.contains(&".".to_string()));
+    assert!(trigger_chars.contains(&" ".to_string()));
 }
 
 #[tokio::test]
