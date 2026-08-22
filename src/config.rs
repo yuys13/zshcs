@@ -15,13 +15,17 @@ pub struct ExperimentalConfig {
     /// Whether experimental syntax diagnostics using `zsh -n` is enabled.
     #[serde(default)]
     pub diagnostics: bool,
+    /// Whether experimental hover documentation provider is enabled.
+    #[serde(default)]
+    pub hover: bool,
 }
 
 impl Config {
     /// Parses configuration from an optional JSON value (e.g. `initializationOptions` or `settings`).
     ///
-    /// Looks for `["zshcs"]["experimental"]["diagnostics"]` first, then `["settings"]["zshcs"]...`,
-    /// and falls back to `["experimental"]["diagnostics"]` if present. Defaults to `false` for diagnostics.
+    /// Looks for `["zshcs"]["experimental"]["diagnostics"]` and `["zshcs"]["experimental"]["hover"]` first,
+    /// then `["settings"]["zshcs"]...`, and falls back to `["experimental"]...` if present.
+    /// Defaults to `false` for both experimental features.
     pub fn from_value(value: Option<&Value>) -> Self {
         let Some(val) = value else {
             return Self::default();
@@ -31,7 +35,7 @@ impl Config {
             return Self::default();
         }
 
-        // 1. Try parsing from `zshcs` key: {"zshcs": {"experimental": {"diagnostics": true}}}
+        // 1. Try parsing from `zshcs` key: {"zshcs": {"experimental": {"diagnostics": true, "hover": true}}}
         if let Some(zshcs_val) = val.get("zshcs")
             && let Ok(config) = serde_json::from_value::<Config>(zshcs_val.clone())
         {
@@ -43,7 +47,7 @@ impl Config {
             return Self::from_value(Some(settings_val));
         }
 
-        // 3. Try parsing root object directly: {"experimental": {"diagnostics": true}}
+        // 3. Try parsing root object directly: {"experimental": {"diagnostics": true, "hover": true}}
         if let Ok(config) = serde_json::from_value::<Config>(val.clone()) {
             return config;
         }
@@ -55,11 +59,21 @@ impl Config {
     pub fn experimental_diagnostics(&self) -> bool {
         self.experimental.diagnostics
     }
+
+    /// Returns true if experimental hover is enabled.
+    pub fn experimental_hover(&self) -> bool {
+        self.experimental.hover
+    }
 }
 
 /// Extracts whether experimental diagnostics is enabled from an optional JSON value.
 pub fn extract_experimental_diagnostics(value: Option<&Value>) -> bool {
     Config::from_value(value).experimental_diagnostics()
+}
+
+/// Extracts whether experimental hover is enabled from an optional JSON value.
+pub fn extract_experimental_hover(value: Option<&Value>) -> bool {
+    Config::from_value(value).experimental_hover()
 }
 
 #[cfg(test)]
@@ -214,12 +228,120 @@ mod tests {
     #[test]
     fn test_config_serialization_roundtrip() {
         let config = Config {
-            experimental: ExperimentalConfig { diagnostics: true },
+            experimental: ExperimentalConfig {
+                diagnostics: true,
+                hover: true,
+            },
         };
         let val = serde_json::to_value(&config).unwrap();
-        assert_eq!(val, json!({ "experimental": { "diagnostics": true } }));
+        assert_eq!(
+            val,
+            json!({ "experimental": { "diagnostics": true, "hover": true } })
+        );
 
         let deserialized = Config::from_value(Some(&val));
         assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn test_extract_hover_none_and_null() {
+        assert!(!extract_experimental_hover(None));
+        let val_null = json!(null);
+        assert!(!extract_experimental_hover(Some(&val_null)));
+        let val_empty = json!({});
+        assert!(!extract_experimental_hover(Some(&val_empty)));
+    }
+
+    #[test]
+    fn test_extract_hover_nested_zshcs() {
+        let val = json!({
+            "zshcs": {
+                "experimental": {
+                    "hover": true
+                }
+            }
+        });
+        let config = Config::from_value(Some(&val));
+        assert!(config.experimental_hover());
+        assert!(extract_experimental_hover(Some(&val)));
+
+        let val_false = json!({
+            "zshcs": {
+                "experimental": {
+                    "hover": false
+                }
+            }
+        });
+        let config_false = Config::from_value(Some(&val_false));
+        assert!(!config_false.experimental_hover());
+        assert!(!extract_experimental_hover(Some(&val_false)));
+    }
+
+    #[test]
+    fn test_extract_hover_direct_experimental() {
+        let val = json!({
+            "experimental": {
+                "hover": true
+            }
+        });
+        let config = Config::from_value(Some(&val));
+        assert!(config.experimental_hover());
+        assert!(extract_experimental_hover(Some(&val)));
+
+        let val_false = json!({
+            "experimental": {
+                "hover": false
+            }
+        });
+        let config_false = Config::from_value(Some(&val_false));
+        assert!(!config_false.experimental_hover());
+        assert!(!extract_experimental_hover(Some(&val_false)));
+    }
+
+    #[test]
+    fn test_extract_hover_nested_settings_wrapper() {
+        let val = json!({
+            "settings": {
+                "zshcs": {
+                    "experimental": {
+                        "hover": true
+                    }
+                }
+            }
+        });
+        let config = Config::from_value(Some(&val));
+        assert!(config.experimental_hover());
+        assert!(extract_experimental_hover(Some(&val)));
+
+        let val_false = json!({
+            "settings": {
+                "zshcs": {
+                    "experimental": {
+                        "hover": false
+                    }
+                }
+            }
+        });
+        let config_false = Config::from_value(Some(&val_false));
+        assert!(!config_false.experimental_hover());
+        assert!(!extract_experimental_hover(Some(&val_false)));
+    }
+
+    #[test]
+    fn test_extract_hover_invalid_types() {
+        let val1 = json!("invalid string");
+        assert!(!extract_experimental_hover(Some(&val1)));
+
+        let val2 = json!(999);
+        assert!(!extract_experimental_hover(Some(&val2)));
+
+        let val3 = json!({
+            "zshcs": {
+                "experimental": {
+                    "hover": "not a boolean"
+                }
+            }
+        });
+        assert!(!extract_experimental_hover(Some(&val3)));
     }
 }
