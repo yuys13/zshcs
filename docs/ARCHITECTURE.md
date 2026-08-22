@@ -16,7 +16,7 @@ flowchart TB
 
     subgraph RustServer [Rust LSP Server Process (zshcs)]
         LSPBackend["LSP Backend (`src/server.rs`)<br/>• LanguageServer Trait<br/>• Request Routing & Commands"]
-        DocMgr["DocumentManager (`src/document.rs`)<br/>• In-Memory Arc<DashMap<Url, DocumentState>><br/>• Incremental Sync & UTF-16/UTF-8 Mapping"]
+        DocMgr["DocumentManager (`src/document.rs`)<br/>• In-Memory Arc&lt;DashMap&lt;Url, DocumentState&gt;&gt;<br/>• Incremental Sync & UTF-16/UTF-8 Mapping"]
         Supervisor["Daemon Supervisor (`src/completion.rs`)<br/>• run_completion_daemon<br/>• HoL Cancellation & Timeout Guard<br/>• Process Recovery & chdir Sync"]
         ErrHandling["Error Hierarchy (`src/error.rs`)<br/>• ZshcsError / ZshcsResult<br/>• Type-Safe Conversions"]
     end
@@ -76,43 +76,30 @@ The `DocumentManager` subsystem maintains accurate in-memory representations of 
 The completion engine runs as an actor managed by a dedicated supervisor loop (`run_completion_daemon`).
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Idle: Spawn Supervisor Loop
-
-    state Idle {
-        [*] --> WaitingForRequest
-        WaitingForRequest --> CheckCancelled: Receive CompletionRequest
-        CheckCancelled --> WaitingForRequest: req.responder.is_closed() [Skip]
-        CheckCancelled --> EnsureAlive: Active Request
-    }
-
-    state ProcessManagement {
-        EnsureAlive --> SpawnDaemon: proc == None or !proc.is_alive()
-        SpawnDaemon --> ExecuteRequest: Success
-        SpawnDaemon --> ReportSpawnError: IoError
-        ReportSpawnError --> WaitingForRequest: Send Err to Responder
-        EnsureAlive --> ExecuteRequest: proc is alive
-    }
-
-    state RequestExecution {
-        ExecuteRequest --> SyncChdir: req.cwd != proc.current_cwd
-        SyncChdir --> SendInput: chdir:<dir>\n -> wait \0__cd_done__\0
-        ExecuteRequest --> SendInput: current_cwd matches
-        SendInput --> ReadStdout: input:<prefix>\n
-        ReadStdout --> ParseCandidates: Read until \x01EOC\x01
-        ParseCandidates --> SendSuccess: Return items via oneshot
-    }
-
-    state FaultRecovery {
-        ReadStdout --> TimeoutError: Elapsed > 5000ms
-        ReadStdout --> IOError: BrokenPipe / Unexpected EOF
-        TimeoutError --> KillProcess: child.start_kill() & proc = None
-        IOError --> KillProcess: child.start_kill() & proc = None
-        KillProcess --> SendFailure: Send Err to Responder
-    }
-
-    SendSuccess --> WaitingForRequest
-    SendFailure --> WaitingForRequest
+flowchart TD
+    Start([Spawn Supervisor Loop]) --> WaitReq[Wait for CompletionRequest from Channel]
+    WaitReq --> CheckCancel{req.responder<br/>.is_closed()?}
+    
+    CheckCancel -- Yes (Client Dropped) --> DropReq[Discard Request Immediately] --> WaitReq
+    CheckCancel -- No (Active Request) --> CheckAlive{proc == None or<br/>!proc.is_alive()?}
+    
+    CheckAlive -- Process Dead / None --> SpawnProc[Spawn DaemonProcess via tokio::process]
+    SpawnProc -- Spawn Error --> ReportSpawnErr[Send IoError to Responder] --> WaitReq
+    SpawnProc -- Success --> CheckCwd
+    CheckAlive -- Process Alive --> CheckCwd
+    
+    CheckCwd{req.cwd !=<br/>proc.current_cwd?}
+    CheckCwd -- Yes (Directory Changed) --> SendChdir["Send chdir:&lt;sanitized_cwd&gt;\\n<br/>Wait for \\0__cd_done__\\0"] --> SendInput
+    CheckCwd -- No (Same Directory) --> SendInput
+    
+    SendInput["Send input:&lt;sanitized_prefix&gt;\\n"] --> ReadStream[Read stdout stream with 5000ms timeout]
+    
+    ReadStream --> CheckLine{Stream Line Type}
+    CheckLine -- Candidate Record --> ParseCandidate[parse_candidate_line & infer_completion_kind] --> ReadStream
+    CheckLine -- End-of-Completion (\\x01EOC\\x01) --> SendSuccess[Send Ok(Vec&lt;CompletionItem&gt;) via oneshot] --> WaitReq
+    
+    ReadStream -- Timeout (> 5000ms) --> KillHung[proc.child.start_kill & proc = None] --> ReportTimeout[Send Daemon Timeout Err] --> WaitReq
+    ReadStream -- I/O Failure / EOF --> KillDead[proc.child.start_kill & proc = None] --> ReportIOErr[Send IoError to Responder] --> WaitReq
 ```
 
 - **Supervisor Pattern & Self-Healing**:
@@ -165,27 +152,32 @@ The completion engine integrates directly with Zsh's programmable completion sys
 classDiagram
     class ZshcsError {
         <<enum>>
-        Document(DocumentError)
-        Io(std::io::Error)
-        Daemon(String)
-        DaemonChannel(String)
-        RequestCancelled(RecvError)
-        Timeout(Elapsed)
-        Serialization(serde_json::Error)
-        Initialization(String)
+        +Document(DocumentError)
+        +Io(std::io::Error)
+        +Daemon(String)
+        +DaemonChannel(String)
+        +RequestCancelled(RecvError)
+        +Timeout(Elapsed)
+        +Serialization(serde_json::Error)
+        +Initialization(String)
     }
 
     class DocumentError {
         <<enum>>
-        NotFound(Url)
-        InvalidRange(Range)
-        OutdatedVersion(current, received)
+        +NotFound(Url)
+        +InvalidRange(Range)
+        +OutdatedVersion(current, received)
     }
+
+    class std_io_Error["std::io::Error"]
+    class tokio_RecvError["tokio::sync::oneshot::error::RecvError"]
+    class tokio_Elapsed["tokio::time::error::Elapsed"]
+    class serde_json_Error["serde_json::Error"]
 
     ZshcsError <.. DocumentError : #[from]
     ZshcsError <.. std_io_Error : #[from]
-    ZshcsError <.. tokio_sync_oneshot_error_RecvError : #[from]
-    ZshcsError <.. tokio_time_error_Elapsed : #[from]
+    ZshcsError <.. tokio_RecvError : #[from]
+    ZshcsError <.. tokio_Elapsed : #[from]
     ZshcsError <.. serde_json_Error : #[from]
 ```
 
@@ -317,4 +309,5 @@ flowchart LR
 4. **Pre-Commit Hook & CI Enforcement**:
    - Git native pre-commit hook (`.githooks/pre-commit`) configured via `git config core.hooksPath .githooks`.
    - CI pipeline (`.github/workflows/ci.yml`) enforces zero warnings on Linux and macOS, accompanied by `cargo-llvm-cov` and an Octocov 85% code coverage threshold gate.
+
 
