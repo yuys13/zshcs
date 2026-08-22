@@ -68,8 +68,22 @@ locally. These are the same checks that run in our CI pipeline.
    cargo test
    ```
 
+5. **Run Zsh script unit tests:**
+
+   ```bash
+   zsh tests/zsh/run_tests.zsh
+   ```
+
 Running these commands will help ensure that your changes are consistent with the
 project's standards and that all tests pass.
+
+### Native Git Pre-commit Hook
+
+You can configure Git to automatically run all pre-commit checks:
+
+```bash
+git config core.hooksPath .githooks
+```
 
 ## Commit Messages
 

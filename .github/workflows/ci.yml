@@ -9,7 +9,11 @@ env:
   CARGO_TERM_COLOR: always
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Rust
@@ -31,11 +35,18 @@ jobs:
         run: cargo clippy --no-deps --all-targets -- -D warnings
       - name: Build
         run: cargo build --release
-      - name: Install dependencies for tests
+      - name: Install dependencies for tests (Linux)
+        if: runner.os == 'Linux'
         run: |
-          sudo apt-get install -y --no-install-recommends zsh
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
+      - name: Install dependencies for tests (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install zsh || true
       - name: Run tests
-        run: cargo test
+        run: cargo test --all-targets
+      - name: Run Zsh script unit tests
+        run: zsh tests/zsh/run_tests.zsh
   coverage:
     runs-on: ubuntu-latest
     permissions:
