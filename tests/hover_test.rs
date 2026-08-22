@@ -570,3 +570,261 @@ async fn test_hover_dynamic_toggle_via_did_change_configuration() {
         .unwrap();
     assert!(hover_disabled.is_none());
 }
+
+#[tokio::test]
+async fn test_hover_path_qualified_and_special_builtins() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let initialize_params = InitializeParams {
+        process_id: Some(123),
+        root_uri: None,
+        capabilities: ClientCapabilities::default(),
+        initialization_options: Some(json!({
+            "zshcs": {
+                "experimental": {
+                    "hover": true
+                }
+            }
+        })),
+        ..Default::default()
+    };
+
+    test_client
+        .send_request::<Initialize>(initialize_params)
+        .await
+        .unwrap();
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    let doc_uri = Url::parse("file:///special_builtins.zsh").unwrap();
+    test_client
+        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: doc_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: "/bin/echo 'hello'\n/bin/ls -la\n: 'noop'\n. ./script.sh\nnonexistent_xyz123 --flag\n".to_string(),
+            },
+        })
+        .await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    // 1. Hover on `/bin/echo` (line 0, char 6 on 'echo') -> resolves to `echo` builtin doc
+    let hover_echo = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 6),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(hover_echo.is_some());
+    let hover_echo_val = hover_echo.unwrap();
+    assert_eq!(
+        hover_echo_val.range,
+        Some(Range {
+            start: Position::new(0, 0),
+            end: Position::new(0, 9),
+        })
+    );
+    if let HoverContents::Markup(markup) = hover_echo_val.contents {
+        assert!(markup.value.contains("`echo` (Zsh Builtin)"));
+    } else {
+        panic!("Expected HoverContents::Markup");
+    }
+
+    // 2. Hover on `/bin/ls` (line 1, char 6 on 'ls') -> resolves to `ls` man page
+    let hover_ls = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(1, 6),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(hover_ls.is_some());
+    let hover_ls_val = hover_ls.unwrap();
+    assert_eq!(
+        hover_ls_val.range,
+        Some(Range {
+            start: Position::new(1, 0),
+            end: Position::new(1, 7),
+        })
+    );
+    if let HoverContents::Markup(markup) = hover_ls_val.contents {
+        assert!(markup.value.starts_with("```text\n"));
+    } else {
+        panic!("Expected HoverContents::Markup");
+    }
+
+    // 3. Hover on `:` builtin (line 2, char 0)
+    let hover_colon = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(2, 0),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(hover_colon.is_some());
+    let hover_colon_val = hover_colon.unwrap();
+    assert_eq!(
+        hover_colon_val.range,
+        Some(Range {
+            start: Position::new(2, 0),
+            end: Position::new(2, 1),
+        })
+    );
+    if let HoverContents::Markup(markup) = hover_colon_val.contents {
+        assert!(markup.value.contains("`:` (Zsh Builtin)"));
+    } else {
+        panic!("Expected HoverContents::Markup");
+    }
+
+    // 4. Hover on `.` builtin (line 3, char 0)
+    let hover_dot = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(3, 0),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(hover_dot.is_some());
+    let hover_dot_val = hover_dot.unwrap();
+    assert_eq!(
+        hover_dot_val.range,
+        Some(Range {
+            start: Position::new(3, 0),
+            end: Position::new(3, 1),
+        })
+    );
+    if let HoverContents::Markup(markup) = hover_dot_val.contents {
+        assert!(markup.value.contains("`.` (Zsh Builtin)"));
+    } else {
+        panic!("Expected HoverContents::Markup");
+    }
+
+    // 5. Hover on nonexistent command (line 4, char 2) -> None
+    let hover_nonexistent = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(4, 2),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(hover_nonexistent.is_none());
+
+    // 6. Hover on flag `--flag` (line 4, char 20) -> None
+    let hover_flag = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(4, 20),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(hover_flag.is_none());
+}
+
+#[tokio::test]
+async fn test_hover_unicode_and_multibyte_document() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let initialize_params = InitializeParams {
+        process_id: Some(123),
+        root_uri: None,
+        capabilities: ClientCapabilities::default(),
+        initialization_options: Some(json!({
+            "zshcs": {
+                "experimental": {
+                    "hover": true
+                }
+            }
+        })),
+        ..Default::default()
+    };
+
+    test_client
+        .send_request::<Initialize>(initialize_params)
+        .await
+        .unwrap();
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    let doc_uri = Url::parse("file:///unicode_doc.zsh").unwrap();
+    test_client
+        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: doc_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: "echo 'こんにちは' # テスト 𩸽 🎉\nprint '成功'\n".to_string(),
+            },
+        })
+        .await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    // Hover on 'print' at line 1, char 2
+    let hover_print = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(1, 2),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(hover_print.is_some());
+    let hover_print_val = hover_print.unwrap();
+    assert_eq!(
+        hover_print_val.range,
+        Some(Range {
+            start: Position::new(1, 0),
+            end: Position::new(1, 5),
+        })
+    );
+    if let HoverContents::Markup(markup) = hover_print_val.contents {
+        assert!(markup.value.contains("`print` (Zsh Builtin)"));
+    } else {
+        panic!("Expected HoverContents::Markup");
+    }
+}
