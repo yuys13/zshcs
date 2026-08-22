@@ -89,7 +89,7 @@ flowchart TD
     CheckAlive -- Process Alive --> CheckCwd
     
     CheckCwd{req.cwd !=<br/>proc.current_cwd?}
-    CheckCwd -- Yes (Directory Changed) --> SendChdir["Send chdir:&lt;sanitized_cwd&gt;\\n<br/>Wait for \\0__cd_done__\\0"] --> SendInput
+    CheckCwd -- Yes (Directory Changed) --> SendChdir["Send chdir:&lt;sanitized_cwd&gt;\\n<br/>(capture.zsh syncs pty cwd)"] --> SendInput
     CheckCwd -- No (Same Directory) --> SendInput
     
     SendInput["Send input:&lt;sanitized_prefix&gt;\\n"] --> ReadStream[Read stdout stream with 5000ms timeout]
@@ -112,7 +112,7 @@ flowchart TD
   - Tracks `current_cwd` in `DaemonProcess`.
   - When a completion request arrives with a target directory derived from the document URI (`file://...`), the supervisor checks whether `current_cwd` matches the target.
   - If synchronization is required, the supervisor transmits `chdir:<sanitized_cwd>\n` to the daemon stdin.
-  - The daemon invokes `_zshcs_chdir` in the pty and emits a null-byte delimited acknowledgement `\0__cd_done__\0`, ensuring subsequent path-relative completions resolve accurately.
+  - The `capture.zsh` script invokes `_zshcs_chdir` in the pty subshell and consumes the null-byte delimited acknowledgement `\0__cd_done__\0`, ensuring subsequent path-relative completions resolve accurately without corrupting the candidate stdout stream.
 - **Asynchronous Stderr Monitoring**:
   - Spawns a dedicated background task reading the daemon's `stderr` stream line-by-line via `BufReader`.
   - Forwards diagnostic and warning output to the LSP client via `window/logMessage` (`MessageType::WARNING`) without blocking completion data on `stdout`.
