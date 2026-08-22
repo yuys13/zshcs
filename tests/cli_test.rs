@@ -173,3 +173,79 @@ fn test_cli_struct_traits() {
     assert!(debug_str.contains("Cli"));
     assert!(debug_str.contains("stdio: true"));
 }
+
+#[test]
+fn test_cli_parse_duplicate_stdio_flag() {
+    let res = Cli::try_parse_from(["zshcs", "--stdio", "--stdio"]);
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err().kind(), ErrorKind::ArgumentConflict);
+}
+
+#[test]
+fn test_cli_parse_case_sensitivity() {
+    let res = Cli::try_parse_from(["zshcs", "--STDIO"]);
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err().kind(), ErrorKind::UnknownArgument);
+}
+
+#[test]
+fn test_cli_parse_empty_positional_arg() {
+    let res = Cli::try_parse_from(["zshcs", ""]);
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err().kind(), ErrorKind::UnknownArgument);
+}
+
+#[test]
+fn test_binary_help_with_stdio_flag() {
+    let bin_path = env!("CARGO_BIN_EXE_zshcs");
+    let output = Command::new(bin_path)
+        .args(["--stdio", "--help"])
+        .output()
+        .expect("Failed to execute zshcs --stdio --help");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("zshcs"));
+}
+
+#[test]
+fn test_binary_version_with_stdio_flag() {
+    let bin_path = env!("CARGO_BIN_EXE_zshcs");
+    let output = Command::new(bin_path)
+        .args(["--stdio", "--version"])
+        .output()
+        .expect("Failed to execute zshcs --stdio --version");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn test_binary_invalid_flag_with_stdio() {
+    let bin_path = env!("CARGO_BIN_EXE_zshcs");
+    let output = Command::new(bin_path)
+        .args(["--stdio", "--unknown-flag"])
+        .output()
+        .expect("Failed to execute zshcs --stdio --unknown-flag");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unexpected argument"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cli_parse_non_utf8_os_argument() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    // Construct an invalid UTF-8 OsString
+    let invalid_utf8_arg = OsString::from_vec(vec![0x66, 0x6f, 0x80, 0x6f]); // "fo\x80o"
+    let args = [OsString::from("zshcs"), invalid_utf8_arg];
+    let res = Cli::try_parse_from(args);
+    assert!(
+        res.is_err(),
+        "Invalid UTF-8 arguments must result in an error, not panic"
+    );
+}
