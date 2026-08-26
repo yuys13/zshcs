@@ -68,10 +68,13 @@
             nativeBuildInputs = [
               pkgs.zsh
               pkgs.git
+              pkgs.man-db
+              pkgs.man-pages
             ];
 
             preCheck = ''
               export HOME=$TMPDIR
+              export MANPATH="${pkgs.git}/share/man:${pkgs.man-pages}/share/man:$MANPATH"
             '';
 
           };

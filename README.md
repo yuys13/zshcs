@@ -51,11 +51,12 @@ return {
   cmd = { "zshcs" },
   filetypes = { "zsh" },
   root_markers = { ".git" },
-  -- Optional: Enable experimental syntax diagnostics (zsh -n)
+  -- Optional: Enable experimental features (diagnostics, hover)
   settings = {
     zshcs = {
       experimental = {
         diagnostics = true,
+        hover = true,
       },
     },
   },
@@ -71,6 +72,7 @@ vim.lsp.enable("zshcs")
 ### Experimental Features
 
 - **Syntax Diagnostics (`zsh -n`)**: By default, diagnostics are disabled to avoid unnecessary process overhead. You can opt-in by configuring `settings.zshcs.experimental.diagnostics = true` in your LSP client configuration or `initializationOptions`.
+- **Hover Documentation (`textDocument/hover`)**: By default, hover documentation is disabled. You can opt-in by configuring `settings.zshcs.experimental.hover = true` in your LSP client configuration or `initializationOptions`. It provides structured Markdown documentation for Zsh builtins and reserved words, and automatically falls back to full manual pages (`man`) formatted in code blocks for external commands (with 2000ms timeout protection).
 
 
 ## How It Works
