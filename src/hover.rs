@@ -1,8 +1,8 @@
 use std::time::Duration;
 use tower_lsp::lsp_types::{HoverContents, MarkupContent, MarkupKind, Position, Range};
 
-/// Default timeout for asynchronous man page retrieval (2000 milliseconds).
-pub const DEFAULT_HOVER_MAN_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Default timeout for asynchronous man page retrieval (5000 milliseconds).
+pub const DEFAULT_HOVER_MAN_TIMEOUT: Duration = Duration::from_millis(5000);
 
 /// Determines whether a character is part of a word/token for hover inspection.
 ///
