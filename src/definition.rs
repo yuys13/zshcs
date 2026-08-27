@@ -579,7 +579,7 @@ pub fn extract_word_and_target_at_position(
         });
     }
 
-    if target_u16 >= current_u16 && !tokens.is_empty() {
+    if target_u16 > current_u16 && !tokens.is_empty() {
         // Cursor beyond end of line
         return None;
     }
@@ -1355,10 +1355,15 @@ echo "$VAR"
         assert!(find_definition("", &uri, Position::new(0, 0)).is_none());
         assert!(find_definition("", &uri, Position::new(10, 10)).is_none());
 
-        // 2. Out of bounds positions
+        // 2. Out of bounds positions and boundary matching
         let sample = "foo() { : }\nfoo\n";
         assert!(find_definition(sample, &uri, Position::new(10, 0)).is_none());
         assert!(find_definition(sample, &uri, Position::new(1, 100)).is_none());
+        // Cursor at column 0, 1, 2, and 3 (end boundary of foo)
+        assert!(find_definition(sample, &uri, Position::new(1, 0)).is_some());
+        assert!(find_definition(sample, &uri, Position::new(1, 1)).is_some());
+        assert!(find_definition(sample, &uri, Position::new(1, 2)).is_some());
+        assert!(find_definition(sample, &uri, Position::new(1, 3)).is_some());
 
         // 3. CRLF line endings
         let crlf = "bar() {\r\n    :\r\n}\r\nbar\r\n";
