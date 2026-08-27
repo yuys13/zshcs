@@ -984,3 +984,139 @@ echo "Upper: ${(U)USER_NAME}"
         panic!("Expected Scalar response for ${{(U)USER_NAME}}");
     }
 }
+
+#[tokio::test]
+async fn test_definition_nested_expansions_loops_and_compound_source() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let temp_dir = tempdir().unwrap();
+    let lib_path = temp_dir.path().join("sublib.zsh");
+    std::fs::write(&lib_path, "# Sublib\n").unwrap();
+    let lib_uri = Url::from_file_path(lib_path.canonicalize().unwrap()).unwrap();
+
+    let main_path = temp_dir.path().join("main_script.zsh");
+    let main_uri = Url::from_file_path(&main_path).unwrap();
+
+    let initialize_params = InitializeParams {
+        process_id: Some(123),
+        root_uri: None,
+        capabilities: ClientCapabilities::default(),
+        initialization_options: Some(json!({
+            "zshcs": {
+                "experimental": {
+                    "definition": true
+                }
+            }
+        })),
+        ..Default::default()
+    };
+
+    test_client
+        .send_request::<Initialize>(initialize_params)
+        .await
+        .unwrap();
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    let text = r#"
+# Script setup
+DEFAULT_USER="guest"
+ACTIVE_USER="admin"
+
+echo "User: ${ACTIVE_USER:-${DEFAULT_USER}}"
+
+for entry in one two three; do
+    echo "$entry"
+done
+
+[ -f ./sublib.zsh ] && source ./sublib.zsh
+"#;
+
+    test_client
+        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: main_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: text.to_string(),
+            },
+        })
+        .await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    // 1. Jump to DEFAULT_USER inside nested expansion `${ACTIVE_USER:-${DEFAULT_USER}}` (line 5, char 32)
+    let def_def_user = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: main_uri.clone(),
+                },
+                position: Position::new(5, 32),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    assert!(def_def_user.is_some());
+    if let Some(GotoDefinitionResponse::Scalar(loc)) = def_def_user {
+        assert_eq!(loc.uri, main_uri);
+        assert_eq!(loc.range.start, Position::new(2, 0));
+        assert_eq!(loc.range.end, Position::new(2, 12));
+    } else {
+        panic!("Expected Scalar response for DEFAULT_USER");
+    }
+
+    // 2. Jump to for-loop variable `entry` (line 8, char 12)
+    let def_entry = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: main_uri.clone(),
+                },
+                position: Position::new(8, 12),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    assert!(def_entry.is_some());
+    if let Some(GotoDefinitionResponse::Scalar(loc)) = def_entry {
+        assert_eq!(loc.uri, main_uri);
+        assert_eq!(loc.range.start, Position::new(7, 4));
+        assert_eq!(loc.range.end, Position::new(7, 9));
+    } else {
+        panic!("Expected Scalar response for loop variable entry");
+    }
+
+    // 3. Jump to compound `source` statement (line 11, char 28)
+    let def_src = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: main_uri.clone(),
+                },
+                position: Position::new(11, 28),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    assert!(def_src.is_some());
+    if let Some(GotoDefinitionResponse::Scalar(loc)) = def_src {
+        assert_eq!(loc.uri, lib_uri);
+        assert_eq!(loc.range.start, Position::new(0, 0));
+    } else {
+        panic!("Expected Scalar response for compound source statement");
+    }
+}

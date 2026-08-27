@@ -132,7 +132,8 @@ pub fn is_ident_char(c: char) -> bool {
 }
 
 /// Splits a line into distinct statements separated by `;`, `&&`, `||`, `&`, `|`
-/// while respecting single quotes, double quotes, backticks, and parentheses.
+/// as well as standalone command block braces `{` and `}`, while respecting single quotes,
+/// double quotes, backticks, parentheses, and parameter expansions (`${...}`).
 pub fn split_line_statements(line: &str) -> Vec<StatementSpan<'_>> {
     let mut statements = Vec::new();
     let bytes = line.as_bytes();
@@ -142,7 +143,7 @@ pub fn split_line_statements(line: &str) -> Vec<StatementSpan<'_>> {
 
     let mut in_quote: Option<u8> = None;
     let mut paren_depth = 0;
-    let mut brace_depth = 0;
+    let mut param_brace_depth = 0;
 
     while i < len {
         let b = bytes[i];
@@ -164,27 +165,27 @@ pub fn split_line_statements(line: &str) -> Vec<StatementSpan<'_>> {
             if paren_depth > 0 {
                 paren_depth -= 1;
             }
-        } else if b == b'{' {
-            brace_depth += 1;
-        } else if b == b'}' {
-            if brace_depth > 0 {
-                brace_depth -= 1;
-            }
-        } else if paren_depth == 0 && brace_depth == 0 {
+        } else if b == b'{' && i > 0 && bytes[i - 1] == b'$' {
+            param_brace_depth += 1;
+        } else if b == b'}' && param_brace_depth > 0 {
+            param_brace_depth -= 1;
+        } else if paren_depth == 0 && param_brace_depth == 0 {
             if b == b'#' {
                 // Comment starts; capture current statement and stop for the line
-                if stmt_start < i {
+                let candidate = &line[stmt_start..i];
+                if !candidate.trim().is_empty() {
                     statements.push(StatementSpan {
-                        text: &line[stmt_start..i],
+                        text: candidate,
                         start_byte: stmt_start,
                     });
                 }
                 stmt_start = len;
                 break;
             } else if b == b';' || b == b'&' || b == b'|' {
-                if stmt_start < i {
+                let candidate = &line[stmt_start..i];
+                if !candidate.trim().is_empty() {
                     statements.push(StatementSpan {
-                        text: &line[stmt_start..i],
+                        text: candidate,
                         start_byte: stmt_start,
                     });
                 }
@@ -194,16 +195,28 @@ pub fn split_line_statements(line: &str) -> Vec<StatementSpan<'_>> {
                     i += 1;
                 }
                 stmt_start = i + 1;
+            } else if b == b'{' || b == b'}' {
+                let candidate = &line[stmt_start..i];
+                if !candidate.trim().is_empty() {
+                    statements.push(StatementSpan {
+                        text: candidate,
+                        start_byte: stmt_start,
+                    });
+                }
+                stmt_start = i + 1;
             }
         }
         i += 1;
     }
 
     if stmt_start < len {
-        statements.push(StatementSpan {
-            text: &line[stmt_start..len],
-            start_byte: stmt_start,
-        });
+        let candidate = &line[stmt_start..len];
+        if !candidate.trim().is_empty() {
+            statements.push(StatementSpan {
+                text: candidate,
+                start_byte: stmt_start,
+            });
+        }
     }
 
     statements
@@ -281,56 +294,59 @@ pub fn extract_source_path_at_position(text: &str, position: Position) -> Option
     }
 
     let line_str = &text[line_start..line_end];
-    let trimmed = line_str.trim_start();
-    let indent_bytes = line_str.len() - trimmed.len();
+    let target_u16 = position.character;
 
-    if trimmed.starts_with('#') {
-        return None;
-    }
-
-    let cmd_len = if trimmed.starts_with("source ") || trimmed.starts_with("source\t") {
-        6
-    } else if trimmed.starts_with(". ") || trimmed.starts_with(".\t") {
-        1
-    } else {
-        return None;
-    };
-
-    let after_cmd = &trimmed[cmd_len..];
-    let arg_trim_len = after_cmd.len() - after_cmd.trim_start().len();
-    let arg_start_byte = indent_bytes + cmd_len + arg_trim_len;
-    if arg_start_byte >= line_str.len() {
-        return None;
-    }
-
-    let arg_content = &line_str[arg_start_byte..];
-    let (unquoted, arg_end_byte) = if let Some(stripped) = arg_content.strip_prefix('"') {
-        if let Some(close_idx) = stripped.find('"') {
-            (&stripped[..close_idx], arg_start_byte + 1 + close_idx + 1)
-        } else {
-            (stripped, line_str.len())
+    for stmt in split_line_statements(line_str) {
+        let trimmed = stmt.text.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
         }
-    } else if let Some(stripped) = arg_content.strip_prefix('\'') {
-        if let Some(close_idx) = stripped.find('\'') {
-            (&stripped[..close_idx], arg_start_byte + 1 + close_idx + 1)
+
+        let stmt_indent = stmt.text.len() - trimmed.len();
+        let cmd_len = if trimmed.starts_with("source ") || trimmed.starts_with("source\t") {
+            6
+        } else if trimmed.starts_with(". ") || trimmed.starts_with(".\t") {
+            1
         } else {
-            (stripped, line_str.len())
+            continue;
+        };
+
+        let after_cmd = &trimmed[cmd_len..];
+        let arg_trim_len = after_cmd.len() - after_cmd.trim_start().len();
+        let arg_start_byte = stmt.start_byte + stmt_indent + cmd_len + arg_trim_len;
+        if arg_start_byte >= line_str.len() {
+            continue;
         }
-    } else {
-        let token_len = arg_content
-            .find(|c: char| c.is_whitespace() || c == '#' || c == ';')
-            .unwrap_or(arg_content.len());
-        (&arg_content[..token_len], arg_start_byte + token_len)
-    };
 
-    let cmd_start_u16 = byte_to_utf16_col(line_str, indent_bytes);
-    let arg_end_u16 = byte_to_utf16_col(line_str, arg_end_byte);
+        let arg_content = &line_str[arg_start_byte..];
+        let (unquoted, arg_end_byte) = if let Some(stripped) = arg_content.strip_prefix('"') {
+            if let Some(close_idx) = stripped.find('"') {
+                (&stripped[..close_idx], arg_start_byte + 1 + close_idx + 1)
+            } else {
+                (stripped, line_str.len())
+            }
+        } else if let Some(stripped) = arg_content.strip_prefix('\'') {
+            if let Some(close_idx) = stripped.find('\'') {
+                (&stripped[..close_idx], arg_start_byte + 1 + close_idx + 1)
+            } else {
+                (stripped, line_str.len())
+            }
+        } else {
+            let token_len = arg_content
+                .find(|c: char| c.is_whitespace() || c == '#' || c == ';')
+                .unwrap_or(arg_content.len());
+            (&arg_content[..token_len], arg_start_byte + token_len)
+        };
 
-    if position.character >= cmd_start_u16 && position.character <= arg_end_u16 {
-        Some(unquoted.to_string())
-    } else {
-        None
+        let cmd_start_u16 = byte_to_utf16_col(line_str, stmt.start_byte + stmt_indent);
+        let arg_end_u16 = byte_to_utf16_col(line_str, arg_end_byte);
+
+        if target_u16 >= cmd_start_u16 && target_u16 <= arg_end_u16 {
+            return Some(unquoted.to_string());
+        }
     }
+
+    None
 }
 
 /// Resolves a source path relative to the current document's directory or as an absolute / tilde path.
@@ -391,6 +407,23 @@ pub fn resolve_source_path(path_str: &str, base_uri: &Url) -> Option<Url> {
     None
 }
 
+/// Extracts a `read` command from a statement (supporting `while read ...`, `IFS= read ...`, etc.).
+fn find_read_command(stmt_text: &str) -> Option<(usize, &str)> {
+    if stmt_text.starts_with("read ") || stmt_text.starts_with("read\t") {
+        return Some((0, &stmt_text[5..]));
+    }
+
+    let markers = [" read ", "\tread ", " read\t", "\tread\t"];
+    for marker in markers {
+        if let Some(pos) = stmt_text.find(marker) {
+            let read_start = pos + 1;
+            return Some((read_start, &stmt_text[read_start + 5..]));
+        }
+    }
+
+    None
+}
+
 /// Extracts the definition target under the cursor along with its UTF-16 range.
 pub fn extract_word_and_target_at_position(
     text: &str,
@@ -411,14 +444,41 @@ pub fn extract_word_and_target_at_position(
     let line_str = &text[line_start..line_end];
     let target_u16 = position.character;
 
-    // 1. Check for parameter expansion `${VAR}` spanning cursor
-    for (start_idx, _) in line_str.match_indices("${") {
-        if let Some(close_rel) = line_str[start_idx + 2..].find('}') {
-            let close_idx = start_idx + 2 + close_rel;
-            let start_u16 = byte_to_utf16_col(line_str, start_idx);
-            let end_u16 = byte_to_utf16_col(line_str, close_idx + 1);
+    // 1. Collect all variable references (${...} and $VAR)
+    let mut var_spans: Vec<(usize, usize, String)> = Vec::new();
+    let bytes = line_str.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
 
-            if target_u16 >= start_u16 && target_u16 <= end_u16 {
+    while i < len {
+        if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
+            let start_idx = i;
+            let mut depth = 1;
+            let mut j = i + 2;
+            let mut in_q: Option<u8> = None;
+
+            while j < len && depth > 0 {
+                let b = bytes[j];
+                if b == b'\\' && in_q != Some(b'\'') && j + 1 < len {
+                    j += 2;
+                    continue;
+                }
+                if let Some(q) = in_q {
+                    if b == q {
+                        in_q = None;
+                    }
+                } else if b == b'"' || b == b'\'' || b == b'`' {
+                    in_q = Some(b);
+                } else if b == b'{' {
+                    depth += 1;
+                } else if b == b'}' {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+
+            if depth == 0 {
+                let close_idx = j - 1;
                 let mut inside = &line_str[start_idx + 2..close_idx];
                 // Strip Zsh parameter expansion flags e.g. `(U)`, `(q)`, `(f)`
                 if inside.starts_with('(')
@@ -426,8 +486,12 @@ pub fn extract_word_and_target_at_position(
                 {
                     inside = &inside[close_paren + 1..];
                 }
-                // Strip leading length `#` or indirect `!` if followed by identifier
-                if (inside.starts_with('#') || inside.starts_with('!'))
+                // Strip leading length `#`, indirect `!`, etc. if followed by identifier
+                if (inside.starts_with('#')
+                    || inside.starts_with('!')
+                    || inside.starts_with('^')
+                    || inside.starts_with('=')
+                    || inside.starts_with('~'))
                     && inside.len() > 1
                     && is_var_ident_char(inside.chars().nth(1).unwrap_or(' '))
                 {
@@ -438,37 +502,39 @@ pub fn extract_word_and_target_at_position(
                     .take_while(|c| is_var_ident_char(*c))
                     .collect();
                 if !var_name.is_empty() {
-                    let range = Range {
-                        start: Position::new(position.line, start_u16),
-                        end: Position::new(position.line, end_u16),
-                    };
-                    return Some((DefinitionTarget::Variable(var_name), range));
+                    var_spans.push((start_idx, close_idx + 1, var_name));
                 }
             }
-        }
-    }
-
-    // 2. Check for `$VAR` variable reference spanning cursor
-    for (dollar_idx, _) in line_str.match_indices('$') {
-        let after_dollar = &line_str[dollar_idx + 1..];
-        let var_name: String = after_dollar
-            .chars()
-            .take_while(|c| is_var_ident_char(*c))
-            .collect();
-        if !var_name.is_empty() {
-            let start_u16 = byte_to_utf16_col(line_str, dollar_idx);
-            let end_u16 = byte_to_utf16_col(line_str, dollar_idx + 1 + var_name.len());
-            if target_u16 >= start_u16 && target_u16 <= end_u16 {
-                let range = Range {
-                    start: Position::new(position.line, start_u16),
-                    end: Position::new(position.line, end_u16),
-                };
-                return Some((DefinitionTarget::Variable(var_name), range));
+        } else if bytes[i] == b'$' && (i + 1 == len || bytes[i + 1] != b'{') {
+            let dollar_idx = i;
+            let after_dollar = &line_str[dollar_idx + 1..];
+            let var_name: String = after_dollar
+                .chars()
+                .take_while(|c| is_var_ident_char(*c))
+                .collect();
+            if !var_name.is_empty() {
+                var_spans.push((dollar_idx, dollar_idx + 1 + var_name.len(), var_name));
             }
         }
+        i += 1;
     }
 
-    // 3. Extract word token spanning cursor (functions, bare variables, assignments)
+    // Sort variable spans by length ascending so innermost / most specific matches first
+    var_spans.sort_by_key(|(start, end, _)| end - start);
+    for (start_byte, end_byte, var_name) in &var_spans {
+        let start_u16 = byte_to_utf16_col(line_str, *start_byte);
+        let end_u16 = byte_to_utf16_col(line_str, *end_byte);
+
+        if target_u16 >= start_u16 && target_u16 <= end_u16 {
+            let range = Range {
+                start: Position::new(position.line, start_u16),
+                end: Position::new(position.line, end_u16),
+            };
+            return Some((DefinitionTarget::Variable(var_name.clone()), range));
+        }
+    }
+
+    // 2. Extract word token spanning cursor (functions, bare variables, assignments)
     struct TokenSpan {
         start_byte: usize,
         end_byte: usize,
@@ -582,6 +648,7 @@ pub fn scan_function_definitions(text: &str, uri: &Url, func_name: &str) -> Vec<
             // Pattern 2: `function func_name ...`
             if trimmed.starts_with("function ") || trimmed.starts_with("function\t") {
                 let after_fn = trimmed[8..].trim_start();
+                let fn_spaces = trimmed[8..].len() - after_fn.len();
                 if let Some(rest) = after_fn.strip_prefix(func_name) {
                     let rest_t = rest.trim_start();
                     let is_header_end = rest_t.is_empty()
@@ -591,20 +658,17 @@ pub fn scan_function_definitions(text: &str, uri: &Url, func_name: &str) -> Vec<
                         || (rest_t.starts_with('(') && rest_t.contains(')'));
 
                     if is_header_end {
-                        let fn_kw_offset = stmt_offset + 8;
-                        if let Some(offset) = line[fn_kw_offset..].find(func_name) {
-                            let start_byte = fn_kw_offset + offset;
-                            let end_byte = start_byte + func_name.len();
-                            let start_u16 = byte_to_utf16_col(line, start_byte);
-                            let end_u16 = byte_to_utf16_col(line, end_byte);
-                            locations.push(Location {
-                                uri: uri.clone(),
-                                range: Range::new(
-                                    Position::new(line_idx as u32, start_u16),
-                                    Position::new(line_idx as u32, end_u16),
-                                ),
-                            });
-                        }
+                        let start_byte = stmt_offset + 8 + fn_spaces;
+                        let end_byte = start_byte + func_name.len();
+                        let start_u16 = byte_to_utf16_col(line, start_byte);
+                        let end_u16 = byte_to_utf16_col(line, end_byte);
+                        locations.push(Location {
+                            uri: uri.clone(),
+                            range: Range::new(
+                                Position::new(line_idx as u32, start_u16),
+                                Position::new(line_idx as u32, end_u16),
+                            ),
+                        });
                     }
                 }
             }
@@ -631,7 +695,7 @@ pub fn scan_variable_definitions(text: &str, uri: &Url, var_name: &str) -> Vec<L
             let stmt_indent = stmt.text.len() - trimmed.len();
             let stmt_offset = stmt.start_byte + stmt_indent;
 
-            // Direct assignment: `VAR=...`, `VAR+=...`, `VAR[1]=...`
+            // 1. Direct assignment: `VAR=...`, `VAR+=...`, `VAR[1]=...`
             if let Some(rest) = trimmed.strip_prefix(var_name) {
                 let is_direct_assignment = rest.starts_with('=')
                     || rest.starts_with("+=")
@@ -657,7 +721,104 @@ pub fn scan_variable_definitions(text: &str, uri: &Url, var_name: &str) -> Vec<L
                 }
             }
 
-            // Declaration statements: `export`, `typeset`, `local`, `declare`, `readonly`, etc.
+            // 2. Loop variable: `for VAR in ...`, `for VAR; do`, `for VAR ( ... )`, `select VAR in ...`
+            let for_or_select_kw = if trimmed.starts_with("for ") || trimmed.starts_with("for\t") {
+                Some(4)
+            } else if trimmed.starts_with("select ") || trimmed.starts_with("select\t") {
+                Some(7)
+            } else {
+                None
+            };
+
+            if let Some(kw_len) = for_or_select_kw {
+                let after_kw = trimmed[kw_len..].trim_start();
+                let kw_space_len = trimmed[kw_len..].len() - after_kw.len();
+                if let Some(rest) = after_kw.strip_prefix(var_name) {
+                    let is_loop_var = rest.is_empty()
+                        || rest.starts_with(' ')
+                        || rest.starts_with('\t')
+                        || rest.starts_with(';')
+                        || rest.starts_with('(')
+                        || rest.starts_with('\n');
+                    if is_loop_var {
+                        let start_byte = stmt_offset + kw_len + kw_space_len;
+                        let end_byte = start_byte + var_name.len();
+                        let start_u16 = byte_to_utf16_col(line, start_byte);
+                        let end_u16 = byte_to_utf16_col(line, end_byte);
+                        locations.push(Location {
+                            uri: uri.clone(),
+                            range: Range::new(
+                                Position::new(line_idx as u32, start_u16),
+                                Position::new(line_idx as u32, end_u16),
+                            ),
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // 3. C-style for loop: `for (( VAR = 0; ... ))`
+            if trimmed.starts_with("for ((") || trimmed.starts_with("for((") {
+                let after_for = if let Some(stripped) = trimmed.strip_prefix("for ((") {
+                    stripped
+                } else {
+                    trimmed.strip_prefix("for((").unwrap_or("")
+                };
+                let kw_offset = stmt.text.len() - after_for.len();
+                if let Some(close_idx) = after_for.find("))") {
+                    let init_part = &after_for[..close_idx];
+                    let first_semi = init_part.find(';').unwrap_or(init_part.len());
+                    let clause = &init_part[..first_semi];
+                    for token in split_declaration_tokens(clause) {
+                        if let Some(rest) = token.text.strip_prefix(var_name)
+                            && (rest.is_empty()
+                                || rest.starts_with('=')
+                                || rest.starts_with("+=")
+                                || rest.starts_with("++")
+                                || rest.starts_with("--"))
+                        {
+                            let start_byte = stmt.start_byte + kw_offset + token.byte_offset;
+                            let end_byte = start_byte + var_name.len();
+                            let start_u16 = byte_to_utf16_col(line, start_byte);
+                            let end_u16 = byte_to_utf16_col(line, end_byte);
+                            locations.push(Location {
+                                uri: uri.clone(),
+                                range: Range::new(
+                                    Position::new(line_idx as u32, start_u16),
+                                    Position::new(line_idx as u32, end_u16),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // 4. `read` statement: `read VAR`, `read -r VAR`, `while read -r line; do`
+            if let Some((read_start, after_read)) = find_read_command(trimmed) {
+                let read_kw_offset = stmt_offset + read_start + 5;
+                for token in split_declaration_tokens(after_read) {
+                    if token.text.starts_with('-') || token.text.starts_with('+') {
+                        continue;
+                    }
+                    if let Some(rest) = token.text.strip_prefix(var_name)
+                        && (rest.is_empty() || rest.starts_with('='))
+                    {
+                        let start_byte = read_kw_offset + token.byte_offset;
+                        let end_byte = start_byte + var_name.len();
+                        let start_u16 = byte_to_utf16_col(line, start_byte);
+                        let end_u16 = byte_to_utf16_col(line, end_byte);
+                        locations.push(Location {
+                            uri: uri.clone(),
+                            range: Range::new(
+                                Position::new(line_idx as u32, start_u16),
+                                Position::new(line_idx as u32, end_u16),
+                            ),
+                        });
+                    }
+                }
+            }
+
+            // 5. Declaration statements: `export`, `typeset`, `local`, `declare`, `readonly`, etc.
             for kw in decl_keywords {
                 if trimmed.starts_with(kw)
                     && (trimmed[kw.len()..].starts_with(' ')
@@ -1254,6 +1415,178 @@ echo "$VAR"
         // Restore HOME
         unsafe {
             std::env::set_var("HOME", home_env);
+        }
+    }
+
+    #[test]
+    fn test_find_definition_nested_parameter_expansions() {
+        let text = r#"
+FOO="foo_val"
+BAR="bar_val"
+OTHER="other_val"
+
+echo "${FOO:-${BAR}}"
+echo "${FOO:-$OTHER}"
+"#;
+        let uri = Url::parse("file:///nested_params.zsh").unwrap();
+
+        // 1. Cursor on FOO inside `${FOO:-${BAR}}` (line 5, char 8) -> FOO (line 1)
+        let def_foo = find_definition(text, &uri, Position::new(5, 8)).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = def_foo {
+            assert_eq!(loc.range.start, Position::new(1, 0));
+            assert_eq!(loc.range.end, Position::new(1, 3));
+        } else {
+            panic!("Expected Scalar response for FOO in nested expansion");
+        }
+
+        // 2. Cursor on BAR inside `${FOO:-${BAR}}` (line 5, char 16) -> BAR (line 2)
+        let def_bar = find_definition(text, &uri, Position::new(5, 16)).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = def_bar {
+            assert_eq!(loc.range.start, Position::new(2, 0));
+            assert_eq!(loc.range.end, Position::new(2, 3));
+        } else {
+            panic!("Expected Scalar response for BAR in nested expansion");
+        }
+
+        // 3. Cursor on OTHER inside `${FOO:-$OTHER}` (line 6, char 16) -> OTHER (line 3)
+        let def_other = find_definition(text, &uri, Position::new(6, 16)).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = def_other {
+            assert_eq!(loc.range.start, Position::new(3, 0));
+            assert_eq!(loc.range.end, Position::new(3, 5));
+        } else {
+            panic!("Expected Scalar response for $OTHER in nested expansion");
+        }
+    }
+
+    #[test]
+    fn test_loop_and_read_variable_definitions() {
+        let text = r#"
+for item in alpha beta gamma; do
+    echo "Item: $item"
+done
+
+for f (*.txt); do
+    cat "$f"
+done
+
+for (( idx=0; idx < 10; idx++ )); do
+    echo "$idx"
+done
+
+select choice in "yes" "no"; do
+    echo "$choice"
+    break
+done
+
+while IFS= read -r input_line; do
+    echo "$input_line"
+done
+"#;
+        let uri = Url::parse("file:///loops.zsh").unwrap();
+
+        // 1. Jump to `item` from `$item` on line 2, char 18
+        let def_item = find_definition(text, &uri, Position::new(2, 18)).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = def_item {
+            assert_eq!(loc.range.start, Position::new(1, 4));
+            assert_eq!(loc.range.end, Position::new(1, 8));
+        } else {
+            panic!("Expected Scalar response for for-loop variable `item`");
+        }
+
+        // 2. Jump to `f` from `$f` on line 6, char 10
+        let def_f = find_definition(text, &uri, Position::new(6, 10)).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = def_f {
+            assert_eq!(loc.range.start, Position::new(5, 4));
+            assert_eq!(loc.range.end, Position::new(5, 5));
+        } else {
+            panic!("Expected Scalar response for short for-loop variable `f`");
+        }
+
+        // 3. Jump to `idx` from `$idx` on line 10, char 12
+        let def_idx = find_definition(text, &uri, Position::new(10, 12)).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = def_idx {
+            assert_eq!(loc.range.start, Position::new(9, 7));
+            assert_eq!(loc.range.end, Position::new(9, 10));
+        } else {
+            panic!("Expected Scalar response for C-style for-loop variable `idx`");
+        }
+
+        // 4. Jump to `choice` from `$choice` on line 14, char 12
+        let def_choice = find_definition(text, &uri, Position::new(14, 12)).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = def_choice {
+            assert_eq!(loc.range.start, Position::new(13, 7));
+            assert_eq!(loc.range.end, Position::new(13, 13));
+        } else {
+            panic!("Expected Scalar response for select variable `choice`");
+        }
+
+        // 5. Jump to `input_line` from `$input_line` on line 19, char 12
+        let def_read = find_definition(text, &uri, Position::new(19, 12)).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = def_read {
+            assert_eq!(loc.range.start, Position::new(18, 19));
+            assert_eq!(loc.range.end, Position::new(18, 29));
+        } else {
+            panic!("Expected Scalar response for read variable `input_line`");
+        }
+    }
+
+    #[test]
+    fn test_single_line_function_with_variable_definitions() {
+        let text = "inline_func() { INLINE_VAR=42; echo \"$INLINE_VAR\"; }\ninline_func\n";
+        let uri = Url::parse("file:///inline.zsh").unwrap();
+
+        // 1. Jump to inline_func from line 1
+        let def_fn = find_definition(text, &uri, Position::new(1, 4)).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = def_fn {
+            assert_eq!(loc.range.start, Position::new(0, 0));
+            assert_eq!(loc.range.end, Position::new(0, 11));
+        } else {
+            panic!("Expected Scalar response for inline_func");
+        }
+
+        // 2. Jump to INLINE_VAR from line 0, char 40 ($INLINE_VAR)
+        let def_var = find_definition(text, &uri, Position::new(0, 40)).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = def_var {
+            assert_eq!(loc.range.start, Position::new(0, 16));
+            assert_eq!(loc.range.end, Position::new(0, 26));
+        } else {
+            panic!("Expected Scalar response for INLINE_VAR");
+        }
+    }
+
+    #[test]
+    fn test_compound_and_multi_statement_source_jump() {
+        let temp = tempdir().unwrap();
+        let lib_a = temp.path().join("lib_a.zsh");
+        std::fs::write(&lib_a, "echo 'A'\n").unwrap();
+        let lib_b = temp.path().join("lib_b.zsh");
+        std::fs::write(&lib_b, "echo 'B'\n").unwrap();
+
+        let doc_path = temp.path().join("main.zsh");
+        let doc_uri = Url::from_file_path(&doc_path).unwrap();
+
+        let text = "[[ -f ./lib_a.zsh ]] && source ./lib_a.zsh; source ./lib_b.zsh\n";
+
+        // 1. Jump to lib_a from char 26 (on `source ./lib_a.zsh`)
+        let def_a = find_definition(text, &doc_uri, Position::new(0, 26)).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = def_a {
+            assert_eq!(
+                loc.uri,
+                Url::from_file_path(lib_a.canonicalize().unwrap()).unwrap()
+            );
+        } else {
+            panic!("Expected Scalar response for compound source lib_a");
+        }
+
+        // 2. Jump to lib_b from char 50 (on `source ./lib_b.zsh`)
+        let def_b = find_definition(text, &doc_uri, Position::new(0, 50)).unwrap();
+        if let GotoDefinitionResponse::Scalar(loc) = def_b {
+            assert_eq!(
+                loc.uri,
+                Url::from_file_path(lib_b.canonicalize().unwrap()).unwrap()
+            );
+        } else {
+            panic!("Expected Scalar response for second source lib_b on multi-statement line");
         }
     }
 }
