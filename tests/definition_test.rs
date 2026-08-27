@@ -830,3 +830,157 @@ async fn test_definition_surrogate_and_multibyte_integration() {
         panic!("Expected Scalar GotoDefinitionResponse");
     }
 }
+
+#[tokio::test]
+async fn test_definition_advanced_syntax_and_multi_statement() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let initialize_params = InitializeParams {
+        process_id: Some(123),
+        root_uri: None,
+        capabilities: ClientCapabilities::default(),
+        initialization_options: Some(json!({
+            "zshcs": {
+                "experimental": {
+                    "definition": true
+                }
+            }
+        })),
+        ..Default::default()
+    };
+
+    test_client
+        .send_request::<Initialize>(initialize_params)
+        .await
+        .unwrap();
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    let doc_uri = Url::parse("file:///advanced_def.zsh").unwrap();
+    let text = r#"
+# Advanced variable and function definitions
+BASE_DIR="/opt/app"; APP_PORT=9000
+local -r USER_NAME="admin"
+
+echo "Path: $BASE_DIR/config.json"
+echo "URL: http://localhost:$APP_PORT/api"
+echo "Greeting: ${USER_NAME:-guest}"
+echo "Upper: ${(U)USER_NAME}"
+"#;
+
+    test_client
+        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: doc_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: text.to_string(),
+            },
+        })
+        .await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    // 1. Jump to BASE_DIR from `$BASE_DIR/config.json` on line 5, char 14
+    let def_dir = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(5, 14),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    assert!(def_dir.is_some(), "Expected definition for BASE_DIR");
+    if let Some(GotoDefinitionResponse::Scalar(loc)) = def_dir {
+        assert_eq!(loc.uri, doc_uri);
+        assert_eq!(loc.range.start, Position::new(2, 0));
+        assert_eq!(loc.range.end, Position::new(2, 8));
+    } else {
+        panic!("Expected Scalar response for BASE_DIR");
+    }
+
+    // 2. Jump to APP_PORT from `$APP_PORT/api` on line 6, char 30 (on APP_PORT)
+    let def_port = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(6, 30),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    assert!(def_port.is_some(), "Expected definition for APP_PORT");
+    if let Some(GotoDefinitionResponse::Scalar(loc)) = def_port {
+        assert_eq!(loc.uri, doc_uri);
+        assert_eq!(loc.range.start, Position::new(2, 21));
+        assert_eq!(loc.range.end, Position::new(2, 29));
+    } else {
+        panic!("Expected Scalar response for APP_PORT");
+    }
+
+    // 3. Jump to USER_NAME from `${USER_NAME:-guest}` on line 7, char 20
+    let def_user = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(7, 20),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    assert!(def_user.is_some(), "Expected definition for USER_NAME");
+    if let Some(GotoDefinitionResponse::Scalar(loc)) = def_user {
+        assert_eq!(loc.uri, doc_uri);
+        assert_eq!(loc.range.start, Position::new(3, 9));
+        assert_eq!(loc.range.end, Position::new(3, 18));
+    } else {
+        panic!("Expected Scalar response for USER_NAME");
+    }
+
+    // 4. Jump to USER_NAME from ${(U)USER_NAME} on line 8, char 20
+    let def_upper = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(8, 20),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        def_upper.is_some(),
+        "Expected definition for ${{(U)USER_NAME}}"
+    );
+    if let Some(GotoDefinitionResponse::Scalar(loc)) = def_upper {
+        assert_eq!(loc.uri, doc_uri);
+        assert_eq!(loc.range.start, Position::new(3, 9));
+        assert_eq!(loc.range.end, Position::new(3, 18));
+    } else {
+        panic!("Expected Scalar response for ${{(U)USER_NAME}}");
+    }
+}
