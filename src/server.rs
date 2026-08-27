@@ -12,6 +12,7 @@ use tower_lsp::{Client, LanguageServer};
 
 use crate::completion::{CAPTURE_ZSH, CompletionRequest, ZPTYRC_ZSH, run_completion_daemon};
 use crate::config::Config;
+use crate::definition::find_definition;
 use crate::diagnostics::check_syntax;
 use crate::document::DocumentManager;
 use crate::error::{ZshcsError, ZshcsResult};
@@ -136,6 +137,10 @@ impl Backend {
     pub async fn is_hover_enabled(&self) -> bool {
         self.config.read().await.experimental_hover()
     }
+
+    pub async fn is_definition_enabled(&self) -> bool {
+        self.config.read().await.experimental_definition()
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -154,6 +159,7 @@ impl LanguageServer for Backend {
             tracing::info!(
                 experimental_diagnostics = initial_config.experimental_diagnostics(),
                 experimental_hover = initial_config.experimental_hover(),
+                experimental_definition = initial_config.experimental_definition(),
                 "Parsed initial server configuration"
             );
             *self.config.write().await = initial_config;
@@ -169,6 +175,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::INCREMENTAL, // Support Incremental sync
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
                     trigger_characters: Some(vec![
@@ -534,6 +541,45 @@ impl LanguageServer for Backend {
                 Ok(None)
             }
         }
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        if !self.is_definition_enabled().await {
+            tracing::debug!("Goto definition requested but experimental definition is disabled");
+            return Ok(None);
+        }
+
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        tracing::debug!(
+            uri = %uri,
+            line = position.line,
+            character = position.character,
+            "Goto definition request received"
+        );
+
+        let doc_text = match self.document_manager.get_content(&uri) {
+            Some(t) => t,
+            None => {
+                tracing::debug!(
+                    uri = %uri,
+                    "Document not found in document_manager for goto_definition"
+                );
+                return Ok(None);
+            }
+        };
+
+        let response = find_definition(&doc_text, &uri, position);
+        tracing::debug!(
+            uri = %uri,
+            found = response.is_some(),
+            "Goto definition result resolved"
+        );
+        Ok(response)
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {

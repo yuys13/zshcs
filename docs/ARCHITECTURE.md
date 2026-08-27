@@ -16,10 +16,11 @@ flowchart TB
 
     subgraph RustServer [Rust LSP Server Process (zshcs)]
         LSPBackend["LSP Backend (`src/server.rs`)<br/>• LanguageServer Trait<br/>• Request Routing & Commands"]
-        ConfigMgr["Config Subsystem (`src/config.rs`)<br/>• Opt-In Schema Parsing<br/>• Experimental Diagnostics & Hover Flags"]
+        ConfigMgr["Config Subsystem (`src/config.rs`)<br/>• Opt-In Schema Parsing<br/>• Experimental Diagnostics, Hover & Definition Flags"]
         DocMgr["DocumentManager (`src/document.rs`)<br/>• In-Memory Arc&lt;DashMap&lt;Url, DocumentState&gt;&gt;<br/>• Incremental Sync & UTF-16/UTF-8 Mapping"]
         DiagEngine["Diagnostics Engine (`src/diagnostics.rs`)<br/>• Non-blocking `zsh -n` Runner<br/>• Debounced Stderr Parser"]
         HoverEngine["Hover Engine (`src/hover.rs`)<br/>• Word Extraction & Range Mapping<br/>• Builtin & Reserved Words Dictionary<br/>• Async manpage Full-Text Retrieval"]
+        DefinitionEngine["Definition Engine (`src/definition.rs`)<br/>• Function, Variable & Source Resolvers<br/>• UTF-16 Code Unit Location Mapping"]
         Supervisor["Daemon Supervisor (`src/completion.rs`)<br/>• run_completion_daemon<br/>• HoL Cancellation & Timeout Guard<br/>• Process Recovery & chdir Sync"]
         Logging["Logging Subsystem (`src/logging.rs`)<br/>• tracing & tracing-subscriber<br/>• Stderr Destination & EnvFilter"]
         ErrHandling["Error Hierarchy (`src/error.rs`)<br/>• ZshcsError / ZshcsResult<br/>• Type-Safe Conversions"]
@@ -36,6 +37,7 @@ flowchart TB
     LSPBackend -->|Debounced Syntax Validation| DiagEngine
     DiagEngine -.->|publishDiagnostics| Editor
     LSPBackend -->|Cursor Word Hover Query| HoverEngine
+    LSPBackend -->|Definition Jump Query| DefinitionEngine
     LSPBackend -->|mpsc / oneshot| Supervisor
     RustServer -.->|Structured Logs (stderr)| Editor
     Supervisor <-->|Piped stdin/stdout (RPC: input / chdir)| CaptureScript
@@ -57,6 +59,7 @@ The entry point and server backend coordinate command-line argument parsing, LSP
 - **Capabilities Negotiation (`initialize`)**:
   - **Text Document Sync**: `TextDocumentSyncKind::INCREMENTAL` for fine-grained, low-latency diff synchronization.
   - **Hover Provider**: `HoverProviderCapability::Simple(true)` providing on-demand documentation lookups.
+  - **Definition Provider**: `Some(OneOf::Left(true))` providing opt-in `textDocument/definition` navigation.
   - **Trigger Characters**: Registers `["-", "$", "/", "~", ".", " "]` to trigger completions immediately upon typing flags, variables, directory paths, hidden files, or subcommands.
   - **Execute Command Provider**: Exposes custom command `zshcs/getDocumentContent` for internal document state inspection and integration testing.
 - **Dual Initialization Pathways**:
@@ -381,6 +384,40 @@ flowchart TD
 
 ---
 
+### 2.11 Experimental Definition Navigation Subsystem (`src/definition.rs`, `src/config.rs`)
+
+`zshcs` provides an opt-in, non-blocking definition jump engine (`textDocument/definition`) resolving shell functions, variable assignments, and external sourced files within Zsh scripts.
+
+- **Experimental Opt-In Configuration (`src/config.rs`)**:
+  - Disabled by default (`definition: false`) to ensure zero scanning and AST overhead for standard completion-only setups.
+  - Dynamically configured via LSP `initializationOptions` (startup) or `workspace/didChangeConfiguration` (runtime) using the schema:
+    ```json
+    {
+      "zshcs": {
+        "experimental": {
+          "definition": true
+        }
+      }
+    }
+    ```
+  - Also accepts flat `{ "experimental": { "definition": true } }` payloads.
+- **Three-Tier Definition Resolution**:
+  1. **Source / `.` Script Reference Navigation**:
+     - Detects when the cursor rests on `source <path>` or `. <path>` commands.
+     - Strips single and double quotes, handles tilde paths (`~`, `~/...`), and resolves relative paths against the active document's parent directory (`Url::to_file_path()`).
+     - If the target file exists on disk, returns `Location` pointing to line 0, column 0 of the resolved file URI.
+  2. **Shell Function Definition Scanning (`scan_function_definitions`)**:
+     - Scans the document line-by-line for standard shell function definition constructs:
+       - POSIX / Korn style: `func_name() { ... }` or `func_name () {`
+       - Zsh / Bash keyword style: `function func_name { ... }` or `function func_name() { ... }`
+     - Skips commented lines (`# ...`) and returns precise 0-indexed UTF-16 line and character ranges pointing to the function identifier.
+  3. **Shell Variable Declaration & Assignment Scanning (`scan_variable_definitions`)**:
+     - Resolves variable references (`$VAR`, `${VAR}`, or `VAR`).
+     - Scans for direct assignments (`VAR=...`, `VAR+=...`) and keyword declarations (`export`, `typeset`, `local`, `declare`, `readonly`, `integer`, `float`).
+     - Employs quote- and paren-aware token splitting (`split_declaration_tokens`) to accurately locate variable names even in multi-variable declarations (`local -r A="hello" B=20`) and array declarations (`typeset -a ARR=(1 2 3)`).
+
+---
+
 ## 3. Detailed Data Flow & Protocols
 
 ### 3.1 Completion Request Lifecycle
@@ -507,6 +544,41 @@ sequenceDiagram
 
 ---
 
+### 3.4 Experimental Definition Request Lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Editor User
+    participant Client as LSP Client
+    participant Server as Backend (`src/server.rs`)
+    participant DocMgr as DocumentManager (`src/document.rs`)
+    participant Def as Definition Engine (`src/definition.rs`)
+
+    User->>Client: Go to definition (gd / textDocument/definition)
+    Client->>Server: textDocument/definition (uri, position)
+    alt Experimental Definition Disabled (default)
+        Server-->>Client: Ok(None) (Zero overhead)
+    else Experimental Definition Enabled
+        Server->>DocMgr: get_content(uri)
+        DocMgr-->>Server: Some(doc_text)
+        Server->>Def: find_definition(doc_text, uri, position)
+        alt Cursor on source / . statement
+            Def->>Def: resolve_source_path(path, uri)
+            Def-->>Server: Some(GotoDefinitionResponse::Scalar(Location { target_file_uri, range: 0:0 }))
+        else Cursor on function / variable identifier
+            Def->>Def: scan_function_definitions / scan_variable_definitions
+            Def-->>Server: Some(GotoDefinitionResponse (Scalar / Array))
+        else No definition found
+            Def-->>Server: None
+        end
+        Server-->>Client: Ok(definition_response)
+        Client-->>User: Jump to definition location
+    end
+```
+
+---
+
 ## 4. Testing, QA & Quality Gates
 
 `zshcs` enforces quality assurance through a multi-tier testing and verification architecture:
@@ -538,7 +610,8 @@ flowchart LR
 ### 4.1 Test Suites Overview
 
 1. **Rust Integration & Unit Test Suites**:
-   - `tests/hover_test.rs` (6 tests): Validates experimental hover documentation opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, builtin/reserved word markdown rendering, external command `man` page retrieval in code blocks, and whitespace/out-of-bounds cursor handling.
+   - `tests/definition_test.rs` (8 tests): Validates experimental definition provider opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, function definition jumping, external script source jumping (`source` / `.`), variable declaration and assignment jumping, and edge case handling (unopened buffers, comments, whitespace, nonexistent targets).
+   - `tests/hover_test.rs` (8 tests): Validates experimental hover documentation opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, builtin/reserved word markdown rendering, external command `man` page retrieval in code blocks, and whitespace/out-of-bounds cursor handling.
    - `tests/diagnostics_test.rs` (9 tests): Validates experimental syntax diagnostics opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, syntax error reporting, error clearing on fix, buffer closing cleanup, and edit debouncing.
    - `tests/completion_test.rs` (37 tests): Validates LSP completions, consecutive requests, dynamic item kinds, working directory switching, crash recovery, timeout handling, and CRLF / multibyte buffers.
    - `tests/server_test.rs` (34 tests): Tests initialize handshake, capabilities negotiation, incremental synchronization, out-of-order versions, invalid ranges, document close cleanup, and custom execution commands.
