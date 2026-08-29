@@ -16,11 +16,12 @@ flowchart TB
 
     subgraph RustServer [Rust LSP Server Process (zshcs)]
         LSPBackend["LSP Backend (`src/server.rs`)<br/>• LanguageServer Trait<br/>• Request Routing & Commands"]
-        ConfigMgr["Config Subsystem (`src/config.rs`)<br/>• Opt-In Schema Parsing<br/>• Experimental Diagnostics, Hover & Definition Flags"]
+        ConfigMgr["Config Subsystem (`src/config.rs`)<br/>• Opt-In Schema Parsing<br/>• Experimental Diagnostics, Hover, Definition & Symbols Flags"]
         DocMgr["DocumentManager (`src/document.rs`)<br/>• In-Memory Arc&lt;DashMap&lt;Url, DocumentState&gt;&gt;<br/>• Incremental Sync & UTF-16/UTF-8 Mapping"]
         DiagEngine["Diagnostics Engine (`src/diagnostics.rs`)<br/>• Non-blocking `zsh -n` Runner<br/>• Debounced Stderr Parser"]
         HoverEngine["Hover Engine (`src/hover.rs`)<br/>• Word Extraction & Range Mapping<br/>• Builtin & Reserved Words Dictionary<br/>• Async manpage Full-Text Retrieval"]
         DefinitionEngine["Definition Engine (`src/definition.rs`)<br/>• Function, Variable & Source Resolvers<br/>• UTF-16 Code Unit Location Mapping"]
+        SymbolsEngine["Document Symbol Engine (`src/symbols.rs`)<br/>• Function, Variable & Alias Extraction<br/>• Hierarchical Symbol Tree & UTF-16 Bounds"]
         Supervisor["Daemon Supervisor (`src/completion.rs`)<br/>• run_completion_daemon<br/>• HoL Cancellation & Timeout Guard<br/>• Process Recovery & chdir Sync"]
         Logging["Logging Subsystem (`src/logging.rs`)<br/>• tracing & tracing-subscriber<br/>• Stderr Destination & EnvFilter"]
         ErrHandling["Error Hierarchy (`src/error.rs`)<br/>• ZshcsError / ZshcsResult<br/>• Type-Safe Conversions"]
@@ -38,6 +39,7 @@ flowchart TB
     DiagEngine -.->|publishDiagnostics| Editor
     LSPBackend -->|Cursor Word Hover Query| HoverEngine
     LSPBackend -->|Definition Jump Query| DefinitionEngine
+    LSPBackend -->|Document Symbol Outline Query| SymbolsEngine
     LSPBackend -->|mpsc / oneshot| Supervisor
     RustServer -.->|Structured Logs (stderr)| Editor
     Supervisor <-->|Piped stdin/stdout (RPC: input / chdir)| CaptureScript
@@ -60,6 +62,7 @@ The entry point and server backend coordinate command-line argument parsing, LSP
   - **Text Document Sync**: `TextDocumentSyncKind::INCREMENTAL` for fine-grained, low-latency diff synchronization.
   - **Hover Provider**: `HoverProviderCapability::Simple(true)` providing on-demand documentation lookups.
   - **Definition Provider**: `Some(OneOf::Left(true))` providing opt-in `textDocument/definition` navigation.
+  - **Document Symbol Provider**: `Some(OneOf::Left(true))` providing opt-in `textDocument/documentSymbol` outline generation.
   - **Trigger Characters**: Registers `["-", "$", "/", "~", ".", " "]` to trigger completions immediately upon typing flags, variables, directory paths, hidden files, or subcommands.
   - **Execute Command Provider**: Exposes custom command `zshcs/getDocumentContent` for internal document state inspection and integration testing.
 - **Dual Initialization Pathways**:
@@ -418,6 +421,44 @@ flowchart TD
 
 ---
 
+### 2.12 Experimental Document Symbol Subsystem (`src/symbols.rs`, `src/config.rs`)
+
+`zshcs` provides an opt-in, zero-overhead document symbol engine (`textDocument/documentSymbol`) extracting shell functions, variable and constant declarations, and alias definitions into an editor-navigable hierarchical symbol tree.
+
+- **Experimental Opt-In Configuration (`src/config.rs`)**:
+  - Disabled by default (`symbols: false`) to ensure zero scanning and AST overhead for standard completion-only setups.
+  - Dynamically configured via LSP `initializationOptions` (startup) or `workspace/didChangeConfiguration` (runtime) using the schema:
+    ```json
+    {
+      "zshcs": {
+        "experimental": {
+          "symbols": true
+        }
+      }
+    }
+    ```
+  - Also accepts flat `{ "experimental": { "symbols": true } }` payloads.
+- **Three-Tier Symbol Extraction (`extract_document_symbols`)**:
+  1. **Shell Function Extraction (`SymbolKind::FUNCTION`)**:
+     - Scans for POSIX syntax (`func() { ... }`, `func () { ... }`) and keyword syntax (`function func { ... }`, `function func() { ... }`).
+     - Accurately tracks nested braces (`{ ... }`), string literals (`"..."`, `'...'`, `` `...` ``), escape characters, and comments to compute the full function range from start statement to matching closing `}`.
+     - Sets `selection_range` pointing to the exact function identifier.
+  2. **Variable & Constant Declaration Extraction (`SymbolKind::VARIABLE`)**:
+     - Captures keyword declarations: `export`, `typeset` (including `-g` global and `-a` array), `local`, `declare`, `readonly`, `integer`, and `float`.
+     - Captures direct assignments: `VAR=...`, `VAR+=...`, `VAR[k]=...`, and array assignments `VAR=(...)`.
+     - Sets `selection_range` to the variable name and `range` to the declaration/assignment token.
+  3. **Alias Definition Extraction (`SymbolKind::OPERATOR`)**:
+     - Captures standard aliases (`alias name='...'`), global aliases (`alias -g name='...'`), suffix aliases (`alias -s name=...`), and multi-alias declarations on single lines.
+     - Sets `selection_range` to the alias identifier name and `detail` to the alias expansion target.
+- **Hierarchical Tree Construction (`build_symbol_tree`)**:
+  - Employs a stack-based algorithm sorting symbols by starting coordinates (with larger enclosing spans prioritized).
+  - Automatically nests local variables, inner aliases, and nested functions inside their enclosing function's `children` array while maintaining top-level symbols in document order.
+- **Robustness & UTF-16 Multi-Byte Safety**:
+  - Converts all line/column positions to LSP UTF-16 code units via `byte_to_utf16_col`, correctly handling multi-byte CJK ideographs, surrogate pairs, and emoji sequences.
+  - Tolerates unclosed braces, syntax errors, and malformed statements gracefully without panic.
+
+---
+
 ## 3. Detailed Data Flow & Protocols
 
 ### 3.1 Completion Request Lifecycle
@@ -579,6 +620,37 @@ sequenceDiagram
 
 ---
 
+### 3.5 Experimental Document Symbol Request Lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Editor User
+    participant Client as LSP Client
+    participant Server as Backend (`src/server.rs`)
+    participant DocMgr as DocumentManager (`src/document.rs`)
+    participant Sym as Document Symbol Engine (`src/symbols.rs`)
+
+    User->>Client: Open file / Request document symbols (outline tree)
+    Client->>Server: textDocument/documentSymbol (uri)
+    alt Experimental Symbols Disabled (default)
+        Server-->>Client: Ok(None) (Zero overhead)
+    else Experimental Symbols Enabled
+        Server->>DocMgr: get_content(uri)
+        DocMgr-->>Server: Some(doc_text)
+        Server->>Sym: extract_document_symbols(doc_text, uri)
+        Sym->>Sym: Scan functions (POSIX & keyword style)
+        Sym->>Sym: Scan variable declarations & assignments
+        Sym->>Sym: Scan alias definitions
+        Sym->>Sym: build_symbol_tree (hierarchical nesting)
+        Sym-->>Server: Vec<DocumentSymbol>
+        Server-->>Client: Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+        Client-->>User: Render document outline tree / breadcrumbs
+    end
+```
+
+---
+
 ## 4. Testing, QA & Quality Gates
 
 `zshcs` enforces quality assurance through a multi-tier testing and verification architecture:
@@ -610,6 +682,7 @@ flowchart LR
 ### 4.1 Test Suites Overview
 
 1. **Rust Integration & Unit Test Suites**:
+   - `tests/symbols_test.rs` (7 tests): Validates experimental document symbol provider opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, function/variable/alias extraction, hierarchical nesting of local variables and inner functions, flat/nested settings schema compatibility, and unopened document handling.
    - `tests/definition_test.rs` (10 tests): Validates experimental definition provider opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, function definition jumping, external script source jumping (`source` / `.`), compound source statements, variable declaration/assignment/loop/read variable jumping, multi-statement lines, nested parameter expansions with flags, and edge case handling (unopened buffers, comments, whitespace, nonexistent targets).
    - `tests/hover_test.rs` (8 tests): Validates experimental hover documentation opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, builtin/reserved word markdown rendering, external command `man` page retrieval in code blocks, and whitespace/out-of-bounds cursor handling.
    - `tests/diagnostics_test.rs` (9 tests): Validates experimental syntax diagnostics opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, syntax error reporting, error clearing on fix, buffer closing cleanup, and edit debouncing.

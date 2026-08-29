@@ -17,6 +17,7 @@ use crate::diagnostics::check_syntax;
 use crate::document::DocumentManager;
 use crate::error::{ZshcsError, ZshcsResult};
 use crate::hover::{extract_word_at_position, get_hover_info};
+use crate::symbols::extract_document_symbols;
 
 #[derive(Debug)]
 pub struct Backend {
@@ -141,6 +142,10 @@ impl Backend {
     pub async fn is_definition_enabled(&self) -> bool {
         self.config.read().await.experimental_definition()
     }
+
+    pub async fn is_symbols_enabled(&self) -> bool {
+        self.config.read().await.experimental_symbols()
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -160,6 +165,7 @@ impl LanguageServer for Backend {
                 experimental_diagnostics = initial_config.experimental_diagnostics(),
                 experimental_hover = initial_config.experimental_hover(),
                 experimental_definition = initial_config.experimental_definition(),
+                experimental_symbols = initial_config.experimental_symbols(),
                 "Parsed initial server configuration"
             );
             *self.config.write().await = initial_config;
@@ -176,6 +182,7 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
                     trigger_characters: Some(vec![
@@ -580,6 +587,38 @@ impl LanguageServer for Backend {
             "Goto definition result resolved"
         );
         Ok(response)
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        if !self.is_symbols_enabled().await {
+            tracing::debug!("Document symbol requested but experimental symbols is disabled");
+            return Ok(None);
+        }
+
+        let uri = params.text_document.uri;
+        tracing::debug!(uri = %uri, "Document symbol request received");
+
+        let doc_text = match self.document_manager.get_content(&uri) {
+            Some(t) => t,
+            None => {
+                tracing::debug!(
+                    uri = %uri,
+                    "Document not found in document_manager for document_symbol"
+                );
+                return Ok(None);
+            }
+        };
+
+        let symbols = extract_document_symbols(&doc_text, &uri);
+        tracing::debug!(
+            uri = %uri,
+            count = symbols.len(),
+            "Document symbols extracted successfully"
+        );
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
