@@ -21,13 +21,16 @@ pub struct ExperimentalConfig {
     /// Whether experimental definition provider is enabled.
     #[serde(default)]
     pub definition: bool,
+    /// Whether experimental document symbol provider is enabled.
+    #[serde(default)]
+    pub symbols: bool,
 }
 
 impl Config {
     /// Parses configuration from an optional JSON value (e.g. `initializationOptions` or `settings`).
     ///
     /// Looks for `["zshcs"]["experimental"]["diagnostics"]`, `["zshcs"]["experimental"]["hover"]`,
-    /// and `["zshcs"]["experimental"]["definition"]` first,
+    /// `["zshcs"]["experimental"]["definition"]`, and `["zshcs"]["experimental"]["symbols"]` first,
     /// then `["settings"]["zshcs"]...`, and falls back to `["experimental"]...` if present.
     /// Defaults to `false` for experimental features.
     pub fn from_value(value: Option<&Value>) -> Self {
@@ -39,7 +42,7 @@ impl Config {
             return Self::default();
         }
 
-        // 1. Try parsing from `zshcs` key: {"zshcs": {"experimental": {"diagnostics": true, "hover": true, "definition": true}}}
+        // 1. Try parsing from `zshcs` key: {"zshcs": {"experimental": {"diagnostics": true, "hover": true, "definition": true, "symbols": true}}}
         if let Some(zshcs_val) = val.get("zshcs")
             && let Ok(config) = serde_json::from_value::<Config>(zshcs_val.clone())
         {
@@ -51,7 +54,7 @@ impl Config {
             return Self::from_value(Some(settings_val));
         }
 
-        // 3. Try parsing root object directly: {"experimental": {"diagnostics": true, "hover": true, "definition": true}}
+        // 3. Try parsing root object directly: {"experimental": {"diagnostics": true, "hover": true, "definition": true, "symbols": true}}
         if let Ok(config) = serde_json::from_value::<Config>(val.clone()) {
             return config;
         }
@@ -73,6 +76,11 @@ impl Config {
     pub fn experimental_definition(&self) -> bool {
         self.experimental.definition
     }
+
+    /// Returns true if experimental symbols is enabled.
+    pub fn experimental_symbols(&self) -> bool {
+        self.experimental.symbols
+    }
 }
 
 /// Extracts whether experimental diagnostics is enabled from an optional JSON value.
@@ -90,6 +98,11 @@ pub fn extract_experimental_definition(value: Option<&Value>) -> bool {
     Config::from_value(value).experimental_definition()
 }
 
+/// Extracts whether experimental symbols is enabled from an optional JSON value.
+pub fn extract_experimental_symbols(value: Option<&Value>) -> bool {
+    Config::from_value(value).experimental_symbols()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +117,8 @@ mod tests {
         assert!(!config.experimental_hover());
         assert!(!config.experimental.definition);
         assert!(!config.experimental_definition());
+        assert!(!config.experimental.symbols);
+        assert!(!config.experimental_symbols());
     }
 
     #[test]
@@ -250,12 +265,13 @@ mod tests {
                 diagnostics: true,
                 hover: true,
                 definition: true,
+                symbols: true,
             },
         };
         let val = serde_json::to_value(&config).unwrap();
         assert_eq!(
             val,
-            json!({ "experimental": { "diagnostics": true, "hover": true, "definition": true } })
+            json!({ "experimental": { "diagnostics": true, "hover": true, "definition": true, "symbols": true } })
         );
 
         let deserialized = Config::from_value(Some(&val));
@@ -464,5 +480,107 @@ mod tests {
             }
         });
         assert!(!extract_experimental_definition(Some(&val3)));
+    }
+
+    #[test]
+    fn test_extract_symbols_none_and_null() {
+        assert!(!extract_experimental_symbols(None));
+        let val_null = json!(null);
+        assert!(!extract_experimental_symbols(Some(&val_null)));
+        let val_empty = json!({});
+        assert!(!extract_experimental_symbols(Some(&val_empty)));
+    }
+
+    #[test]
+    fn test_extract_symbols_nested_zshcs() {
+        let val = json!({
+            "zshcs": {
+                "experimental": {
+                    "symbols": true
+                }
+            }
+        });
+        let config = Config::from_value(Some(&val));
+        assert!(config.experimental_symbols());
+        assert!(extract_experimental_symbols(Some(&val)));
+
+        let val_false = json!({
+            "zshcs": {
+                "experimental": {
+                    "symbols": false
+                }
+            }
+        });
+        let config_false = Config::from_value(Some(&val_false));
+        assert!(!config_false.experimental_symbols());
+        assert!(!extract_experimental_symbols(Some(&val_false)));
+    }
+
+    #[test]
+    fn test_extract_symbols_direct_experimental() {
+        let val = json!({
+            "experimental": {
+                "symbols": true
+            }
+        });
+        let config = Config::from_value(Some(&val));
+        assert!(config.experimental_symbols());
+        assert!(extract_experimental_symbols(Some(&val)));
+
+        let val_false = json!({
+            "experimental": {
+                "symbols": false
+            }
+        });
+        let config_false = Config::from_value(Some(&val_false));
+        assert!(!config_false.experimental_symbols());
+        assert!(!extract_experimental_symbols(Some(&val_false)));
+    }
+
+    #[test]
+    fn test_extract_symbols_nested_settings_wrapper() {
+        let val = json!({
+            "settings": {
+                "zshcs": {
+                    "experimental": {
+                        "symbols": true
+                    }
+                }
+            }
+        });
+        let config = Config::from_value(Some(&val));
+        assert!(config.experimental_symbols());
+        assert!(extract_experimental_symbols(Some(&val)));
+
+        let val_false = json!({
+            "settings": {
+                "zshcs": {
+                    "experimental": {
+                        "symbols": false
+                    }
+                }
+            }
+        });
+        let config_false = Config::from_value(Some(&val_false));
+        assert!(!config_false.experimental_symbols());
+        assert!(!extract_experimental_symbols(Some(&val_false)));
+    }
+
+    #[test]
+    fn test_extract_symbols_invalid_types() {
+        let val1 = json!("invalid string");
+        assert!(!extract_experimental_symbols(Some(&val1)));
+
+        let val2 = json!(456);
+        assert!(!extract_experimental_symbols(Some(&val2)));
+
+        let val3 = json!({
+            "zshcs": {
+                "experimental": {
+                    "symbols": "not a boolean"
+                }
+            }
+        });
+        assert!(!extract_experimental_symbols(Some(&val3)));
     }
 }

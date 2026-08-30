@@ -9,12 +9,13 @@ pub mod error;
 pub mod hover;
 pub mod logging;
 pub mod server;
+pub mod symbols;
 
 pub use cli::{Cli, Commands};
 pub use completion::{CAPTURE_ZSH, ZPTYRC_ZSH, infer_completion_kind};
 pub use config::{
     Config, ExperimentalConfig, extract_experimental_definition, extract_experimental_diagnostics,
-    extract_experimental_hover,
+    extract_experimental_hover, extract_experimental_symbols,
 };
 pub use definition::{
     DeclarationToken, DefinitionTarget, StatementSpan, byte_to_utf16_col,
@@ -41,3 +42,4 @@ pub use hover::{
 };
 pub use logging::{create_env_filter, init_logging, try_init_logging};
 pub use server::Backend;
+pub use symbols::extract_document_symbols;
