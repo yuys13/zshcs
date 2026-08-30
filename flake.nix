@@ -33,10 +33,6 @@
           ...
         }:
         let
-          pkgs = import inputs.nixpkgs {
-            inherit system;
-            overlays = [ (import inputs.rust-overlay) ];
-          };
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           rustPlatform = pkgs.makeRustPlatform {
             cargo = rustToolchain;
@@ -44,6 +40,11 @@
           };
         in
         {
+          _module.args.pkgs = import inputs.nixpkgs {
+            inherit system;
+            overlays = [ (import inputs.rust-overlay) ];
+          };
+
           treefmt.config = {
             projectRootFile = "flake.nix";
             programs = {
@@ -65,18 +66,17 @@
               lockFile = ./Cargo.lock;
             };
 
-            nativeBuildInputs = [
-              pkgs.zsh
-              pkgs.git
-              pkgs.man-db
-              pkgs.man-pages
+            nativeBuildInputs = with pkgs; [
+              git
+              man-db
+              man-pages
+              zsh
             ];
 
             preCheck = ''
               export HOME=$TMPDIR
               export MANPATH="${pkgs.git}/share/man:${pkgs.man-pages}/share/man:$MANPATH"
             '';
-
           };
 
           apps.default = {
@@ -88,8 +88,6 @@
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
               rustToolchain
-              openssl
-              pkg-config
               zsh
             ];
 
