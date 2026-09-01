@@ -1,0 +1,22 @@
+name: Nix DevShell Diff
+on:
+  pull_request:
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  devshell-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: natsukium/nix-diff-action@4091452e4c7b3c7ea4ecbaec84be7f0066d810d7 # v1.1.1
+        with:
+          comment-strategy: update
+          attributes: |
+            - displayName: devShell (x86_64-linux)
+              attribute: devShells.x86_64-linux.default
+            - displayName: devShell (aarch64-linux)
+              attribute: devShells.aarch64-linux.default
+            - displayName: devShell (aarch64-darwin)
+              attribute: devShells.aarch64-darwin.default
