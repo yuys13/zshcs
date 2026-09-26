@@ -10,7 +10,9 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::completion::{CAPTURE_ZSH, CompletionRequest, ZPTYRC_ZSH, run_completion_daemon};
+use crate::completion::{
+    CAPTURE_ZSH, CompletionRequest, ZPTYRC_ZSH, resolve_completion_item, run_completion_daemon,
+};
 use crate::config::Config;
 use crate::definition::find_definition;
 use crate::diagnostics::check_syntax;
@@ -184,7 +186,7 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
-                    resolve_provider: Some(false),
+                    resolve_provider: Some(true),
                     trigger_characters: Some(vec![
                         "-".to_string(),
                         "$".to_string(),
@@ -495,6 +497,16 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn completion_resolve(&self, params: CompletionItem) -> Result<CompletionItem> {
+        tracing::debug!(
+            label = %params.label,
+            ?params.kind,
+            "completionItem/resolve request received"
+        );
+        let resolved = resolve_completion_item(params);
+        Ok(resolved)
+    }
+
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         if !self.is_hover_enabled().await {
             tracing::debug!("Hover requested but experimental hover is disabled");
@@ -740,5 +752,19 @@ mod tests {
         let res = service.inner().execute_command(params).await;
         assert!(res.is_ok());
         assert!(res.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_backend_completion_resolve() {
+        let (service, _socket) = LspService::new(|client| Backend::new(client).unwrap());
+        let item = CompletionItem {
+            label: "cd".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+        let res = service.inner().completion_resolve(item).await;
+        assert!(res.is_ok());
+        let resolved = res.unwrap();
+        assert!(resolved.documentation.is_some());
     }
 }

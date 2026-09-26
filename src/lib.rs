@@ -12,7 +12,7 @@ pub mod server;
 pub mod symbols;
 
 pub use cli::{Cli, Commands};
-pub use completion::{CAPTURE_ZSH, ZPTYRC_ZSH, infer_completion_kind};
+pub use completion::{CAPTURE_ZSH, ZPTYRC_ZSH, infer_completion_kind, resolve_completion_item};
 pub use config::{
     Config, ExperimentalConfig, extract_experimental_definition, extract_experimental_diagnostics,
     extract_experimental_hover, extract_experimental_symbols,

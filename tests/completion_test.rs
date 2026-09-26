@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower_lsp::LanguageServer;
 use tower_lsp::lsp_types::{
-    CompletionParams, CompletionResponse, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    Position, Range, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, Documentation, MarkupKind, Position,
+    Range, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
     notification::{DidChangeTextDocument, LogMessage},
     request,
@@ -1827,4 +1828,116 @@ async fn test_zsh_script_unit_test_harness() {
         "Zsh script unit test harness failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(stdout.contains("All Zsh unit tests passed successfully!"));
+}
+
+#[tokio::test]
+async fn test_completion_resolve_builtin() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///resolve_builtin.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "echo").await;
+
+    let item = CompletionItem {
+        label: "echo".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        ..Default::default()
+    };
+
+    let resolved = test_client
+        .send_request::<request::ResolveCompletionItem>(item)
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.label, "echo");
+    match resolved.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.contains("echo"));
+            assert!(
+                markup
+                    .value
+                    .contains("Write arguments to the standard output.")
+            );
+        }
+        other => panic!("Expected MarkupContent documentation, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_completion_resolve_reserved_word() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///resolve_reserved.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "if").await;
+
+    let item = CompletionItem {
+        label: "if".to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        ..Default::default()
+    };
+
+    let resolved = test_client
+        .send_request::<request::ResolveCompletionItem>(item)
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.label, "if");
+    match resolved.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.contains("### `if` (Zsh Reserved Word)"));
+            assert!(
+                markup
+                    .value
+                    .contains("Execute command list conditionally based on exit status.")
+            );
+        }
+        other => panic!("Expected MarkupContent documentation, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_completion_resolve_fallback_and_passthrough() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///resolve_fallback.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "some_cmd").await;
+
+    // Unknown command
+    let unknown_item = CompletionItem {
+        label: "nonexistent_custom_cmd".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        detail: Some("custom detail".to_string()),
+        ..Default::default()
+    };
+
+    let resolved_unknown = test_client
+        .send_request::<request::ResolveCompletionItem>(unknown_item.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(resolved_unknown.label, "nonexistent_custom_cmd");
+    assert_eq!(resolved_unknown.kind, Some(CompletionItemKind::FUNCTION));
+    assert_eq!(resolved_unknown.detail, Some("custom detail".to_string()));
+    assert_eq!(resolved_unknown.documentation, None);
+
+    // File path item
+    let file_item = CompletionItem {
+        label: "cd".to_string(),
+        kind: Some(CompletionItemKind::FILE),
+        detail: Some("regular file".to_string()),
+        ..Default::default()
+    };
+
+    let resolved_file = test_client
+        .send_request::<request::ResolveCompletionItem>(file_item.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(resolved_file.label, "cd");
+    assert_eq!(resolved_file.kind, Some(CompletionItemKind::FILE));
+    assert_eq!(resolved_file.documentation, None);
 }
