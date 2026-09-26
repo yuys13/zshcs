@@ -51,6 +51,7 @@ async fn test_initialize() {
         " ".to_string(),
     ];
     assert_eq!(completion_opts.trigger_characters, Some(expected_triggers));
+    assert_eq!(completion_opts.resolve_provider, Some(true));
 }
 
 #[tokio::test]

@@ -4,7 +4,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tower_lsp::Client;
-use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, MessageType};
+use tower_lsp::lsp_types::{
+    CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind, MessageType,
+};
 
 use crate::error::{ZshcsError, ZshcsResult};
 
@@ -322,6 +324,48 @@ pub fn parse_candidate_line(line: &str, items: &mut Vec<CompletionItem>) {
         detail,
         ..Default::default()
     });
+}
+
+/// Resolves detailed documentation for completion items on demand.
+///
+/// Builtin commands and reserved words are looked up in the static documentation dictionary.
+/// If matched, Markdown documentation is attached to `item.documentation`.
+/// Items that are non-command types (such as files, folders, or variables) or for which no
+/// documentation exists are returned unmodified.
+pub fn resolve_completion_item(mut item: CompletionItem) -> CompletionItem {
+    let has_doc = match &item.documentation {
+        Some(Documentation::String(s)) => !s.trim().is_empty(),
+        Some(Documentation::MarkupContent(m)) => !m.value.trim().is_empty(),
+        None => false,
+    };
+    if has_doc {
+        return item;
+    }
+
+    let trimmed_label = item.label.trim();
+    if trimmed_label.is_empty() {
+        return item;
+    }
+
+    if let Some(kind) = item.kind {
+        let is_eligible = matches!(
+            kind,
+            CompletionItemKind::FUNCTION | CompletionItemKind::KEYWORD | CompletionItemKind::TEXT
+        ) || (kind == CompletionItemKind::FOLDER && trimmed_label == ".");
+
+        if !is_eligible {
+            return item;
+        }
+    }
+
+    if let Some(doc) = crate::hover::get_builtin_or_reserved_doc(trimmed_label) {
+        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: doc.to_string(),
+        }));
+    }
+
+    item
 }
 
 #[cfg(test)]
@@ -791,5 +835,603 @@ mod tests {
         assert_eq!(items[0].detail.as_deref(), Some("show working tree status"));
         assert_eq!(items[0].insert_text, None);
         assert!(elapsed.as_secs() < 5);
+    }
+
+    #[test]
+    fn test_resolve_completion_item_builtins() {
+        let cases = vec![
+            ("cd", "Change the current working directory."),
+            ("echo", "Write arguments to the standard output."),
+            ("export", "Set export attribute for shell parameters."),
+            (
+                "pwd",
+                "Print the absolute path name of the current working directory.",
+            ),
+            ("setopt", "Set the specified shell options."),
+        ];
+
+        for (label, snippet) in cases {
+            let item = CompletionItem {
+                label: label.to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                ..Default::default()
+            };
+            let resolved = resolve_completion_item(item);
+            let doc = resolved
+                .documentation
+                .expect("Expected documentation for builtin");
+            match doc {
+                Documentation::MarkupContent(markup) => {
+                    assert_eq!(markup.kind, MarkupKind::Markdown);
+                    assert!(
+                        markup.value.contains(snippet),
+                        "Expected snippet '{}' in doc for '{}'",
+                        snippet,
+                        label
+                    );
+                }
+                Documentation::String(_) => panic!("Expected MarkupContent documentation"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_completion_item_reserved_words() {
+        let cases = vec![
+            (
+                "if",
+                "Execute command list conditionally based on exit status.",
+            ),
+            (
+                "while",
+                "Execute command list repeatedly as long as the test command returns status 0.",
+            ),
+            (
+                "function",
+                "Define a shell function with the specified name.",
+            ),
+            (
+                "for",
+                "Execute command list for each member in a list or arithmetic iteration.",
+            ),
+            (
+                "case",
+                "Execute command list corresponding to the first matching pattern.",
+            ),
+        ];
+
+        for (label, snippet) in cases {
+            let item = CompletionItem {
+                label: label.to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                ..Default::default()
+            };
+            let resolved = resolve_completion_item(item);
+            let doc = resolved
+                .documentation
+                .expect("Expected documentation for reserved word");
+            match doc {
+                Documentation::MarkupContent(markup) => {
+                    assert_eq!(markup.kind, MarkupKind::Markdown);
+                    assert!(
+                        markup.value.contains(snippet),
+                        "Expected snippet '{}' in doc for '{}'",
+                        snippet,
+                        label
+                    );
+                }
+                Documentation::String(_) => panic!("Expected MarkupContent documentation"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_completion_item_all_53_builtins_and_20_reserved_words() {
+        let builtins = [
+            "cd",
+            "echo",
+            "export",
+            "set",
+            "setopt",
+            "unsetopt",
+            "autoload",
+            "compadd",
+            "typeset",
+            "print",
+            "printf",
+            "source",
+            ".",
+            "eval",
+            "alias",
+            "unalias",
+            "read",
+            "return",
+            "exit",
+            "shift",
+            "test",
+            "trap",
+            "unset",
+            "local",
+            "declare",
+            "which",
+            "where",
+            "whence",
+            "type",
+            "bindkey",
+            "zstyle",
+            "zmodload",
+            "zpty",
+            "zparseopts",
+            "pushd",
+            "popd",
+            "dirs",
+            "pwd",
+            "history",
+            "fc",
+            "bg",
+            "fg",
+            "jobs",
+            "kill",
+            "wait",
+            "disown",
+            "exec",
+            "hash",
+            "rehash",
+            "umask",
+            "true",
+            "false",
+            ":",
+        ];
+        assert_eq!(builtins.len(), 53);
+
+        for b in builtins {
+            let kind = if b == "." {
+                CompletionItemKind::FOLDER
+            } else if b == ":" {
+                CompletionItemKind::TEXT
+            } else {
+                CompletionItemKind::FUNCTION
+            };
+            let item = CompletionItem {
+                label: b.to_string(),
+                kind: Some(kind),
+                ..Default::default()
+            };
+            let resolved = resolve_completion_item(item);
+            let doc = resolved
+                .documentation
+                .unwrap_or_else(|| panic!("Builtin '{b}' must be resolved with documentation"));
+            match doc {
+                Documentation::MarkupContent(markup) => {
+                    assert_eq!(markup.kind, MarkupKind::Markdown);
+                    assert!(
+                        markup.value.contains("Builtin") || markup.value.contains("Module"),
+                        "Doc for '{b}' should mention Builtin or Module"
+                    );
+                    assert!(
+                        markup.value.contains("```zsh"),
+                        "Doc for '{b}' should contain zsh syntax block"
+                    );
+                }
+                Documentation::String(_) => panic!("Expected MarkupContent documentation"),
+            }
+
+            // Verify resolution with CompletionItemKind::TEXT (default inferred kind without detail)
+            let text_item = CompletionItem {
+                label: b.to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                ..Default::default()
+            };
+            assert!(
+                resolve_completion_item(text_item).documentation.is_some(),
+                "Builtin '{b}' with TEXT kind must resolve documentation"
+            );
+
+            // Verify resolution with kind: None (client omitted kind)
+            let none_item = CompletionItem {
+                label: b.to_string(),
+                kind: None,
+                ..Default::default()
+            };
+            assert!(
+                resolve_completion_item(none_item).documentation.is_some(),
+                "Builtin '{b}' with kind: None must resolve documentation"
+            );
+        }
+
+        let reserved = [
+            "if",
+            "then",
+            "elif",
+            "else",
+            "fi",
+            "for",
+            "do",
+            "done",
+            "while",
+            "until",
+            "case",
+            "esac",
+            "select",
+            "function",
+            "repeat",
+            "time",
+            "coproc",
+            "nocorrect",
+            "foreach",
+            "end",
+        ];
+        assert_eq!(reserved.len(), 20);
+
+        for r in reserved {
+            let item = CompletionItem {
+                label: r.to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                ..Default::default()
+            };
+            let resolved = resolve_completion_item(item);
+            let doc = resolved.documentation.unwrap_or_else(|| {
+                panic!("Reserved word '{r}' must be resolved with documentation")
+            });
+            match doc {
+                Documentation::MarkupContent(markup) => {
+                    assert_eq!(markup.kind, MarkupKind::Markdown);
+                    assert!(
+                        markup.value.contains("Reserved Word"),
+                        "Doc for '{r}' should mention Reserved Word"
+                    );
+                    assert!(
+                        markup.value.contains("```zsh"),
+                        "Doc for '{r}' should contain zsh syntax block"
+                    );
+                }
+                Documentation::String(_) => panic!("Expected MarkupContent documentation"),
+            }
+
+            // Verify resolution with CompletionItemKind::TEXT (default inferred kind without detail)
+            let text_item = CompletionItem {
+                label: r.to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                ..Default::default()
+            };
+            assert!(
+                resolve_completion_item(text_item).documentation.is_some(),
+                "Reserved word '{r}' with TEXT kind must resolve documentation"
+            );
+
+            // Verify resolution with kind: None (client omitted kind)
+            let none_item = CompletionItem {
+                label: r.to_string(),
+                kind: None,
+                ..Default::default()
+            };
+            assert!(
+                resolve_completion_item(none_item).documentation.is_some(),
+                "Reserved word '{r}' with kind: None must resolve documentation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_completion_item_fallback_unrecognized() {
+        let unknown = CompletionItem {
+            label: "my_custom_unknown_binary".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some("custom command".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_completion_item(unknown.clone());
+        assert_eq!(resolved.documentation, None);
+        assert_eq!(resolved.label, unknown.label);
+        assert_eq!(resolved.kind, unknown.kind);
+        assert_eq!(resolved.detail, unknown.detail);
+    }
+
+    #[test]
+    fn test_resolve_completion_item_file_fallback() {
+        // Even if a file shares a name with a builtin (e.g., 'cd' or 'echo'), if kind is FILE,
+        // it must not be resolved to builtin documentation.
+        let file_item = CompletionItem {
+            label: "cd".to_string(),
+            kind: Some(CompletionItemKind::FILE),
+            ..Default::default()
+        };
+        let resolved = resolve_completion_item(file_item);
+        assert_eq!(resolved.documentation, None);
+
+        // Path candidate fallback
+        let path_item = CompletionItem {
+            label: "/usr/bin/cd".to_string(),
+            kind: Some(CompletionItemKind::FILE),
+            ..Default::default()
+        };
+        let resolved_path = resolve_completion_item(path_item);
+        assert_eq!(resolved_path.documentation, None);
+    }
+
+    #[test]
+    fn test_resolve_completion_item_preserves_existing_documentation() {
+        let item = CompletionItem {
+            label: "cd".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::String("pre-existing doc".to_string())),
+            ..Default::default()
+        };
+        let resolved = resolve_completion_item(item);
+        match resolved.documentation {
+            Some(Documentation::String(s)) => assert_eq!(s, "pre-existing doc"),
+            other => {
+                panic!("Expected pre-existing string documentation preserved, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_completion_item_special_builtins() {
+        // '.' builtin
+        let dot_item = CompletionItem {
+            label: ".".to_string(),
+            kind: Some(CompletionItemKind::FOLDER),
+            ..Default::default()
+        };
+        let resolved = resolve_completion_item(dot_item);
+        assert!(resolved.documentation.is_some());
+
+        // ':' builtin
+        let colon_item = CompletionItem {
+            label: ":".to_string(),
+            ..Default::default()
+        };
+        let resolved = resolve_completion_item(colon_item);
+        assert!(resolved.documentation.is_some());
+    }
+
+    #[test]
+    fn test_resolve_completion_item_edge_cases() {
+        // Empty label
+        let empty = CompletionItem {
+            label: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_completion_item(empty).documentation, None);
+
+        // Whitespace only label
+        let ws = CompletionItem {
+            label: "   ".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_completion_item(ws).documentation, None);
+
+        // Variable kind with builtin name
+        let var = CompletionItem {
+            label: "cd".to_string(),
+            kind: Some(CompletionItemKind::VARIABLE),
+            ..Default::default()
+        };
+        assert_eq!(resolve_completion_item(var).documentation, None);
+
+        // Folder kind with non-dot name
+        let folder = CompletionItem {
+            label: "cd".to_string(),
+            kind: Some(CompletionItemKind::FOLDER),
+            ..Default::default()
+        };
+        assert_eq!(resolve_completion_item(folder).documentation, None);
+
+        // Parent folder '..'
+        let parent_folder = CompletionItem {
+            label: "..".to_string(),
+            kind: Some(CompletionItemKind::FOLDER),
+            ..Default::default()
+        };
+        assert_eq!(resolve_completion_item(parent_folder).documentation, None);
+
+        // Snippet kind with builtin name
+        let snippet = CompletionItem {
+            label: "echo".to_string(),
+            kind: Some(CompletionItemKind::SNIPPET),
+            ..Default::default()
+        };
+        assert_eq!(resolve_completion_item(snippet).documentation, None);
+    }
+
+    #[test]
+    fn test_resolve_completion_item_empty_documentation_is_resolved() {
+        // Empty String documentation should not block resolution
+        let item_empty_str = CompletionItem {
+            label: "cd".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::String("".to_string())),
+            ..Default::default()
+        };
+        let resolved = resolve_completion_item(item_empty_str);
+        match resolved.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert_eq!(markup.kind, MarkupKind::Markdown);
+                assert!(
+                    markup
+                        .value
+                        .contains("Change the current working directory.")
+                );
+            }
+            other => {
+                panic!("Expected empty string doc to be resolved to MarkupContent, got {other:?}")
+            }
+        }
+
+        // Whitespace String documentation should not block resolution
+        let item_ws_str = CompletionItem {
+            label: "echo".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::String("   \n\t  ".to_string())),
+            ..Default::default()
+        };
+        let resolved_ws = resolve_completion_item(item_ws_str);
+        match resolved_ws.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert_eq!(markup.kind, MarkupKind::Markdown);
+                assert!(
+                    markup
+                        .value
+                        .contains("Write arguments to the standard output.")
+                );
+            }
+            other => panic!("Expected whitespace string doc to be resolved, got {other:?}"),
+        }
+
+        // Empty MarkupContent documentation should not block resolution
+        let item_empty_markup = CompletionItem {
+            label: "export".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "".to_string(),
+            })),
+            ..Default::default()
+        };
+        let resolved_markup = resolve_completion_item(item_empty_markup);
+        match resolved_markup.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert_eq!(markup.kind, MarkupKind::Markdown);
+                assert!(
+                    markup
+                        .value
+                        .contains("Set export attribute for shell parameters.")
+                );
+            }
+            other => panic!("Expected empty markup doc to be resolved, got {other:?}"),
+        }
+
+        // Whitespace-only MarkupContent should not block resolution
+        let item_ws_markup = CompletionItem {
+            label: "setopt".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "   \n\t  ".to_string(),
+            })),
+            ..Default::default()
+        };
+        let resolved_ws_markup = resolve_completion_item(item_ws_markup);
+        match resolved_ws_markup.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert_eq!(markup.kind, MarkupKind::Markdown);
+                assert!(markup.value.contains("Set the specified shell options."));
+            }
+            other => panic!("Expected whitespace markup doc to be resolved, got {other:?}"),
+        }
+
+        // Non-empty PlainText MarkupContent should be preserved as-is
+        let item_plain_markup = CompletionItem {
+            label: "cd".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Custom plain text doc for cd".to_string(),
+            })),
+            ..Default::default()
+        };
+        let resolved_plain_markup = resolve_completion_item(item_plain_markup);
+        match resolved_plain_markup.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert_eq!(markup.kind, MarkupKind::PlainText);
+                assert_eq!(markup.value, "Custom plain text doc for cd");
+            }
+            other => panic!("Expected plain text markup doc to be preserved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_completion_item_whitespace_in_label() {
+        // Leading and trailing whitespace in label
+        let item = CompletionItem {
+            label: "  echo  ".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+        let resolved = resolve_completion_item(item);
+        assert_eq!(resolved.label, "  echo  ");
+        assert!(resolved.documentation.is_some());
+
+        // Builtin dot '.' with whitespace
+        let dot_item = CompletionItem {
+            label: " . ".to_string(),
+            kind: Some(CompletionItemKind::FOLDER),
+            ..Default::default()
+        };
+        let resolved_dot = resolve_completion_item(dot_item);
+        assert_eq!(resolved_dot.label, " . ");
+        assert!(resolved_dot.documentation.is_some());
+    }
+
+    #[test]
+    fn test_resolve_completion_item_field_preservation() {
+        use tower_lsp::lsp_types::{
+            Command, CompletionItemLabelDetails, CompletionItemTag, InsertTextFormat, Position,
+            Range, TextEdit,
+        };
+
+        let original = CompletionItem {
+            label: "echo".to_string(),
+            label_details: Some(CompletionItemLabelDetails {
+                detail: Some(" (builtin)".to_string()),
+                description: Some("print args".to_string()),
+            }),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some("builtin command".to_string()),
+            documentation: None,
+            deprecated: Some(false),
+            preselect: Some(true),
+            sort_text: Some("0001".to_string()),
+            filter_text: Some("echo".to_string()),
+            insert_text: Some("echo $0".to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_mode: None,
+            text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+                new_text: "echo ".to_string(),
+            })),
+            additional_text_edits: Some(vec![TextEdit {
+                range: Range::new(Position::new(0, 4), Position::new(0, 4)),
+                new_text: "\n".to_string(),
+            }]),
+            command: Some(Command {
+                title: "Trigger Suggest".to_string(),
+                command: "editor.action.triggerSuggest".to_string(),
+                arguments: None,
+            }),
+            commit_characters: Some(vec![" ".to_string()]),
+            data: Some(serde_json::json!({
+                "source": "zshcs",
+                "custom_id": 999
+            })),
+            tags: Some(vec![CompletionItemTag::DEPRECATED]),
+        };
+
+        let resolved = resolve_completion_item(original.clone());
+
+        // Verify documentation was added
+        assert!(resolved.documentation.is_some());
+
+        // Verify every other single field was preserved exactly
+        assert_eq!(resolved.label, original.label);
+        assert_eq!(resolved.label_details, original.label_details);
+        assert_eq!(resolved.kind, original.kind);
+        assert_eq!(resolved.detail, original.detail);
+        assert_eq!(resolved.deprecated, original.deprecated);
+        assert_eq!(resolved.preselect, original.preselect);
+        assert_eq!(resolved.sort_text, original.sort_text);
+        assert_eq!(resolved.filter_text, original.filter_text);
+        assert_eq!(resolved.insert_text, original.insert_text);
+        assert_eq!(resolved.insert_text_format, original.insert_text_format);
+        assert_eq!(resolved.text_edit, original.text_edit);
+        assert_eq!(
+            resolved.additional_text_edits,
+            original.additional_text_edits
+        );
+        assert_eq!(resolved.command, original.command);
+        assert_eq!(resolved.commit_characters, original.commit_characters);
+        assert_eq!(resolved.data, original.data);
+        assert_eq!(resolved.tags, original.tags);
     }
 }

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower_lsp::LanguageServer;
 use tower_lsp::lsp_types::{
-    CompletionParams, CompletionResponse, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    Position, Range, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, Documentation, MarkupKind, Position,
+    Range, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
     notification::{DidChangeTextDocument, LogMessage},
     request,
@@ -1827,4 +1828,401 @@ async fn test_zsh_script_unit_test_harness() {
         "Zsh script unit test harness failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(stdout.contains("All Zsh unit tests passed successfully!"));
+}
+
+#[tokio::test]
+async fn test_completion_resolve_builtin() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///resolve_builtin.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "echo").await;
+
+    let item = CompletionItem {
+        label: "echo".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        ..Default::default()
+    };
+
+    let resolved = test_client
+        .send_request::<request::ResolveCompletionItem>(item)
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.label, "echo");
+    match resolved.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.contains("echo"));
+            assert!(
+                markup
+                    .value
+                    .contains("Write arguments to the standard output.")
+            );
+        }
+        other => panic!("Expected MarkupContent documentation, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_completion_resolve_reserved_word() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///resolve_reserved.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "if").await;
+
+    let item = CompletionItem {
+        label: "if".to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        ..Default::default()
+    };
+
+    let resolved = test_client
+        .send_request::<request::ResolveCompletionItem>(item)
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.label, "if");
+    match resolved.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.contains("### `if` (Zsh Reserved Word)"));
+            assert!(
+                markup
+                    .value
+                    .contains("Execute command list conditionally based on exit status.")
+            );
+        }
+        other => panic!("Expected MarkupContent documentation, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_completion_resolve_fallback_and_passthrough() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///resolve_fallback.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "some_cmd").await;
+
+    // Unknown command
+    let unknown_item = CompletionItem {
+        label: "nonexistent_custom_cmd".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        detail: Some("custom detail".to_string()),
+        ..Default::default()
+    };
+
+    let resolved_unknown = test_client
+        .send_request::<request::ResolveCompletionItem>(unknown_item.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(resolved_unknown.label, "nonexistent_custom_cmd");
+    assert_eq!(resolved_unknown.kind, Some(CompletionItemKind::FUNCTION));
+    assert_eq!(resolved_unknown.detail, Some("custom detail".to_string()));
+    assert_eq!(resolved_unknown.documentation, None);
+
+    // File path item
+    let file_item = CompletionItem {
+        label: "cd".to_string(),
+        kind: Some(CompletionItemKind::FILE),
+        detail: Some("regular file".to_string()),
+        ..Default::default()
+    };
+
+    let resolved_file = test_client
+        .send_request::<request::ResolveCompletionItem>(file_item.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(resolved_file.label, "cd");
+    assert_eq!(resolved_file.kind, Some(CompletionItemKind::FILE));
+    assert_eq!(resolved_file.documentation, None);
+}
+
+#[tokio::test]
+async fn test_completion_resolve_empty_doc_and_field_preservation() {
+    use tower_lsp::lsp_types::{
+        Command, CompletionItemLabelDetails, CompletionItemTag, InsertTextFormat, TextEdit,
+    };
+
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///resolve_fields.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "echo").await;
+
+    // Item with empty documentation placeholder and rich client metadata
+    let rich_item = CompletionItem {
+        label: "echo".to_string(),
+        label_details: Some(CompletionItemLabelDetails {
+            detail: Some(" [builtin]".to_string()),
+            description: Some("print args".to_string()),
+        }),
+        kind: Some(CompletionItemKind::FUNCTION),
+        detail: Some("builtin command".to_string()),
+        documentation: Some(Documentation::String("   ".to_string())),
+        deprecated: Some(false),
+        preselect: Some(true),
+        sort_text: Some("0010".to_string()),
+        filter_text: Some("echo".to_string()),
+        insert_text: Some("echo".to_string()),
+        insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+        insert_text_mode: None,
+        text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+            new_text: "echo ".to_string(),
+        })),
+        additional_text_edits: Some(vec![TextEdit {
+            range: Range::new(Position::new(0, 4), Position::new(0, 4)),
+            new_text: " \"$@\"".to_string(),
+        }]),
+        command: Some(Command {
+            title: "Notify".to_string(),
+            command: "editor.notify".to_string(),
+            arguments: None,
+        }),
+        commit_characters: Some(vec!["\n".to_string()]),
+        data: Some(serde_json::json!({
+            "trace_id": "xyz-789",
+            "score": 42
+        })),
+        tags: Some(vec![CompletionItemTag::DEPRECATED]),
+    };
+
+    let resolved = test_client
+        .send_request::<request::ResolveCompletionItem>(rich_item.clone())
+        .await
+        .unwrap();
+
+    // Verify documentation was successfully resolved into Markdown
+    match resolved.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.contains("### `echo` (Zsh Builtin)"));
+        }
+        other => panic!("Expected MarkupContent documentation, got {:?}", other),
+    }
+
+    // Verify all client metadata fields remain preserved
+    assert_eq!(resolved.label, rich_item.label);
+    assert_eq!(resolved.label_details, rich_item.label_details);
+    assert_eq!(resolved.kind, rich_item.kind);
+    assert_eq!(resolved.detail, rich_item.detail);
+    assert_eq!(resolved.deprecated, rich_item.deprecated);
+    assert_eq!(resolved.preselect, rich_item.preselect);
+    assert_eq!(resolved.sort_text, rich_item.sort_text);
+    assert_eq!(resolved.filter_text, rich_item.filter_text);
+    assert_eq!(resolved.insert_text, rich_item.insert_text);
+    assert_eq!(resolved.insert_text_format, rich_item.insert_text_format);
+    assert_eq!(resolved.text_edit, rich_item.text_edit);
+    assert_eq!(
+        resolved.additional_text_edits,
+        rich_item.additional_text_edits
+    );
+    assert_eq!(resolved.command, rich_item.command);
+    assert_eq!(resolved.commit_characters, rich_item.commit_characters);
+    assert_eq!(resolved.data, rich_item.data);
+    assert_eq!(resolved.tags, rich_item.tags);
+}
+
+#[tokio::test]
+async fn test_completion_resolve_e2e_pipeline() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while read -r line; do
+    if [[ "$line" == input:* ]]; then
+        printf "%s\n" "echo	builtin command"
+        printf "%s\n" "custom_app	executable binary"
+        printf "\x01EOC\x01\n"
+    fi
+done
+"#;
+
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///e2e_resolve.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "ec").await;
+
+    // 1. Request completion candidates
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 2),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert_eq!(items.len(), 2);
+
+    let echo_item = items
+        .iter()
+        .find(|item| item.label == "echo")
+        .expect("Expected 'echo' completion item");
+    assert_eq!(echo_item.kind, Some(CompletionItemKind::FUNCTION));
+    assert_eq!(echo_item.documentation, None);
+
+    let custom_item = items
+        .iter()
+        .find(|item| item.label == "custom_app")
+        .expect("Expected 'custom_app' completion item");
+    assert_eq!(custom_item.documentation, None);
+
+    // 2. Resolve 'echo' item directly from completion response
+    let resolved_echo = test_client
+        .send_request::<request::ResolveCompletionItem>(echo_item.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(resolved_echo.label, "echo");
+    match resolved_echo.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.contains("### `echo` (Zsh Builtin)"));
+            assert!(
+                markup
+                    .value
+                    .contains("Write arguments to the standard output.")
+            );
+        }
+        other => panic!("Expected MarkupContent for echo, got {:?}", other),
+    }
+
+    // 3. Resolve 'custom_app' item -> remains safe fallthrough with None
+    let resolved_custom = test_client
+        .send_request::<request::ResolveCompletionItem>(custom_item.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(resolved_custom.label, "custom_app");
+    assert_eq!(resolved_custom.documentation, None);
+}
+
+#[tokio::test]
+async fn test_completion_resolve_real_zsh_daemon_e2e() {
+    use tower_lsp::lsp_types::{
+        InitializeParams, InitializedParams, notification::Initialized, request::Initialize,
+    };
+
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    // 1. Handshake verification: Verify capabilities.completion_provider.resolve_provider == Some(true)
+    let init_result = test_client
+        .send_request::<Initialize>(InitializeParams::default())
+        .await
+        .unwrap();
+
+    let completion_opts = init_result
+        .capabilities
+        .completion_provider
+        .expect("Server capabilities must include completion_provider");
+    assert_eq!(
+        completion_opts.resolve_provider,
+        Some(true),
+        "completion_provider.resolve_provider must be true"
+    );
+
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+
+    // 2. Open document and query real Zsh completion for 'whi'
+    let doc_uri = Url::parse("file:///real_daemon_resolve.zsh").unwrap();
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidOpenTextDocument>(
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: "whi".to_string(),
+                },
+            },
+        )
+        .await;
+    test_client.read_notification::<LogMessage>().await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 3),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert!(
+        !items.is_empty(),
+        "Real daemon must return completion items for 'whi'"
+    );
+
+    // Find builtin 'which' candidate
+    let which_item = items
+        .iter()
+        .find(|item| item.label == "which")
+        .expect("Real daemon completion items must contain 'which'");
+    assert_eq!(which_item.documentation, None);
+
+    // Find reserved word 'while' candidate
+    let while_item = items
+        .iter()
+        .find(|item| item.label == "while")
+        .expect("Real daemon completion items must contain 'while'");
+    assert_eq!(while_item.documentation, None);
+
+    // 3. Resolve builtin 'which' candidate returned by real daemon
+    let resolved_which = test_client
+        .send_request::<request::ResolveCompletionItem>(which_item.clone())
+        .await
+        .unwrap();
+    assert_eq!(resolved_which.label, "which");
+    match resolved_which.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.contains("### `which` (Zsh Builtin)"));
+            assert!(
+                markup
+                    .value
+                    .contains("Locate and display information about commands.")
+            );
+        }
+        other => panic!("Expected MarkupContent for 'which', got {:?}", other),
+    }
+
+    // 4. Resolve reserved word 'while' candidate returned by real daemon
+    let resolved_while = test_client
+        .send_request::<request::ResolveCompletionItem>(while_item.clone())
+        .await
+        .unwrap();
+    assert_eq!(resolved_while.label, "while");
+    match resolved_while.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.contains("### `while` (Zsh Reserved Word)"));
+            assert!(markup.value.contains(
+                "Execute command list repeatedly as long as the test command returns status 0."
+            ));
+        }
+        other => panic!("Expected MarkupContent for 'while', got {:?}", other),
+    }
 }

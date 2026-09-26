@@ -60,10 +60,10 @@ The entry point and server backend coordinate command-line argument parsing, LSP
   - Supports the `doctor` subcommand (`zshcs doctor`) to inspect runtime prerequisites and environment health.
 - **Capabilities Negotiation (`initialize`)**:
   - **Text Document Sync**: `TextDocumentSyncKind::INCREMENTAL` for fine-grained, low-latency diff synchronization.
+  - **Completion Provider**: `CompletionOptions` configured with `resolve_provider: Some(true)` for on-demand Markdown documentation lookups (`completionItem/resolve`), and trigger characters `["-", "$", "/", "~", ".", " "]` to trigger completions immediately upon typing flags, variables, directory paths, hidden files, or subcommands.
   - **Hover Provider**: `HoverProviderCapability::Simple(true)` providing on-demand documentation lookups.
   - **Definition Provider**: `Some(OneOf::Left(true))` providing opt-in `textDocument/definition` navigation.
   - **Document Symbol Provider**: `Some(OneOf::Left(true))` providing opt-in `textDocument/documentSymbol` outline generation.
-  - **Trigger Characters**: Registers `["-", "$", "/", "~", ".", " "]` to trigger completions immediately upon typing flags, variables, directory paths, hidden files, or subcommands.
   - **Execute Command Provider**: Exposes custom command `zshcs/getDocumentContent` for internal document state inspection and integration testing.
 - **Dual Initialization Pathways**:
   - **Synchronous Constructors**: `Backend::new`, `Backend::new_with_scripts`, and `Backend::new_with_scripts_and_cache` provide immediate synchronous setup using standard file I/O (`std::fs`).
@@ -505,6 +505,14 @@ sequenceDiagram
         Supervisor->>Server: Send Ok(Vec<CompletionItem>) via oneshot
         Server-->>Client: CompletionResponse::Array(items)
         Client-->>User: Display completion popup
+
+        opt User focuses/selects candidate item (e.g., builtin or reserved word)
+            Client->>Server: completionItem/resolve (CompletionItem)
+            Server->>Server: resolve_completion_item(item)
+            Note over Server: Matches label against static builtins & reserved words<br/>Attaches Markdown documentation MarkupContent
+            Server-->>Client: Resolved CompletionItem (with documentation)
+            Client-->>User: Render rich Markdown documentation in detail pane
+        end
     end
 ```
 
@@ -686,12 +694,12 @@ flowchart LR
    - `tests/definition_test.rs` (10 tests): Validates experimental definition provider opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, function definition jumping, external script source jumping (`source` / `.`), compound source statements, variable declaration/assignment/loop/read variable jumping, multi-statement lines, nested parameter expansions with flags, and edge case handling (unopened buffers, comments, whitespace, nonexistent targets).
    - `tests/hover_test.rs` (8 tests): Validates experimental hover documentation opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, builtin/reserved word markdown rendering, external command `man` page retrieval in code blocks, and whitespace/out-of-bounds cursor handling.
    - `tests/diagnostics_test.rs` (9 tests): Validates experimental syntax diagnostics opt-in via `initializationOptions`, dynamic toggling via `workspace/didChangeConfiguration`, syntax error reporting, error clearing on fix, buffer closing cleanup, and edit debouncing.
-   - `tests/completion_test.rs` (37 tests): Validates LSP completions, consecutive requests, dynamic item kinds, working directory switching, crash recovery, timeout handling, and CRLF / multibyte buffers.
+   - `tests/completion_test.rs` (43 tests): Validates LSP completions, consecutive requests, dynamic item kinds, working directory switching, crash recovery, timeout handling, CRLF / multibyte buffers, and on-demand `completionItem/resolve` for builtins and reserved words with real Zsh daemon verification.
    - `tests/server_test.rs` (34 tests): Tests initialize handshake, capabilities negotiation, incremental synchronization, out-of-order versions, invalid ranges, document close cleanup, and custom execution commands.
    - `tests/logging_test.rs` (8 tests): Validates tracing subscriber initialization, `stderr` log routing, stdout JSON-RPC isolation, and dynamic `ZSHCS_LOG` / `RUST_LOG` filter evaluation.
    - `tests/cli_test.rs` (22 tests): Validates CLI flag parsing (`--stdio`, `--help`, `--version`), doctor subcommand parsing, duplicate detection, and process lifecycle over stdio.
    - `tests/doctor_test.rs` (24 tests): Validates the `doctor` health check subsystem, individual diagnostic checks (Zsh executable, zpty, zutil, cache dir permissions, capture dry-run), report formatting, and exit codes.
-   - `tests/stress_test.rs` (20 tests): High-concurrency stress testing with 50 simultaneous clients, 10,000-candidate volume parsing, channel saturation, rapid interleaved edit/completion bursts, and deterministic PRNG fuzzing for Unicode boundaries and surrogate pairs.
+   - `tests/stress_test.rs` (22 tests): High-concurrency stress testing with 50 simultaneous clients, concurrent `completionItem/resolve` load, 10,000-candidate volume parsing, channel saturation, rapid interleaved edit/completion bursts, deterministic PRNG fuzzing, and adversarial resolve inputs.
 2. **Zsh Script Unit Test Harness (`tests/zsh/run_tests.zsh`)**:
    - Executes 12 standalone unit test cases validating `capture.zsh` and `zptyrc.zsh` syntax (`zsh -n`), module loading (`zsh/zpty`, `zsh/zutil`), isolated cache creation, directory synchronization helpers (`_zshcs_chdir`), `compadd` delegation and interception hooks, and pty end-to-end query processing.
 3. **Statistical Performance Benchmarking (`benches/parser_benchmark.rs`)**:
