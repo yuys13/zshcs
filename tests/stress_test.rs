@@ -1248,3 +1248,52 @@ async fn test_stress_concurrent_50_clients_resolve() {
         h.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn test_stress_concurrent_50_clients_resolve_external_command_man_cache() {
+    use std::sync::Arc;
+    use zshcs::completion::{ManCache, resolve_completion_item_async};
+
+    let count = 50;
+    let barrier = Arc::new(Barrier::new(count));
+    let cache = Arc::new(ManCache::new());
+
+    // Warm up the shared cache once to avoid launching 50 concurrent man processes on constrained CI runners
+    let git_item = CompletionItem {
+        label: "git".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        ..Default::default()
+    };
+    let initial_resolved = resolve_completion_item_async(git_item.clone(), &cache).await;
+    assert!(initial_resolved.documentation.is_some());
+
+    let handles: Vec<_> = (0..count)
+        .map(|i| {
+            let b = barrier.clone();
+            let cache_clone = Arc::clone(&cache);
+            let item = git_item.clone();
+            tokio::spawn(async move {
+                b.wait().await; // Synchronize simultaneous resolve burst
+
+                let resolved = resolve_completion_item_async(item, &cache_clone).await;
+                match resolved.documentation {
+                    Some(Documentation::MarkupContent(ref markup)) => {
+                        assert_eq!(markup.kind, MarkupKind::Markdown);
+                        assert!(
+                            markup.value.to_lowercase().contains("git")
+                                || markup.value.to_lowercase().contains("repository")
+                        );
+                    }
+                    other => panic!("Client {i}: Expected MarkupContent for git, got {other:?}"),
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    assert!(cache.contains_key("git"));
+    assert!(cache.get("git").unwrap().is_some());
+}

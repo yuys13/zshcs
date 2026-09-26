@@ -11,7 +11,8 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::completion::{
-    CAPTURE_ZSH, CompletionRequest, ZPTYRC_ZSH, resolve_completion_item, run_completion_daemon,
+    CAPTURE_ZSH, CompletionRequest, ManCache, ZPTYRC_ZSH, resolve_completion_item_async,
+    run_completion_daemon,
 };
 use crate::config::Config;
 use crate::definition::find_definition;
@@ -28,6 +29,7 @@ pub struct Backend {
     _temp_dir: TempDir,
     completion_tx: mpsc::Sender<CompletionRequest>,
     config: Arc<RwLock<Config>>,
+    man_cache: Arc<ManCache>,
 }
 
 impl Backend {
@@ -75,6 +77,7 @@ impl Backend {
             _temp_dir: temp_dir,
             completion_tx: tx,
             config: Arc::new(RwLock::new(Config::default())),
+            man_cache: Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -122,6 +125,7 @@ impl Backend {
             _temp_dir: temp_dir,
             completion_tx: tx,
             config: Arc::new(RwLock::new(Config::default())),
+            man_cache: Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -131,6 +135,10 @@ impl Backend {
 
     pub fn config(&self) -> Arc<RwLock<Config>> {
         Arc::clone(&self.config)
+    }
+
+    pub fn man_cache(&self) -> Arc<ManCache> {
+        Arc::clone(&self.man_cache)
     }
 
     pub async fn is_diagnostics_enabled(&self) -> bool {
@@ -503,7 +511,7 @@ impl LanguageServer for Backend {
             ?params.kind,
             "completionItem/resolve request received"
         );
-        let resolved = resolve_completion_item(params);
+        let resolved = resolve_completion_item_async(params, &self.man_cache).await;
         Ok(resolved)
     }
 
@@ -766,5 +774,104 @@ mod tests {
         assert!(res.is_ok());
         let resolved = res.unwrap();
         assert!(resolved.documentation.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_backend_completion_resolve_external_command_caching() {
+        let (service, _socket) = LspService::new(|client| Backend::new(client).unwrap());
+        let backend = service.inner();
+
+        // 1. Resolve external command git
+        let git_item = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+        let res = backend.completion_resolve(git_item.clone()).await;
+        assert!(res.is_ok());
+        let resolved_git = res.unwrap();
+        match resolved_git.documentation {
+            Some(Documentation::MarkupContent(ref markup)) => {
+                assert_eq!(markup.kind, MarkupKind::Markdown);
+                assert!(markup.value.to_lowercase().contains("git"));
+            }
+            other => panic!("Expected MarkupContent for git, got {other:?}"),
+        }
+
+        // Cache must contain git
+        assert!(backend.man_cache().contains_key("git"));
+        assert!(backend.man_cache().get("git").unwrap().is_some());
+
+        // 2. Second resolve should hit cache
+        let res_cached = backend.completion_resolve(git_item).await;
+        assert!(res_cached.is_ok());
+        assert_eq!(
+            res_cached.unwrap().documentation,
+            resolved_git.documentation
+        );
+
+        // 3. Resolve nonexistent external command (negative caching)
+        let dummy = "nonexistent_backend_cmd_xyz123";
+        let dummy_item = CompletionItem {
+            label: dummy.to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+        let res_dummy = backend.completion_resolve(dummy_item.clone()).await;
+        assert!(res_dummy.is_ok());
+        assert_eq!(res_dummy.unwrap().documentation, None);
+
+        // Negative cache must contain None
+        assert!(backend.man_cache().contains_key(dummy));
+        assert_eq!(*backend.man_cache().get(dummy).unwrap(), None);
+
+        // 4. Second resolve of nonexistent command returns None from negative cache
+        let res_dummy_cached = backend.completion_resolve(dummy_item).await;
+        assert!(res_dummy_cached.is_ok());
+        assert_eq!(res_dummy_cached.unwrap().documentation, None);
+    }
+
+    #[tokio::test]
+    async fn test_backend_concurrent_completion_resolve_shared_cache() {
+        let (service, _socket) = LspService::new(|client| Backend::new(client).unwrap());
+        let backend = service.inner();
+
+        // Warm up cache once to avoid spawning 20 concurrent man processes on constrained CI runners
+        let init_item = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+        let init_res = backend.completion_resolve(init_item).await.unwrap();
+        assert!(init_res.documentation.is_some());
+
+        let futures: Vec<_> = (0..20)
+            .map(|_| {
+                let item = CompletionItem {
+                    label: "git".to_string(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    ..Default::default()
+                };
+                backend.completion_resolve(item)
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+
+        for res in results {
+            assert!(res.is_ok());
+            let resolved = res.unwrap();
+            match resolved.documentation {
+                Some(Documentation::MarkupContent(markup)) => {
+                    assert_eq!(markup.kind, MarkupKind::Markdown);
+                    assert!(markup.value.to_lowercase().contains("git"));
+                }
+                other => panic!("Expected MarkupContent in concurrent test, got {other:?}"),
+            }
+        }
+
+        // Shared cache must contain git
+        assert!(backend.man_cache().contains_key("git"));
+        assert!(backend.man_cache().get("git").unwrap().is_some());
     }
 }
