@@ -341,6 +341,8 @@ pub fn resolve_completion_item(mut item: CompletionItem) -> CompletionItem {
     if has_doc {
         return item;
     }
+    // Clear empty or whitespace documentation placeholder
+    item.documentation = None;
 
     let trimmed_label = item.label.trim();
     if trimmed_label.is_empty() {
@@ -384,8 +386,11 @@ pub fn is_eligible_for_external_command(kind: Option<CompletionItemKind>, label:
     if trimmed.is_empty()
         || trimmed.len() > 256
         || trimmed.starts_with('-')
-        || trimmed == "."
-        || trimmed == ".."
+        || trimmed.starts_with('.')
+        || trimmed.starts_with(':')
+        || trimmed.ends_with('.')
+        || trimmed.ends_with(':')
+        || !trimmed.chars().any(|c| c.is_alphanumeric())
     {
         return false;
     }
@@ -414,6 +419,8 @@ pub async fn resolve_completion_item_async_with_timeout(
     if has_doc {
         return item;
     }
+    // Clear empty or whitespace documentation placeholder so fallthrough checks work reliably
+    item.documentation = None;
 
     // 2. Try resolving builtin or reserved word synchronously
     item = resolve_completion_item(item);
@@ -1735,5 +1742,233 @@ mod tests {
         assert_eq!(resolved.documentation, None);
         assert!(cache.contains_key("git"));
         assert_eq!(*cache.get("git").unwrap(), None);
+    }
+
+    #[test]
+    fn test_is_eligible_for_external_command_comprehensive() {
+        // Valid commands
+        assert!(is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "git"
+        ));
+        assert!(is_eligible_for_external_command(
+            Some(CompletionItemKind::TEXT),
+            "cargo"
+        ));
+        assert!(is_eligible_for_external_command(None, "grep"));
+        assert!(is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "python3.11"
+        ));
+        assert!(is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "git-commit"
+        ));
+        assert!(is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "7z"
+        ));
+        assert!(is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "my_cmd_1"
+        ));
+
+        // Ineligible labels: flags, dots, colons, punctuation-only, path slashes
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "-v"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "--help"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "."
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            ".."
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "..."
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            ".gitignore"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            ".zshrc"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "::"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            ":wq"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "git."
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "test:"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "_"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "__"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            ""
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "   "
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "foo/bar"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "/usr/bin/git"
+        ));
+
+        // Ineligible kinds
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FILE),
+            "git"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FOLDER),
+            "git"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::KEYWORD),
+            "git"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::VARIABLE),
+            "git"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_empty_doc_is_resolved_for_external_command() {
+        let cache = ManCache::new();
+
+        // 1. Empty string documentation
+        let item_empty_str = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::String("".to_string())),
+            ..Default::default()
+        };
+        let resolved = resolve_completion_item_async(item_empty_str, &cache).await;
+        match resolved.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert!(
+                    markup.value.to_lowercase().contains("git")
+                        || markup.value.to_lowercase().contains("repository")
+                );
+            }
+            other => panic!(
+                "Expected empty string doc on external command to be resolved, got {other:?}"
+            ),
+        }
+
+        // 2. Whitespace-only string documentation
+        let item_ws_str = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::TEXT),
+            documentation: Some(Documentation::String("   \n\t  ".to_string())),
+            ..Default::default()
+        };
+        let resolved_ws = resolve_completion_item_async(item_ws_str, &cache).await;
+        match resolved_ws.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert!(markup.value.to_lowercase().contains("git"));
+            }
+            other => panic!(
+                "Expected whitespace string doc on external command to be resolved, got {other:?}"
+            ),
+        }
+
+        // 3. Empty MarkupContent documentation
+        let item_empty_markup = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "".to_string(),
+            })),
+            ..Default::default()
+        };
+        let resolved_markup = resolve_completion_item_async(item_empty_markup, &cache).await;
+        match resolved_markup.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert!(markup.value.to_lowercase().contains("git"));
+            }
+            other => panic!(
+                "Expected empty markup doc on external command to be resolved, got {other:?}"
+            ),
+        }
+
+        // 4. Nonexistent external command with empty documentation returns None
+        let dummy = "nonexistent_dummy_binary_with_empty_doc";
+        let dummy_item = CompletionItem {
+            label: dummy.to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::String("   ".to_string())),
+            ..Default::default()
+        };
+        let resolved_dummy = resolve_completion_item_async(dummy_item, &cache).await;
+        assert_eq!(resolved_dummy.documentation, None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_ineligible_label_edge_cases() {
+        let cache = ManCache::new();
+
+        let edge_labels = [
+            ".gitignore",
+            ".zshrc",
+            "..",
+            "...",
+            "::",
+            ":wq",
+            "git.",
+            "test:",
+            "_",
+            "__",
+            "-v",
+            "--flag",
+        ];
+
+        for label in edge_labels {
+            let item = CompletionItem {
+                label: label.to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                ..Default::default()
+            };
+            let resolved = resolve_completion_item_async(item, &cache).await;
+            assert_eq!(
+                resolved.documentation, None,
+                "Label '{label}' must not resolve external man documentation"
+            );
+            assert!(
+                !cache.contains_key(label),
+                "Label '{label}' must not be stored in man_cache"
+            );
+        }
     }
 }

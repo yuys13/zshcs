@@ -2395,3 +2395,63 @@ async fn test_completion_resolve_real_zsh_daemon_external_command_e2e() {
         ),
     }
 }
+
+#[tokio::test]
+async fn test_completion_resolve_external_command_empty_doc_placeholder_e2e() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///resolve_empty_doc.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git").await;
+
+    // 1. External command candidate with empty string doc placeholder
+    let item_with_empty_doc = CompletionItem {
+        label: "git".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        documentation: Some(Documentation::String("   ".to_string())),
+        ..Default::default()
+    };
+
+    let resolved = test_client
+        .send_request::<request::ResolveCompletionItem>(item_with_empty_doc)
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.label, "git");
+    match resolved.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(
+                markup.value.to_lowercase().contains("git")
+                    || markup.value.to_lowercase().contains("repository")
+            );
+        }
+        other => panic!(
+            "Expected MarkupContent for git with empty doc placeholder, got {:?}",
+            other
+        ),
+    }
+
+    // 2. Ineligible candidates (hidden files, colon-prefixed) safely fall through to None
+    let dotfile_item = CompletionItem {
+        label: ".gitignore".to_string(),
+        kind: Some(CompletionItemKind::TEXT),
+        ..Default::default()
+    };
+    let resolved_dotfile = test_client
+        .send_request::<request::ResolveCompletionItem>(dotfile_item)
+        .await
+        .unwrap();
+    assert_eq!(resolved_dotfile.documentation, None);
+
+    let colon_item = CompletionItem {
+        label: ":wq".to_string(),
+        kind: Some(CompletionItemKind::TEXT),
+        ..Default::default()
+    };
+    let resolved_colon = test_client
+        .send_request::<request::ResolveCompletionItem>(colon_item)
+        .await
+        .unwrap();
+    assert_eq!(resolved_colon.documentation, None);
+}
