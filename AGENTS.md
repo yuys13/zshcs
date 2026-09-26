@@ -107,3 +107,20 @@ A commit message should be structured as follows:
 ```text
 feat: allow provided config object to extend other configs
 ```
+
+## Documentation and Settings Ordering
+
+When defining or documenting configuration keys (such as `settings.zshcs.experimental.*`), schema options, or lists of features:
+- Always sort keys, example configuration snippets (e.g. Lua tables), and their corresponding descriptive documentation in **alphabetical order (A-Z)**.
+- Ensure the explanatory sections strictly follow the same ordering as the configuration examples.
+
+## Nix Build and Sandbox Testing Discipline
+
+- When external tools or dependencies are declared in `flake.nix` (`nativeBuildInputs`), corresponding tests must **strictly assert** their presence and functionality instead of silently skipping.
+- Avoid loose skips in tests when running under `nix build`; tests should fail fast if the required environment is incomplete.
+- If a test command or implementation is modified and an external package in `nativeBuildInputs` is no longer needed, remove it immediately to keep derivations minimal.
+
+## Pull Request Guidelines
+
+- **Single Concern per PR**: Each pull request must focus on solving a single, well-defined concern or feature. Avoid combining multiple unrelated features, refactorings, or subsystem changes into a single PR. Keep PRs granular, self-contained, and easy to review and revert if necessary.
+- **No Internal Proposal References**: Do not reference uncommitted or untracked proposal/scratch files (e.g., `docs/IMPROVEMENT_PROPOSALS.md`) in PR titles, PR descriptions, or commit messages. Describe features strictly in terms of their public functionality and architectural changes.
