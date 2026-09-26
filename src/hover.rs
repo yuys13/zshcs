@@ -248,19 +248,20 @@ pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
             }
         }
         Ok(Ok(output)) => {
-            eprintln!(
-                "man command exited with status: {:?}, stderr: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr)
+            tracing::debug!(
+                word = %target,
+                status = ?output.status.code(),
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "man command exited with non-zero status"
             );
             None
         }
         Ok(Err(e)) => {
-            eprintln!("Failed to execute man command: {e}");
+            tracing::debug!(word = %target, error = %e, "Failed to execute man command");
             None
         }
         Err(_) => {
-            eprintln!("man command timed out");
+            tracing::debug!(word = %target, "man command timed out");
             None
         }
     }
