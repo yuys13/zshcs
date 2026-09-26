@@ -368,6 +368,106 @@ pub fn resolve_completion_item(mut item: CompletionItem) -> CompletionItem {
     item
 }
 
+pub type ManCache = dashmap::DashMap<String, Option<String>>;
+
+/// Default timeout for asynchronous man page retrieval during completion resolution (2000 milliseconds).
+pub const DEFAULT_RESOLVE_MAN_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Determines whether a completion item is eligible for external command man page lookup.
+pub fn is_eligible_for_external_command(kind: Option<CompletionItemKind>, label: &str) -> bool {
+    if let Some(k) = kind
+        && !matches!(k, CompletionItemKind::FUNCTION | CompletionItemKind::TEXT)
+    {
+        return false;
+    }
+    let trimmed = label.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 256
+        || trimmed.starts_with('-')
+        || trimmed == "."
+        || trimmed == ".."
+    {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
+/// Resolves detailed documentation for a `CompletionItem` asynchronously with a custom timeout.
+///
+/// Documentation lookup precedence:
+/// 1. Pre-existing non-empty documentation is preserved.
+/// 2. Zsh builtins and reserved words are resolved synchronously from the static dictionary.
+/// 3. Eligible external commands are resolved asynchronously via `man` with negative caching and timeout protection.
+pub async fn resolve_completion_item_async_with_timeout(
+    mut item: CompletionItem,
+    cache: &ManCache,
+    timeout_dur: Duration,
+) -> CompletionItem {
+    // 1. Preserve existing documentation if present and non-empty
+    let has_doc = match &item.documentation {
+        Some(Documentation::String(s)) => !s.trim().is_empty(),
+        Some(Documentation::MarkupContent(m)) => !m.value.trim().is_empty(),
+        None => false,
+    };
+    if has_doc {
+        return item;
+    }
+
+    // 2. Try resolving builtin or reserved word synchronously
+    item = resolve_completion_item(item);
+    if item.documentation.is_some() {
+        return item;
+    }
+
+    let trimmed_label = item.label.trim();
+    if trimmed_label.is_empty() {
+        return item;
+    }
+
+    if !is_eligible_for_external_command(item.kind, trimmed_label) {
+        return item;
+    }
+
+    if let Some(entry) = cache.get(trimmed_label) {
+        if let Some(markdown) = entry.value() {
+            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: markdown.clone(),
+            }));
+        }
+        return item;
+    }
+
+    let markdown_opt = match crate::hover::get_man_page(trimmed_label, timeout_dur).await {
+        Some(raw_man) => {
+            let md = crate::hover::format_man_markdown(&raw_man);
+            Some(md)
+        }
+        None => None,
+    };
+
+    cache.insert(trimmed_label.to_string(), markdown_opt.clone());
+
+    if let Some(markdown) = markdown_opt {
+        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: markdown,
+        }));
+    }
+
+    item
+}
+
+/// Resolves detailed documentation for a `CompletionItem` asynchronously with the default 2-second timeout.
+pub async fn resolve_completion_item_async(
+    item: CompletionItem,
+    cache: &ManCache,
+) -> CompletionItem {
+    resolve_completion_item_async_with_timeout(item, cache, DEFAULT_RESOLVE_MAN_TIMEOUT).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1433,5 +1533,207 @@ mod tests {
         assert_eq!(resolved.commit_characters, original.commit_characters);
         assert_eq!(resolved.data, original.data);
         assert_eq!(resolved.tags, original.tags);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_external_command_git() {
+        let cache = ManCache::new();
+        let item = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+
+        let resolved = resolve_completion_item_async(item, &cache).await;
+        assert_eq!(resolved.label, "git");
+        match resolved.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert_eq!(markup.kind, MarkupKind::Markdown);
+                assert!(markup.value.starts_with("```text\n"));
+                assert!(markup.value.ends_with("\n```"));
+                assert!(
+                    markup.value.to_lowercase().contains("git")
+                        || markup.value.to_lowercase().contains("repository")
+                );
+            }
+            other => panic!("Expected MarkupContent documentation for 'git', got {other:?}"),
+        }
+
+        // Cache must have stored the result
+        assert!(cache.contains_key("git"));
+        assert!(cache.get("git").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_cache_hit_and_caching() {
+        let cache = ManCache::new();
+        let item = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::TEXT),
+            ..Default::default()
+        };
+
+        // 1. First resolution populates cache
+        let resolved = resolve_completion_item_async(item.clone(), &cache).await;
+        assert!(resolved.documentation.is_some());
+        assert!(cache.contains_key("git"));
+
+        // 2. Overwrite cache with mock entry to prove 2nd resolution reads strictly from cache
+        let mock_md = "```text\nmock git manual page\n```".to_string();
+        cache.insert("git".to_string(), Some(mock_md.clone()));
+
+        let resolved2 = resolve_completion_item_async(item, &cache).await;
+        match resolved2.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert_eq!(markup.value, mock_md);
+            }
+            other => panic!("Expected mock doc from cache, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_negative_cache() {
+        let cache = ManCache::new();
+        let dummy = "nonexistent_dummy_binary_xyz123_456";
+        let item = CompletionItem {
+            label: dummy.to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+
+        // 1. Initial resolution fails to find man page
+        let resolved = resolve_completion_item_async(item.clone(), &cache).await;
+        assert_eq!(resolved.documentation, None);
+
+        // Negative cache must contain None
+        assert!(cache.contains_key(dummy));
+        assert_eq!(*cache.get(dummy).unwrap(), None);
+
+        // 2. Second resolution should return None immediately from negative cache
+        let resolved2 = resolve_completion_item_async(item, &cache).await;
+        assert_eq!(resolved2.documentation, None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_ineligible_kinds() {
+        let cache = ManCache::new();
+
+        let ineligible_kinds = vec![
+            CompletionItemKind::FILE,
+            CompletionItemKind::FOLDER,
+            CompletionItemKind::VARIABLE,
+            CompletionItemKind::SNIPPET,
+            CompletionItemKind::KEYWORD,
+        ];
+
+        for kind in ineligible_kinds {
+            let item = CompletionItem {
+                label: "git".to_string(),
+                kind: Some(kind),
+                ..Default::default()
+            };
+            let resolved = resolve_completion_item_async(item, &cache).await;
+            assert_eq!(
+                resolved.documentation, None,
+                "Kind {kind:?} should not resolve external command"
+            );
+            assert!(
+                !cache.contains_key("git"),
+                "Cache should not be touched for ineligible kind {kind:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_preserves_existing_documentation() {
+        let cache = ManCache::new();
+        let existing = "Custom user documentation";
+        let item = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::String(existing.to_string())),
+            ..Default::default()
+        };
+
+        let resolved = resolve_completion_item_async(item, &cache).await;
+        assert_eq!(
+            resolved.documentation,
+            Some(Documentation::String(existing.to_string()))
+        );
+        assert!(!cache.contains_key("git"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_resolves_builtins_without_caching() {
+        let cache = ManCache::new();
+        let item = CompletionItem {
+            label: "echo".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+
+        let resolved = resolve_completion_item_async(item, &cache).await;
+        match resolved.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert!(markup.value.contains("`echo` (Zsh Builtin)"));
+            }
+            other => panic!("Expected builtin doc, got {other:?}"),
+        }
+        // Builtins must not pollute the external man cache
+        assert!(!cache.contains_key("echo"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_concurrency() {
+        use std::sync::Arc;
+
+        let cache = Arc::new(ManCache::new());
+        let mut handles = Vec::new();
+
+        for _ in 0..20 {
+            let cache_clone = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move {
+                let item = CompletionItem {
+                    label: "git".to_string(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    ..Default::default()
+                };
+                resolve_completion_item_async(item, &cache_clone).await
+            }));
+        }
+
+        for handle in handles {
+            let resolved = handle.await.unwrap();
+            match resolved.documentation {
+                Some(Documentation::MarkupContent(markup)) => {
+                    assert!(
+                        markup.value.to_lowercase().contains("git")
+                            || markup.value.to_lowercase().contains("repository")
+                    );
+                }
+                other => panic!("Expected MarkupContent in concurrent test, got {other:?}"),
+            }
+        }
+
+        assert!(cache.contains_key("git"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_timeout_protection() {
+        let cache = ManCache::new();
+        let item = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+
+        // Pass 0 duration timeout
+        let resolved =
+            resolve_completion_item_async_with_timeout(item, &cache, Duration::from_millis(0))
+                .await;
+        // Zero timeout aborts immediately, negative caches None, returns unmodified item
+        assert_eq!(resolved.documentation, None);
+        assert!(cache.contains_key("git"));
+        assert_eq!(*cache.get("git").unwrap(), None);
     }
 }

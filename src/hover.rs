@@ -539,16 +539,21 @@ pub async fn get_hover_info_with_timeout(
         return None;
     }
 
+    let markdown = format_man_markdown(&man_text);
+    Some(HoverContents::Markup(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value: markdown,
+    }))
+}
+
+/// Formats raw manual page text into a Markdown code block with dynamic fence escaping.
+pub fn format_man_markdown(man_text: &str) -> String {
     let mut fence_len = 3;
     while man_text.contains(&"`".repeat(fence_len)) {
         fence_len += 1;
     }
     let fence = "`".repeat(fence_len);
-    let markdown = format!("{fence}text\n{man_text}\n{fence}");
-    Some(HoverContents::Markup(MarkupContent {
-        kind: MarkupKind::Markdown,
-        value: markdown,
-    }))
+    format!("{fence}text\n{man_text}\n{fence}")
 }
 
 #[cfg(test)]
@@ -1014,5 +1019,20 @@ mod tests {
         // Multibyte overwrite
         let raw_overwrite = "あ\x08い";
         assert_eq!(clean_man_text(raw_overwrite), "い");
+    }
+
+    #[test]
+    fn test_format_man_markdown_escaping() {
+        let plain = "NAME\n    git - fast version control";
+        assert_eq!(
+            format_man_markdown(plain),
+            "```text\nNAME\n    git - fast version control\n```"
+        );
+
+        let with_backticks = "Run ```command``` to execute.";
+        assert_eq!(
+            format_man_markdown(with_backticks),
+            "````text\nRun ```command``` to execute.\n````"
+        );
     }
 }

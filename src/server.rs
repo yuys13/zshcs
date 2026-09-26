@@ -11,7 +11,8 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::completion::{
-    CAPTURE_ZSH, CompletionRequest, ZPTYRC_ZSH, resolve_completion_item, run_completion_daemon,
+    CAPTURE_ZSH, CompletionRequest, ManCache, ZPTYRC_ZSH, resolve_completion_item_async,
+    run_completion_daemon,
 };
 use crate::config::Config;
 use crate::definition::find_definition;
@@ -28,6 +29,7 @@ pub struct Backend {
     _temp_dir: TempDir,
     completion_tx: mpsc::Sender<CompletionRequest>,
     config: Arc<RwLock<Config>>,
+    man_cache: Arc<ManCache>,
 }
 
 impl Backend {
@@ -75,6 +77,7 @@ impl Backend {
             _temp_dir: temp_dir,
             completion_tx: tx,
             config: Arc::new(RwLock::new(Config::default())),
+            man_cache: Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -122,6 +125,7 @@ impl Backend {
             _temp_dir: temp_dir,
             completion_tx: tx,
             config: Arc::new(RwLock::new(Config::default())),
+            man_cache: Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -131,6 +135,10 @@ impl Backend {
 
     pub fn config(&self) -> Arc<RwLock<Config>> {
         Arc::clone(&self.config)
+    }
+
+    pub fn man_cache(&self) -> Arc<ManCache> {
+        Arc::clone(&self.man_cache)
     }
 
     pub async fn is_diagnostics_enabled(&self) -> bool {
@@ -503,7 +511,7 @@ impl LanguageServer for Backend {
             ?params.kind,
             "completionItem/resolve request received"
         );
-        let resolved = resolve_completion_item(params);
+        let resolved = resolve_completion_item_async(params, &self.man_cache).await;
         Ok(resolved)
     }
 
