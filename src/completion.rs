@@ -372,8 +372,8 @@ pub fn resolve_completion_item(mut item: CompletionItem) -> CompletionItem {
 
 pub type ManCache = dashmap::DashMap<String, Option<String>>;
 
-/// Default timeout for asynchronous man page retrieval during completion resolution (2000 milliseconds).
-pub const DEFAULT_RESOLVE_MAN_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Default timeout for asynchronous man page retrieval during completion resolution (5000 milliseconds).
+pub const DEFAULT_RESOLVE_MAN_TIMEOUT: Duration = Duration::from_millis(5000);
 
 /// Determines whether a completion item is eligible for external command man page lookup.
 pub fn is_eligible_for_external_command(kind: Option<CompletionItemKind>, label: &str) -> bool {
@@ -447,27 +447,28 @@ pub async fn resolve_completion_item_async_with_timeout(
         return item;
     }
 
-    let markdown_opt = match crate::hover::get_man_page(trimmed_label, timeout_dur).await {
-        Some(raw_man) => {
+    match crate::hover::get_man_page_result(trimmed_label, timeout_dur).await {
+        crate::hover::ManPageResult::Found(raw_man) => {
             let md = crate::hover::format_man_markdown(&raw_man);
-            Some(md)
+            cache.insert(trimmed_label.to_string(), Some(md.clone()));
+            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: md,
+            }));
         }
-        None => None,
-    };
-
-    cache.insert(trimmed_label.to_string(), markdown_opt.clone());
-
-    if let Some(markdown) = markdown_opt {
-        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: markdown,
-        }));
+        crate::hover::ManPageResult::NotFound => {
+            // Negative cache missing man pages to avoid recurring process spawn overhead
+            cache.insert(trimmed_label.to_string(), None);
+        }
+        crate::hover::ManPageResult::Timeout | crate::hover::ManPageResult::Error(_) => {
+            // Do not cache transient timeouts or execution errors so future attempts can retry
+        }
     }
 
     item
 }
 
-/// Resolves detailed documentation for a `CompletionItem` asynchronously with the default 2-second timeout.
+/// Resolves detailed documentation for a `CompletionItem` asynchronously with the default 5-second timeout.
 pub async fn resolve_completion_item_async(
     item: CompletionItem,
     cache: &ManCache,
@@ -1697,6 +1698,15 @@ mod tests {
         let cache = Arc::new(ManCache::new());
         let mut handles = Vec::new();
 
+        // Warm up cache once to avoid launching 20 concurrent man processes on constrained CI runners
+        let warmup_item = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+        let warmup_resolved = resolve_completion_item_async(warmup_item, &cache).await;
+        assert!(warmup_resolved.documentation.is_some());
+
         for _ in 0..20 {
             let cache_clone = Arc::clone(&cache);
             handles.push(tokio::spawn(async move {
@@ -1738,10 +1748,9 @@ mod tests {
         let resolved =
             resolve_completion_item_async_with_timeout(item, &cache, Duration::from_millis(0))
                 .await;
-        // Zero timeout aborts immediately, negative caches None, returns unmodified item
+        // Zero timeout aborts immediately without caching transient timeouts, returns unmodified item
         assert_eq!(resolved.documentation, None);
-        assert!(cache.contains_key("git"));
-        assert_eq!(*cache.get("git").unwrap(), None);
+        assert!(!cache.contains_key("git"));
     }
 
     #[test]

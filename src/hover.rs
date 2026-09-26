@@ -199,8 +199,16 @@ pub fn clean_man_text(raw: &str) -> String {
     cleaned.trim_end().to_string()
 }
 
-/// Retrieves the manual page for an external command asynchronously with a timeout.
-pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManPageResult {
+    Found(String),
+    NotFound,
+    Timeout,
+    Error(String),
+}
+
+/// Retrieves the manual page for an external command asynchronously with a timeout, returning a detailed result.
+pub async fn get_man_page_result(word: &str, timeout_dur: Duration) -> ManPageResult {
     let target = if let Some(slash_idx) = word.rfind('/') {
         &word[slash_idx + 1..]
     } else {
@@ -208,7 +216,7 @@ pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
     };
 
     if target.is_empty() || target.len() > 256 || target.starts_with('-') {
-        return None;
+        return ManPageResult::NotFound;
     }
 
     // Only allow alphanumeric and safe command characters
@@ -216,7 +224,7 @@ pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
         .chars()
         .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
     {
-        return None;
+        return ManPageResult::NotFound;
     }
 
     let mut cmd = tokio::process::Command::new("man");
@@ -242,9 +250,9 @@ pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
             let stdout_str = String::from_utf8_lossy(&output.stdout);
             let cleaned = clean_man_text(&stdout_str);
             if cleaned.trim().is_empty() {
-                None
+                ManPageResult::NotFound
             } else {
-                Some(cleaned)
+                ManPageResult::Found(cleaned)
             }
         }
         Ok(Ok(output)) => {
@@ -254,16 +262,24 @@ pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
                 stderr = %String::from_utf8_lossy(&output.stderr).trim(),
                 "man command exited with non-zero status"
             );
-            None
+            ManPageResult::NotFound
         }
         Ok(Err(e)) => {
             tracing::debug!(word = %target, error = %e, "Failed to execute man command");
-            None
+            ManPageResult::Error(e.to_string())
         }
         Err(_) => {
             tracing::debug!(word = %target, "man command timed out");
-            None
+            ManPageResult::Timeout
         }
+    }
+}
+
+/// Retrieves the manual page for an external command asynchronously with a timeout.
+pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
+    match get_man_page_result(word, timeout_dur).await {
+        ManPageResult::Found(page) => Some(page),
+        _ => None,
     }
 }
 
