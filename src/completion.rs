@@ -926,6 +926,149 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_completion_item_all_53_builtins_and_20_reserved_words() {
+        let builtins = [
+            "cd",
+            "echo",
+            "export",
+            "set",
+            "setopt",
+            "unsetopt",
+            "autoload",
+            "compadd",
+            "typeset",
+            "print",
+            "printf",
+            "source",
+            ".",
+            "eval",
+            "alias",
+            "unalias",
+            "read",
+            "return",
+            "exit",
+            "shift",
+            "test",
+            "trap",
+            "unset",
+            "local",
+            "declare",
+            "which",
+            "where",
+            "whence",
+            "type",
+            "bindkey",
+            "zstyle",
+            "zmodload",
+            "zpty",
+            "zparseopts",
+            "pushd",
+            "popd",
+            "dirs",
+            "pwd",
+            "history",
+            "fc",
+            "bg",
+            "fg",
+            "jobs",
+            "kill",
+            "wait",
+            "disown",
+            "exec",
+            "hash",
+            "rehash",
+            "umask",
+            "true",
+            "false",
+            ":",
+        ];
+        assert_eq!(builtins.len(), 53);
+
+        for b in builtins {
+            let kind = if b == "." {
+                CompletionItemKind::FOLDER
+            } else if b == ":" {
+                CompletionItemKind::TEXT
+            } else {
+                CompletionItemKind::FUNCTION
+            };
+            let item = CompletionItem {
+                label: b.to_string(),
+                kind: Some(kind),
+                ..Default::default()
+            };
+            let resolved = resolve_completion_item(item);
+            let doc = resolved
+                .documentation
+                .unwrap_or_else(|| panic!("Builtin '{b}' must be resolved with documentation"));
+            match doc {
+                Documentation::MarkupContent(markup) => {
+                    assert_eq!(markup.kind, MarkupKind::Markdown);
+                    assert!(
+                        markup.value.contains("Builtin") || markup.value.contains("Module"),
+                        "Doc for '{b}' should mention Builtin or Module"
+                    );
+                    assert!(
+                        markup.value.contains("```zsh"),
+                        "Doc for '{b}' should contain zsh syntax block"
+                    );
+                }
+                Documentation::String(_) => panic!("Expected MarkupContent documentation"),
+            }
+        }
+
+        let reserved = [
+            "if",
+            "then",
+            "elif",
+            "else",
+            "fi",
+            "for",
+            "do",
+            "done",
+            "while",
+            "until",
+            "case",
+            "esac",
+            "select",
+            "function",
+            "repeat",
+            "time",
+            "coproc",
+            "nocorrect",
+            "foreach",
+            "end",
+        ];
+        assert_eq!(reserved.len(), 20);
+
+        for r in reserved {
+            let item = CompletionItem {
+                label: r.to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                ..Default::default()
+            };
+            let resolved = resolve_completion_item(item);
+            let doc = resolved.documentation.unwrap_or_else(|| {
+                panic!("Reserved word '{r}' must be resolved with documentation")
+            });
+            match doc {
+                Documentation::MarkupContent(markup) => {
+                    assert_eq!(markup.kind, MarkupKind::Markdown);
+                    assert!(
+                        markup.value.contains("Reserved Word"),
+                        "Doc for '{r}' should mention Reserved Word"
+                    );
+                    assert!(
+                        markup.value.contains("```zsh"),
+                        "Doc for '{r}' should contain zsh syntax block"
+                    );
+                }
+                Documentation::String(_) => panic!("Expected MarkupContent documentation"),
+            }
+        }
+    }
+
+    #[test]
     fn test_resolve_completion_item_fallback_unrecognized() {
         let unknown = CompletionItem {
             label: "my_custom_unknown_binary".to_string(),

@@ -3,13 +3,14 @@ mod common;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 use tower_lsp::lsp_types::{
-    CompletionParams, DidChangeTextDocumentParams, DidOpenTextDocumentParams, ExecuteCommandParams,
-    Position, Range, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    CompletionItem, CompletionItemKind, CompletionParams, DidChangeTextDocumentParams,
+    DidOpenTextDocumentParams, Documentation, ExecuteCommandParams, MarkupKind, Position, Range,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
     notification::{DidChangeTextDocument, DidOpenTextDocument, LogMessage},
     request,
 };
-use zshcs::completion::parse_candidate_line;
+use zshcs::completion::{parse_candidate_line, resolve_completion_item};
 
 // =========================================================================
 // 1. Extreme Fuzzing of `parse_candidate_line`
@@ -1050,4 +1051,200 @@ done
         tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
     };
     assert_eq!(final_items.len(), 1);
+}
+
+#[test]
+fn test_fuzz_resolve_completion_item_adversarial_inputs() {
+    // 1. Extreme length candidate labels
+    let huge_label = "x".repeat(1_000_000);
+    let item_huge = CompletionItem {
+        label: huge_label.clone(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        ..Default::default()
+    };
+    let resolved_huge = resolve_completion_item(item_huge);
+    assert_eq!(resolved_huge.label.len(), 1_000_000);
+    assert_eq!(resolved_huge.documentation, None);
+
+    // 2. Null bytes in label, detail, and documentation
+    let null_item = CompletionItem {
+        label: "echo\0extra".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        detail: Some("detail\0null".to_string()),
+        documentation: Some(Documentation::String("doc\0null".to_string())),
+        ..Default::default()
+    };
+    let resolved_null = resolve_completion_item(null_item);
+    assert_eq!(resolved_null.label, "echo\0extra");
+    assert_eq!(resolved_null.detail.as_deref(), Some("detail\0null"));
+    assert_eq!(
+        resolved_null.documentation,
+        Some(Documentation::String("doc\0null".to_string()))
+    );
+
+    // 3. Deeply nested quotes, backslashes, escape sequences
+    let quotes_label = "\"\"\"'''\\\"\\\"\\\"'''```";
+    let quotes_item = CompletionItem {
+        label: quotes_label.to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        ..Default::default()
+    };
+    let resolved_quotes = resolve_completion_item(quotes_item);
+    assert_eq!(resolved_quotes.label, quotes_label);
+    assert_eq!(resolved_quotes.documentation, None);
+
+    // 4. Unusual Unicode whitespace, ZWJ, RTL overrides, and combining characters
+    let unicode_ws = "\u{00A0}\u{2002}\u{2003}\u{200B}";
+    let ws_item = CompletionItem {
+        label: format!("{unicode_ws}echo{unicode_ws}"),
+        kind: Some(CompletionItemKind::FUNCTION),
+        ..Default::default()
+    };
+    let _ = resolve_completion_item(ws_item);
+
+    let bidi_label = "\u{200D}\u{200C}\u{202E}rtl_override\u{202C}";
+    let bidi_item = CompletionItem {
+        label: bidi_label.to_string(),
+        ..Default::default()
+    };
+    let resolved_bidi = resolve_completion_item(bidi_item);
+    assert_eq!(resolved_bidi.label, bidi_label);
+    assert_eq!(resolved_bidi.documentation, None);
+
+    // 5. Exhaustive check of all 25 LSP CompletionItemKind variants with builtin label
+    let all_kinds = [
+        CompletionItemKind::TEXT,
+        CompletionItemKind::METHOD,
+        CompletionItemKind::FUNCTION,
+        CompletionItemKind::CONSTRUCTOR,
+        CompletionItemKind::FIELD,
+        CompletionItemKind::VARIABLE,
+        CompletionItemKind::CLASS,
+        CompletionItemKind::INTERFACE,
+        CompletionItemKind::MODULE,
+        CompletionItemKind::PROPERTY,
+        CompletionItemKind::UNIT,
+        CompletionItemKind::VALUE,
+        CompletionItemKind::ENUM,
+        CompletionItemKind::KEYWORD,
+        CompletionItemKind::SNIPPET,
+        CompletionItemKind::COLOR,
+        CompletionItemKind::FILE,
+        CompletionItemKind::REFERENCE,
+        CompletionItemKind::FOLDER,
+        CompletionItemKind::ENUM_MEMBER,
+        CompletionItemKind::CONSTANT,
+        CompletionItemKind::STRUCT,
+        CompletionItemKind::EVENT,
+        CompletionItemKind::OPERATOR,
+        CompletionItemKind::TYPE_PARAMETER,
+    ];
+
+    for kind in all_kinds {
+        let item = CompletionItem {
+            label: "echo".to_string(),
+            kind: Some(kind),
+            ..Default::default()
+        };
+        let resolved = resolve_completion_item(item);
+        if matches!(
+            kind,
+            CompletionItemKind::FUNCTION | CompletionItemKind::KEYWORD | CompletionItemKind::TEXT
+        ) {
+            assert!(
+                resolved.documentation.is_some(),
+                "Kind {kind:?} should resolve 'echo'"
+            );
+        } else {
+            assert_eq!(
+                resolved.documentation, None,
+                "Kind {kind:?} should not resolve 'echo'"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_stress_concurrent_50_clients_resolve() {
+    let count = 50;
+    let barrier = Arc::new(Barrier::new(count));
+
+    let handles: Vec<_> = (0..count)
+        .map(|i| {
+            let b = barrier.clone();
+            tokio::spawn(async move {
+                let (mut client_stream, _server_handle) = common::setup_server_mock();
+                let mut test_client = common::TestClient::new(&mut client_stream);
+
+                let doc_uri = Url::parse(&format!("file:///client_resolve_{i}.zsh")).unwrap();
+                test_client.init_and_open(&doc_uri, "echo").await;
+
+                b.wait().await; // Synchronize burst start
+
+                // 1. Resolve builtin
+                let echo_item = CompletionItem {
+                    label: "echo".to_string(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    ..Default::default()
+                };
+                let resolved_echo = test_client
+                    .send_request::<request::ResolveCompletionItem>(echo_item)
+                    .await
+                    .unwrap();
+                match resolved_echo.documentation {
+                    Some(Documentation::MarkupContent(markup)) => {
+                        assert_eq!(markup.kind, MarkupKind::Markdown);
+                        assert!(markup.value.contains("`echo` (Zsh Builtin)"));
+                    }
+                    other => panic!("Client {i}: Expected MarkupContent, got {other:?}"),
+                }
+
+                // 2. Resolve reserved word
+                let if_item = CompletionItem {
+                    label: "if".to_string(),
+                    kind: Some(CompletionItemKind::KEYWORD),
+                    ..Default::default()
+                };
+                let resolved_if = test_client
+                    .send_request::<request::ResolveCompletionItem>(if_item)
+                    .await
+                    .unwrap();
+                match resolved_if.documentation {
+                    Some(Documentation::MarkupContent(markup)) => {
+                        assert_eq!(markup.kind, MarkupKind::Markdown);
+                        assert!(markup.value.contains("`if` (Zsh Reserved Word)"));
+                    }
+                    other => panic!("Client {i}: Expected MarkupContent, got {other:?}"),
+                }
+
+                // 3. Fallthrough for unknown item
+                let unknown_item = CompletionItem {
+                    label: format!("unknown_cmd_{i}"),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    ..Default::default()
+                };
+                let resolved_unknown = test_client
+                    .send_request::<request::ResolveCompletionItem>(unknown_item)
+                    .await
+                    .unwrap();
+                assert_eq!(resolved_unknown.documentation, None);
+
+                // 4. Fallthrough for file item
+                let file_item = CompletionItem {
+                    label: "cd".to_string(),
+                    kind: Some(CompletionItemKind::FILE),
+                    ..Default::default()
+                };
+                let resolved_file = test_client
+                    .send_request::<request::ResolveCompletionItem>(file_item)
+                    .await
+                    .unwrap();
+                assert_eq!(resolved_file.documentation, None);
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.await.unwrap();
+    }
 }
