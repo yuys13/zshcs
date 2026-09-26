@@ -2108,3 +2108,121 @@ done
     assert_eq!(resolved_custom.label, "custom_app");
     assert_eq!(resolved_custom.documentation, None);
 }
+
+#[tokio::test]
+async fn test_completion_resolve_real_zsh_daemon_e2e() {
+    use tower_lsp::lsp_types::{
+        InitializeParams, InitializedParams, notification::Initialized, request::Initialize,
+    };
+
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    // 1. Handshake verification: Verify capabilities.completion_provider.resolve_provider == Some(true)
+    let init_result = test_client
+        .send_request::<Initialize>(InitializeParams::default())
+        .await
+        .unwrap();
+
+    let completion_opts = init_result
+        .capabilities
+        .completion_provider
+        .expect("Server capabilities must include completion_provider");
+    assert_eq!(
+        completion_opts.resolve_provider,
+        Some(true),
+        "completion_provider.resolve_provider must be true"
+    );
+
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+
+    // 2. Open document and query real Zsh completion for 'whi'
+    let doc_uri = Url::parse("file:///real_daemon_resolve.zsh").unwrap();
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidOpenTextDocument>(
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: "whi".to_string(),
+                },
+            },
+        )
+        .await;
+    test_client.read_notification::<LogMessage>().await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 3),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    assert!(
+        !items.is_empty(),
+        "Real daemon must return completion items for 'whi'"
+    );
+
+    // Find builtin 'which' candidate
+    let which_item = items
+        .iter()
+        .find(|item| item.label == "which")
+        .expect("Real daemon completion items must contain 'which'");
+    assert_eq!(which_item.documentation, None);
+
+    // Find reserved word 'while' candidate
+    let while_item = items
+        .iter()
+        .find(|item| item.label == "while")
+        .expect("Real daemon completion items must contain 'while'");
+    assert_eq!(while_item.documentation, None);
+
+    // 3. Resolve builtin 'which' candidate returned by real daemon
+    let resolved_which = test_client
+        .send_request::<request::ResolveCompletionItem>(which_item.clone())
+        .await
+        .unwrap();
+    assert_eq!(resolved_which.label, "which");
+    match resolved_which.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.contains("### `which` (Zsh Builtin)"));
+            assert!(
+                markup
+                    .value
+                    .contains("Locate and display information about commands.")
+            );
+        }
+        other => panic!("Expected MarkupContent for 'which', got {:?}", other),
+    }
+
+    // 4. Resolve reserved word 'while' candidate returned by real daemon
+    let resolved_while = test_client
+        .send_request::<request::ResolveCompletionItem>(while_item.clone())
+        .await
+        .unwrap();
+    assert_eq!(resolved_while.label, "while");
+    match resolved_while.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.contains("### `while` (Zsh Reserved Word)"));
+            assert!(markup.value.contains(
+                "Execute command list repeatedly as long as the test command returns status 0."
+            ));
+        }
+        other => panic!("Expected MarkupContent for 'while', got {:?}", other),
+    }
+}

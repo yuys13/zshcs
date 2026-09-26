@@ -1015,6 +1015,28 @@ mod tests {
                 }
                 Documentation::String(_) => panic!("Expected MarkupContent documentation"),
             }
+
+            // Verify resolution with CompletionItemKind::TEXT (default inferred kind without detail)
+            let text_item = CompletionItem {
+                label: b.to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                ..Default::default()
+            };
+            assert!(
+                resolve_completion_item(text_item).documentation.is_some(),
+                "Builtin '{b}' with TEXT kind must resolve documentation"
+            );
+
+            // Verify resolution with kind: None (client omitted kind)
+            let none_item = CompletionItem {
+                label: b.to_string(),
+                kind: None,
+                ..Default::default()
+            };
+            assert!(
+                resolve_completion_item(none_item).documentation.is_some(),
+                "Builtin '{b}' with kind: None must resolve documentation"
+            );
         }
 
         let reserved = [
@@ -1065,6 +1087,28 @@ mod tests {
                 }
                 Documentation::String(_) => panic!("Expected MarkupContent documentation"),
             }
+
+            // Verify resolution with CompletionItemKind::TEXT (default inferred kind without detail)
+            let text_item = CompletionItem {
+                label: r.to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                ..Default::default()
+            };
+            assert!(
+                resolve_completion_item(text_item).documentation.is_some(),
+                "Reserved word '{r}' with TEXT kind must resolve documentation"
+            );
+
+            // Verify resolution with kind: None (client omitted kind)
+            let none_item = CompletionItem {
+                label: r.to_string(),
+                kind: None,
+                ..Default::default()
+            };
+            assert!(
+                resolve_completion_item(none_item).documentation.is_some(),
+                "Reserved word '{r}' with kind: None must resolve documentation"
+            );
         }
     }
 
@@ -1256,6 +1300,44 @@ mod tests {
                 );
             }
             other => panic!("Expected empty markup doc to be resolved, got {other:?}"),
+        }
+
+        // Whitespace-only MarkupContent should not block resolution
+        let item_ws_markup = CompletionItem {
+            label: "setopt".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "   \n\t  ".to_string(),
+            })),
+            ..Default::default()
+        };
+        let resolved_ws_markup = resolve_completion_item(item_ws_markup);
+        match resolved_ws_markup.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert_eq!(markup.kind, MarkupKind::Markdown);
+                assert!(markup.value.contains("Set the specified shell options."));
+            }
+            other => panic!("Expected whitespace markup doc to be resolved, got {other:?}"),
+        }
+
+        // Non-empty PlainText MarkupContent should be preserved as-is
+        let item_plain_markup = CompletionItem {
+            label: "cd".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Custom plain text doc for cd".to_string(),
+            })),
+            ..Default::default()
+        };
+        let resolved_plain_markup = resolve_completion_item(item_plain_markup);
+        match resolved_plain_markup.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert_eq!(markup.kind, MarkupKind::PlainText);
+                assert_eq!(markup.value, "Custom plain text doc for cd");
+            }
+            other => panic!("Expected plain text markup doc to be preserved, got {other:?}"),
         }
     }
 
