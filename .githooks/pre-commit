@@ -13,10 +13,24 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$REPO_ROOT"
 
-echo "=== Running zshcs pre-commit checks ==="
+# If Nix is available and not already inside a Nix dev environment,
+# re-execute this script inside `nix develop`.
+if [[ -z "${IN_NIX_SHELL:-}" && -z "${__ZSHCS_HOOK_REEXEC:-}" ]] && command -v nix >/dev/null 2>&1; then
+    export __ZSHCS_HOOK_REEXEC=1
+    exec nix develop -c "$0" "$@"
+fi
 
-echo "[1/5] Checking formatting (cargo fmt --check)..."
-cargo fmt --check
+echo "=== Running zshcs pre-commit checks ==="
+if [[ -n "${IN_NIX_SHELL:-}" ]]; then
+    echo "(Running inside Nix devShell environment)"
+fi
+
+echo "[1/5] Checking formatting..."
+if command -v nix >/dev/null 2>&1; then
+    nix fmt -- --fail-on-change
+else
+    cargo fmt --check
+fi
 
 echo "[2/5] Running Clippy linter (cargo clippy)..."
 cargo clippy --no-deps --all-targets -- -D warnings
