@@ -12,7 +12,11 @@ pub mod server;
 pub mod symbols;
 
 pub use cli::{Cli, Commands};
-pub use completion::{CAPTURE_ZSH, ZPTYRC_ZSH, infer_completion_kind, resolve_completion_item};
+pub use completion::{
+    CAPTURE_ZSH, DEFAULT_RESOLVE_MAN_TIMEOUT, ManCache, ZPTYRC_ZSH, infer_completion_kind,
+    is_eligible_for_external_command, resolve_completion_item, resolve_completion_item_async,
+    resolve_completion_item_async_with_timeout,
+};
 pub use config::{
     Config, ExperimentalConfig, extract_experimental_definition, extract_experimental_diagnostics,
     extract_experimental_hover, extract_experimental_symbols,
@@ -36,7 +40,7 @@ pub use doctor::{
 pub use document::{DocumentError, DocumentManager, DocumentState};
 pub use error::{ZshcsError, ZshcsResult};
 pub use hover::{
-    DEFAULT_HOVER_MAN_TIMEOUT, clean_man_text, extract_word_at_position,
+    DEFAULT_HOVER_MAN_TIMEOUT, clean_man_text, extract_word_at_position, format_man_markdown,
     get_builtin_or_reserved_doc, get_hover_info, get_hover_info_with_timeout, get_man_page,
     is_word_char,
 };

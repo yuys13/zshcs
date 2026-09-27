@@ -341,6 +341,8 @@ pub fn resolve_completion_item(mut item: CompletionItem) -> CompletionItem {
     if has_doc {
         return item;
     }
+    // Clear empty or whitespace documentation placeholder
+    item.documentation = None;
 
     let trimmed_label = item.label.trim();
     if trimmed_label.is_empty() {
@@ -366,6 +368,274 @@ pub fn resolve_completion_item(mut item: CompletionItem) -> CompletionItem {
     }
 
     item
+}
+
+pub type ManCache = dashmap::DashMap<String, Option<String>>;
+
+/// Default timeout for asynchronous man page retrieval during completion resolution (2000 milliseconds).
+pub const DEFAULT_RESOLVE_MAN_TIMEOUT: Duration = Duration::from_millis(2000);
+
+#[derive(Clone, Debug)]
+pub(crate) enum SingleFlightResult {
+    Found(String),
+    NotFound,
+    Timeout,
+    Error,
+}
+
+static IN_FLIGHT: std::sync::LazyLock<
+    dashmap::DashMap<String, tokio::sync::watch::Receiver<Option<SingleFlightResult>>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+struct InFlightGuard {
+    key: String,
+    active: bool,
+}
+
+impl InFlightGuard {
+    fn new(key: String) -> Self {
+        Self { key, active: true }
+    }
+
+    fn complete(mut self) {
+        self.active = false;
+        IN_FLIGHT.remove(&self.key);
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.active {
+            IN_FLIGHT.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn is_in_flight(key: &str) -> bool {
+    IN_FLIGHT.contains_key(key)
+}
+
+fn apply_single_flight_result(
+    result: &SingleFlightResult,
+    mut item: CompletionItem,
+    cache: &ManCache,
+    trimmed_label: &str,
+) -> CompletionItem {
+    match result {
+        SingleFlightResult::Found(md) => {
+            cache.insert(trimmed_label.to_string(), Some(md.clone()));
+            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: md.clone(),
+            }));
+        }
+        SingleFlightResult::NotFound => {
+            cache.insert(trimmed_label.to_string(), None);
+        }
+        SingleFlightResult::Timeout | SingleFlightResult::Error => {
+            // Do not cache transient timeouts or execution errors so future attempts can retry
+        }
+    }
+    item
+}
+
+/// Determines whether a completion item is eligible for external command man page lookup.
+pub fn is_eligible_for_external_command(kind: Option<CompletionItemKind>, label: &str) -> bool {
+    if let Some(k) = kind
+        && !matches!(k, CompletionItemKind::FUNCTION | CompletionItemKind::TEXT)
+    {
+        return false;
+    }
+    let trimmed = label.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 256
+        || trimmed.starts_with('-')
+        || trimmed.starts_with('.')
+        || trimmed.starts_with(':')
+        || trimmed.ends_with('.')
+        || trimmed.ends_with(':')
+        || !trimmed.chars().any(|c| c.is_alphanumeric())
+    {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
+/// Resolves detailed documentation for a `CompletionItem` asynchronously using an underlying fetcher
+/// with single-flight request coalescing, negative caching, and timeout protection.
+pub(crate) async fn resolve_completion_item_async_with_fetcher<F, Fut>(
+    mut item: CompletionItem,
+    cache: &ManCache,
+    timeout_dur: Duration,
+    fetcher: F,
+) -> CompletionItem
+where
+    F: FnOnce(String, Duration) -> Fut,
+    Fut: std::future::Future<Output = crate::hover::ManPageResult>,
+{
+    // 1. Preserve existing documentation if present and non-empty
+    let has_doc = match &item.documentation {
+        Some(Documentation::String(s)) => !s.trim().is_empty(),
+        Some(Documentation::MarkupContent(m)) => !m.value.trim().is_empty(),
+        None => false,
+    };
+    if has_doc {
+        return item;
+    }
+    // Clear empty or whitespace documentation placeholder so fallthrough checks work reliably
+    item.documentation = None;
+
+    // 2. Try resolving builtin or reserved word synchronously
+    item = resolve_completion_item(item);
+    if item.documentation.is_some() {
+        return item;
+    }
+
+    let trimmed_label = item.label.trim().to_string();
+    if trimmed_label.is_empty() {
+        return item;
+    }
+
+    if !is_eligible_for_external_command(item.kind, &trimmed_label) {
+        return item;
+    }
+
+    // 3. Fast path: check cache
+    if let Some(entry) = cache.get(&trimmed_label) {
+        if let Some(markdown) = entry.value() {
+            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: markdown.clone(),
+            }));
+        }
+        return item;
+    }
+
+    // 4. Single-Flight request deduplication
+    enum FlightRole {
+        Leader(
+            InFlightGuard,
+            tokio::sync::watch::Sender<Option<SingleFlightResult>>,
+        ),
+        Waiter(tokio::sync::watch::Receiver<Option<SingleFlightResult>>),
+    }
+
+    let role = match IN_FLIGHT.entry(trimmed_label.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => FlightRole::Waiter(entry.get().clone()),
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            // Double-check cache in case a previous in-flight request completed just before locking
+            if let Some(entry_cache) = cache.get(&trimmed_label) {
+                if let Some(markdown) = entry_cache.value() {
+                    item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: markdown.clone(),
+                    }));
+                }
+                return item;
+            }
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            entry.insert(rx);
+            let guard = InFlightGuard::new(trimmed_label.clone());
+            FlightRole::Leader(guard, tx)
+        }
+    };
+
+    match role {
+        FlightRole::Leader(guard, tx) => {
+            match fetcher(trimmed_label.clone(), timeout_dur).await {
+                crate::hover::ManPageResult::Found(raw_man) => {
+                    let md = crate::hover::format_man_markdown(&raw_man);
+                    cache.insert(trimmed_label.clone(), Some(md.clone()));
+                    let _ = tx.send(Some(SingleFlightResult::Found(md.clone())));
+                    guard.complete();
+                    item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: md,
+                    }));
+                }
+                crate::hover::ManPageResult::NotFound => {
+                    cache.insert(trimmed_label.clone(), None);
+                    let _ = tx.send(Some(SingleFlightResult::NotFound));
+                    guard.complete();
+                }
+                crate::hover::ManPageResult::Timeout => {
+                    let _ = tx.send(Some(SingleFlightResult::Timeout));
+                    guard.complete();
+                }
+                crate::hover::ManPageResult::Error(_) => {
+                    let _ = tx.send(Some(SingleFlightResult::Error));
+                    guard.complete();
+                }
+            }
+            item
+        }
+        FlightRole::Waiter(mut rx) => {
+            // Check if the result was already published before subscription
+            if let Some(ref res) = *rx.borrow() {
+                return apply_single_flight_result(res, item, cache, &trimmed_label);
+            }
+
+            match timeout(timeout_dur, rx.changed()).await {
+                Ok(Ok(())) => {
+                    if let Some(ref res) = *rx.borrow() {
+                        return apply_single_flight_result(res, item, cache, &trimmed_label);
+                    }
+                }
+                Ok(Err(_)) => {
+                    // Leader disconnected or dropped without a new value
+                    if let Some(ref res) = *rx.borrow() {
+                        return apply_single_flight_result(res, item, cache, &trimmed_label);
+                    }
+                    if let Some(entry) = cache.get(&trimmed_label)
+                        && let Some(markdown) = entry.value()
+                    {
+                        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: markdown.clone(),
+                        }));
+                    }
+                }
+                Err(_) => {
+                    // Waiter timed out waiting for the in-flight resolution
+                }
+            }
+            item
+        }
+    }
+}
+
+/// Resolves detailed documentation for a `CompletionItem` asynchronously with a custom timeout.
+///
+/// Documentation lookup precedence:
+/// 1. Pre-existing non-empty documentation is preserved.
+/// 2. Zsh builtins and reserved words are resolved synchronously from the static dictionary.
+/// 3. Eligible external commands are resolved asynchronously via `man` with single-flight deduplication,
+///    negative caching, and timeout protection.
+pub async fn resolve_completion_item_async_with_timeout(
+    item: CompletionItem,
+    cache: &ManCache,
+    timeout_dur: Duration,
+) -> CompletionItem {
+    resolve_completion_item_async_with_fetcher(
+        item,
+        cache,
+        timeout_dur,
+        |cmd: String, dur: Duration| async move {
+            crate::hover::get_man_page_result(&cmd, dur).await
+        },
+    )
+    .await
+}
+
+/// Resolves detailed documentation for a `CompletionItem` asynchronously with the default 2-second timeout.
+pub async fn resolve_completion_item_async(
+    item: CompletionItem,
+    cache: &ManCache,
+) -> CompletionItem {
+    resolve_completion_item_async_with_timeout(item, cache, DEFAULT_RESOLVE_MAN_TIMEOUT).await
 }
 
 #[cfg(test)]
@@ -1433,5 +1703,599 @@ mod tests {
         assert_eq!(resolved.commit_characters, original.commit_characters);
         assert_eq!(resolved.data, original.data);
         assert_eq!(resolved.tags, original.tags);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_external_command_git() {
+        let cache = ManCache::new();
+        let item = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+
+        let resolved = resolve_completion_item_async(item, &cache).await;
+        assert_eq!(resolved.label, "git");
+        match resolved.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert_eq!(markup.kind, MarkupKind::Markdown);
+                assert!(markup.value.starts_with("```text\n"));
+                assert!(markup.value.ends_with("\n```"));
+                assert!(
+                    markup.value.to_lowercase().contains("git")
+                        || markup.value.to_lowercase().contains("repository")
+                );
+            }
+            other => panic!("Expected MarkupContent documentation for 'git', got {other:?}"),
+        }
+
+        // Cache must have stored the result
+        assert!(cache.contains_key("git"));
+        assert!(cache.get("git").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_cache_hit_and_caching() {
+        let cache = ManCache::new();
+        let item = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::TEXT),
+            ..Default::default()
+        };
+
+        // 1. First resolution populates cache
+        let resolved = resolve_completion_item_async(item.clone(), &cache).await;
+        assert!(resolved.documentation.is_some());
+        assert!(cache.contains_key("git"));
+
+        // 2. Overwrite cache with mock entry to prove 2nd resolution reads strictly from cache
+        let mock_md = "```text\nmock git manual page\n```".to_string();
+        cache.insert("git".to_string(), Some(mock_md.clone()));
+
+        let resolved2 = resolve_completion_item_async(item, &cache).await;
+        match resolved2.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert_eq!(markup.value, mock_md);
+            }
+            other => panic!("Expected mock doc from cache, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_negative_cache() {
+        let cache = ManCache::new();
+        let dummy = "nonexistent_dummy_binary_xyz123_456";
+        let item = CompletionItem {
+            label: dummy.to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+
+        // 1. Initial resolution fails to find man page
+        let resolved = resolve_completion_item_async(item.clone(), &cache).await;
+        assert_eq!(resolved.documentation, None);
+
+        // Negative cache must contain None
+        assert!(cache.contains_key(dummy));
+        assert_eq!(*cache.get(dummy).unwrap(), None);
+
+        // 2. Second resolution should return None immediately from negative cache
+        let resolved2 = resolve_completion_item_async(item, &cache).await;
+        assert_eq!(resolved2.documentation, None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_ineligible_kinds() {
+        let cache = ManCache::new();
+
+        let ineligible_kinds = vec![
+            CompletionItemKind::FILE,
+            CompletionItemKind::FOLDER,
+            CompletionItemKind::VARIABLE,
+            CompletionItemKind::SNIPPET,
+            CompletionItemKind::KEYWORD,
+        ];
+
+        for kind in ineligible_kinds {
+            let item = CompletionItem {
+                label: "git".to_string(),
+                kind: Some(kind),
+                ..Default::default()
+            };
+            let resolved = resolve_completion_item_async(item, &cache).await;
+            assert_eq!(
+                resolved.documentation, None,
+                "Kind {kind:?} should not resolve external command"
+            );
+            assert!(
+                !cache.contains_key("git"),
+                "Cache should not be touched for ineligible kind {kind:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_preserves_existing_documentation() {
+        let cache = ManCache::new();
+        let existing = "Custom user documentation";
+        let item = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::String(existing.to_string())),
+            ..Default::default()
+        };
+
+        let resolved = resolve_completion_item_async(item, &cache).await;
+        assert_eq!(
+            resolved.documentation,
+            Some(Documentation::String(existing.to_string()))
+        );
+        assert!(!cache.contains_key("git"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_resolves_builtins_without_caching() {
+        let cache = ManCache::new();
+        let item = CompletionItem {
+            label: "echo".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+
+        let resolved = resolve_completion_item_async(item, &cache).await;
+        match resolved.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert!(markup.value.contains("`echo` (Zsh Builtin)"));
+            }
+            other => panic!("Expected builtin doc, got {other:?}"),
+        }
+        // Builtins must not pollute the external man cache
+        assert!(!cache.contains_key("echo"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_concurrency() {
+        use std::sync::Arc;
+        use tokio::sync::Barrier;
+
+        let cache = Arc::new(ManCache::new());
+        let count = 20;
+        let barrier = Arc::new(Barrier::new(count));
+        let mut handles = Vec::new();
+
+        for _ in 0..count {
+            let cache_clone = Arc::clone(&cache);
+            let barrier_clone = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier_clone.wait().await;
+                let item = CompletionItem {
+                    label: "git".to_string(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    ..Default::default()
+                };
+                resolve_completion_item_async(item, &cache_clone).await
+            }));
+        }
+
+        for handle in handles {
+            let resolved = handle.await.unwrap();
+            match resolved.documentation {
+                Some(Documentation::MarkupContent(markup)) => {
+                    assert!(
+                        markup.value.to_lowercase().contains("git")
+                            || markup.value.to_lowercase().contains("repository")
+                    );
+                }
+                other => panic!("Expected MarkupContent in concurrent test, got {other:?}"),
+            }
+        }
+
+        assert!(cache.contains_key("git"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_single_flight_deduplication() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        let cache = Arc::new(ManCache::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count = 20;
+        let barrier = Arc::new(Barrier::new(count));
+
+        let mut handles = Vec::new();
+        for _ in 0..count {
+            let cache_clone = Arc::clone(&cache);
+            let barrier_clone = Arc::clone(&barrier);
+            let count_clone = Arc::clone(&call_count);
+            handles.push(tokio::spawn(async move {
+                barrier_clone.wait().await;
+                let item = CompletionItem {
+                    label: "single_flight_cmd".to_string(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    ..Default::default()
+                };
+                resolve_completion_item_async_with_fetcher(
+                    item,
+                    &cache_clone,
+                    Duration::from_millis(2000),
+                    move |_cmd, _dur| {
+                        let cnt = count_clone;
+                        async move {
+                            cnt.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                            crate::hover::ManPageResult::Found(
+                                "single_flight_cmd(1) - single flight documentation".to_string(),
+                            )
+                        }
+                    },
+                )
+                .await
+            }));
+        }
+
+        for handle in handles {
+            let resolved = handle.await.unwrap();
+            match resolved.documentation {
+                Some(Documentation::MarkupContent(markup)) => {
+                    assert!(markup.value.contains("single_flight_cmd"));
+                }
+                other => panic!("Expected MarkupContent, got {other:?}"),
+            }
+        }
+
+        // Exactly one background fetch task must execute despite 20 concurrent requests
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(cache.contains_key("single_flight_cmd"));
+        assert!(!is_in_flight("single_flight_cmd"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_single_flight_not_found() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        let cache = Arc::new(ManCache::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count = 10;
+        let barrier = Arc::new(Barrier::new(count));
+
+        let mut handles = Vec::new();
+        for _ in 0..count {
+            let cache_clone = Arc::clone(&cache);
+            let barrier_clone = Arc::clone(&barrier);
+            let count_clone = Arc::clone(&call_count);
+            handles.push(tokio::spawn(async move {
+                barrier_clone.wait().await;
+                let item = CompletionItem {
+                    label: "nonexistent_single_flight_cmd".to_string(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    ..Default::default()
+                };
+                resolve_completion_item_async_with_fetcher(
+                    item,
+                    &cache_clone,
+                    Duration::from_millis(2000),
+                    move |_cmd, _dur| {
+                        let cnt = count_clone;
+                        async move {
+                            cnt.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            crate::hover::ManPageResult::NotFound
+                        }
+                    },
+                )
+                .await
+            }));
+        }
+
+        for handle in handles {
+            let resolved = handle.await.unwrap();
+            assert_eq!(resolved.documentation, None);
+        }
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(cache.contains_key("nonexistent_single_flight_cmd"));
+        assert_eq!(*cache.get("nonexistent_single_flight_cmd").unwrap(), None);
+        assert!(!is_in_flight("nonexistent_single_flight_cmd"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_single_flight_timeout_does_not_poison_cache() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        let cache = Arc::new(ManCache::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count = 10;
+        let barrier = Arc::new(Barrier::new(count));
+
+        let mut handles = Vec::new();
+        for _ in 0..count {
+            let cache_clone = Arc::clone(&cache);
+            let barrier_clone = Arc::clone(&barrier);
+            let count_clone = Arc::clone(&call_count);
+            handles.push(tokio::spawn(async move {
+                barrier_clone.wait().await;
+                let item = CompletionItem {
+                    label: "timeout_single_flight_cmd".to_string(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    ..Default::default()
+                };
+                resolve_completion_item_async_with_fetcher(
+                    item,
+                    &cache_clone,
+                    Duration::from_millis(2000),
+                    move |_cmd, _dur| {
+                        let cnt = count_clone;
+                        async move {
+                            cnt.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            crate::hover::ManPageResult::Timeout
+                        }
+                    },
+                )
+                .await
+            }));
+        }
+
+        for handle in handles {
+            let resolved = handle.await.unwrap();
+            assert_eq!(resolved.documentation, None);
+        }
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(!cache.contains_key("timeout_single_flight_cmd"));
+        assert!(!is_in_flight("timeout_single_flight_cmd"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_timeout_protection() {
+        let cache = ManCache::new();
+        let item = CompletionItem {
+            label: "timeout_protection_isolated_cmd".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+
+        // Pass 0 duration timeout
+        let resolved =
+            resolve_completion_item_async_with_timeout(item, &cache, Duration::from_millis(0))
+                .await;
+        // Zero timeout aborts immediately without caching transient timeouts, returns unmodified item
+        assert_eq!(resolved.documentation, None);
+        assert!(!cache.contains_key("timeout_protection_isolated_cmd"));
+        assert!(!is_in_flight("timeout_protection_isolated_cmd"));
+    }
+
+    #[test]
+    fn test_is_eligible_for_external_command_comprehensive() {
+        // Valid commands
+        assert!(is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "git"
+        ));
+        assert!(is_eligible_for_external_command(
+            Some(CompletionItemKind::TEXT),
+            "cargo"
+        ));
+        assert!(is_eligible_for_external_command(None, "grep"));
+        assert!(is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "python3.11"
+        ));
+        assert!(is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "git-commit"
+        ));
+        assert!(is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "7z"
+        ));
+        assert!(is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "my_cmd_1"
+        ));
+
+        // Ineligible labels: flags, dots, colons, punctuation-only, path slashes
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "-v"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "--help"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "."
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            ".."
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "..."
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            ".gitignore"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            ".zshrc"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "::"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            ":wq"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "git."
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "test:"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "_"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "__"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            ""
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "   "
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "foo/bar"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FUNCTION),
+            "/usr/bin/git"
+        ));
+
+        // Ineligible kinds
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FILE),
+            "git"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::FOLDER),
+            "git"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::KEYWORD),
+            "git"
+        ));
+        assert!(!is_eligible_for_external_command(
+            Some(CompletionItemKind::VARIABLE),
+            "git"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_empty_doc_is_resolved_for_external_command() {
+        let cache = ManCache::new();
+
+        // 1. Empty string documentation
+        let item_empty_str = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::String("".to_string())),
+            ..Default::default()
+        };
+        let resolved = resolve_completion_item_async(item_empty_str, &cache).await;
+        match resolved.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert!(
+                    markup.value.to_lowercase().contains("git")
+                        || markup.value.to_lowercase().contains("repository")
+                );
+            }
+            other => panic!(
+                "Expected empty string doc on external command to be resolved, got {other:?}"
+            ),
+        }
+
+        // 2. Whitespace-only string documentation
+        let item_ws_str = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::TEXT),
+            documentation: Some(Documentation::String("   \n\t  ".to_string())),
+            ..Default::default()
+        };
+        let resolved_ws = resolve_completion_item_async(item_ws_str, &cache).await;
+        match resolved_ws.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert!(markup.value.to_lowercase().contains("git"));
+            }
+            other => panic!(
+                "Expected whitespace string doc on external command to be resolved, got {other:?}"
+            ),
+        }
+
+        // 3. Empty MarkupContent documentation
+        let item_empty_markup = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "".to_string(),
+            })),
+            ..Default::default()
+        };
+        let resolved_markup = resolve_completion_item_async(item_empty_markup, &cache).await;
+        match resolved_markup.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert!(markup.value.to_lowercase().contains("git"));
+            }
+            other => panic!(
+                "Expected empty markup doc on external command to be resolved, got {other:?}"
+            ),
+        }
+
+        // 4. Nonexistent external command with empty documentation returns None
+        let dummy = "nonexistent_dummy_binary_with_empty_doc";
+        let dummy_item = CompletionItem {
+            label: dummy.to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            documentation: Some(Documentation::String("   ".to_string())),
+            ..Default::default()
+        };
+        let resolved_dummy = resolve_completion_item_async(dummy_item, &cache).await;
+        assert_eq!(resolved_dummy.documentation, None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_ineligible_label_edge_cases() {
+        let cache = ManCache::new();
+
+        let edge_labels = [
+            ".gitignore",
+            ".zshrc",
+            "..",
+            "...",
+            "::",
+            ":wq",
+            "git.",
+            "test:",
+            "_",
+            "__",
+            "-v",
+            "--flag",
+        ];
+
+        for label in edge_labels {
+            let item = CompletionItem {
+                label: label.to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                ..Default::default()
+            };
+            let resolved = resolve_completion_item_async(item, &cache).await;
+            assert_eq!(
+                resolved.documentation, None,
+                "Label '{label}' must not resolve external man documentation"
+            );
+            assert!(
+                !cache.contains_key(label),
+                "Label '{label}' must not be stored in man_cache"
+            );
+        }
     }
 }

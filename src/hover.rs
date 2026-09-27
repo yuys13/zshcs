@@ -199,8 +199,16 @@ pub fn clean_man_text(raw: &str) -> String {
     cleaned.trim_end().to_string()
 }
 
-/// Retrieves the manual page for an external command asynchronously with a timeout.
-pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManPageResult {
+    Found(String),
+    NotFound,
+    Timeout,
+    Error(String),
+}
+
+/// Retrieves the manual page for an external command asynchronously with a timeout, returning a detailed result.
+pub async fn get_man_page_result(word: &str, timeout_dur: Duration) -> ManPageResult {
     let target = if let Some(slash_idx) = word.rfind('/') {
         &word[slash_idx + 1..]
     } else {
@@ -208,7 +216,7 @@ pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
     };
 
     if target.is_empty() || target.len() > 256 || target.starts_with('-') {
-        return None;
+        return ManPageResult::NotFound;
     }
 
     // Only allow alphanumeric and safe command characters
@@ -216,7 +224,7 @@ pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
         .chars()
         .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
     {
-        return None;
+        return ManPageResult::NotFound;
     }
 
     let mut cmd = tokio::process::Command::new("man");
@@ -242,27 +250,36 @@ pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
             let stdout_str = String::from_utf8_lossy(&output.stdout);
             let cleaned = clean_man_text(&stdout_str);
             if cleaned.trim().is_empty() {
-                None
+                ManPageResult::NotFound
             } else {
-                Some(cleaned)
+                ManPageResult::Found(cleaned)
             }
         }
         Ok(Ok(output)) => {
-            eprintln!(
-                "man command exited with status: {:?}, stderr: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr)
+            tracing::debug!(
+                word = %target,
+                status = ?output.status.code(),
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "man command exited with non-zero status"
             );
-            None
+            ManPageResult::NotFound
         }
         Ok(Err(e)) => {
-            eprintln!("Failed to execute man command: {e}");
-            None
+            tracing::debug!(word = %target, error = %e, "Failed to execute man command");
+            ManPageResult::Error(e.to_string())
         }
         Err(_) => {
-            eprintln!("man command timed out");
-            None
+            tracing::debug!(word = %target, "man command timed out");
+            ManPageResult::Timeout
         }
+    }
+}
+
+/// Retrieves the manual page for an external command asynchronously with a timeout.
+pub async fn get_man_page(word: &str, timeout_dur: Duration) -> Option<String> {
+    match get_man_page_result(word, timeout_dur).await {
+        ManPageResult::Found(page) => Some(page),
+        _ => None,
     }
 }
 
@@ -539,16 +556,21 @@ pub async fn get_hover_info_with_timeout(
         return None;
     }
 
+    let markdown = format_man_markdown(&man_text);
+    Some(HoverContents::Markup(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value: markdown,
+    }))
+}
+
+/// Formats raw manual page text into a Markdown code block with dynamic fence escaping.
+pub fn format_man_markdown(man_text: &str) -> String {
     let mut fence_len = 3;
     while man_text.contains(&"`".repeat(fence_len)) {
         fence_len += 1;
     }
     let fence = "`".repeat(fence_len);
-    let markdown = format!("{fence}text\n{man_text}\n{fence}");
-    Some(HoverContents::Markup(MarkupContent {
-        kind: MarkupKind::Markdown,
-        value: markdown,
-    }))
+    format!("{fence}text\n{man_text}\n{fence}")
 }
 
 #[cfg(test)]
@@ -1014,5 +1036,20 @@ mod tests {
         // Multibyte overwrite
         let raw_overwrite = "あ\x08い";
         assert_eq!(clean_man_text(raw_overwrite), "い");
+    }
+
+    #[test]
+    fn test_format_man_markdown_escaping() {
+        let plain = "NAME\n    git - fast version control";
+        assert_eq!(
+            format_man_markdown(plain),
+            "```text\nNAME\n    git - fast version control\n```"
+        );
+
+        let with_backticks = "Run ```command``` to execute.";
+        assert_eq!(
+            format_man_markdown(with_backticks),
+            "````text\nRun ```command``` to execute.\n````"
+        );
     }
 }

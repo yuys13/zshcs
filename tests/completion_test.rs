@@ -2226,3 +2226,232 @@ async fn test_completion_resolve_real_zsh_daemon_e2e() {
         other => panic!("Expected MarkupContent for 'while', got {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn test_completion_resolve_external_command_man_e2e() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///resolve_man_external.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git").await;
+
+    let item = CompletionItem {
+        label: "git".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        detail: Some("external command".to_string()),
+        ..Default::default()
+    };
+
+    let resolved = test_client
+        .send_request::<request::ResolveCompletionItem>(item)
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.label, "git");
+    assert_eq!(resolved.kind, Some(CompletionItemKind::FUNCTION));
+    match resolved.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.starts_with("```text\n"));
+            assert!(markup.value.ends_with("\n```"));
+            assert!(
+                markup.value.to_lowercase().contains("git")
+                    || markup.value.to_lowercase().contains("repository")
+            );
+        }
+        other => panic!(
+            "Expected MarkupContent documentation for 'git', got {:?}",
+            other
+        ),
+    }
+}
+
+#[tokio::test]
+async fn test_completion_resolve_caching_and_negative_caching_e2e() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///resolve_caching.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git").await;
+
+    // 1. Initial resolution for 'git'
+    let git_item = CompletionItem {
+        label: "git".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        ..Default::default()
+    };
+
+    let start_1 = std::time::Instant::now();
+    let resolved_git_1 = test_client
+        .send_request::<request::ResolveCompletionItem>(git_item.clone())
+        .await
+        .unwrap();
+    let elapsed_1 = start_1.elapsed();
+    assert!(resolved_git_1.documentation.is_some());
+
+    // 2. Second resolution for 'git' should hit cache and be extremely fast
+    let start_2 = std::time::Instant::now();
+    let resolved_git_2 = test_client
+        .send_request::<request::ResolveCompletionItem>(git_item)
+        .await
+        .unwrap();
+    let elapsed_2 = start_2.elapsed();
+    assert_eq!(resolved_git_1.documentation, resolved_git_2.documentation);
+    assert!(elapsed_2 <= elapsed_1 + Duration::from_millis(100));
+
+    // 3. Initial resolution for nonexistent command (triggers negative caching)
+    let dummy_item = CompletionItem {
+        label: "nonexistent_dummy_binary_rpc_999".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        ..Default::default()
+    };
+
+    let resolved_dummy_1 = test_client
+        .send_request::<request::ResolveCompletionItem>(dummy_item.clone())
+        .await
+        .unwrap();
+    assert_eq!(resolved_dummy_1.documentation, None);
+
+    // 4. Second resolution for nonexistent command returns immediately from negative cache
+    let resolved_dummy_2 = test_client
+        .send_request::<request::ResolveCompletionItem>(dummy_item)
+        .await
+        .unwrap();
+    assert_eq!(resolved_dummy_2.documentation, None);
+}
+
+#[tokio::test]
+async fn test_completion_resolve_real_zsh_daemon_external_command_e2e() {
+    use tower_lsp::lsp_types::{
+        InitializeParams, InitializedParams, notification::Initialized, request::Initialize,
+    };
+
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    // Initialize handshake
+    test_client
+        .send_request::<Initialize>(InitializeParams::default())
+        .await
+        .unwrap();
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+
+    let doc_uri = Url::parse("file:///real_daemon_git.zsh").unwrap();
+    test_client
+        .send_notification::<tower_lsp::lsp_types::notification::DidOpenTextDocument>(
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: "gi".to_string(),
+                },
+            },
+        )
+        .await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 2),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let items = get_completion_items(res);
+    let git_item = items
+        .iter()
+        .find(|item| item.label == "git")
+        .expect("Real daemon completion items must contain 'git'");
+    assert_eq!(git_item.documentation, None);
+
+    // Resolve 'git' candidate returned by real Zsh completion daemon
+    let resolved_git = test_client
+        .send_request::<request::ResolveCompletionItem>(git_item.clone())
+        .await
+        .unwrap();
+    assert_eq!(resolved_git.label, "git");
+    match resolved_git.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(
+                markup.value.to_lowercase().contains("git")
+                    || markup.value.to_lowercase().contains("repository")
+            );
+        }
+        other => panic!(
+            "Expected MarkupContent for real daemon 'git', got {:?}",
+            other
+        ),
+    }
+}
+
+#[tokio::test]
+async fn test_completion_resolve_external_command_empty_doc_placeholder_e2e() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///resolve_empty_doc.zsh").unwrap();
+    test_client.init_and_open(&doc_uri, "git").await;
+
+    // 1. External command candidate with empty string doc placeholder
+    let item_with_empty_doc = CompletionItem {
+        label: "git".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        documentation: Some(Documentation::String("   ".to_string())),
+        ..Default::default()
+    };
+
+    let resolved = test_client
+        .send_request::<request::ResolveCompletionItem>(item_with_empty_doc)
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.label, "git");
+    match resolved.documentation {
+        Some(Documentation::MarkupContent(markup)) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(
+                markup.value.to_lowercase().contains("git")
+                    || markup.value.to_lowercase().contains("repository")
+            );
+        }
+        other => panic!(
+            "Expected MarkupContent for git with empty doc placeholder, got {:?}",
+            other
+        ),
+    }
+
+    // 2. Ineligible candidates (hidden files, colon-prefixed) safely fall through to None
+    let dotfile_item = CompletionItem {
+        label: ".gitignore".to_string(),
+        kind: Some(CompletionItemKind::TEXT),
+        ..Default::default()
+    };
+    let resolved_dotfile = test_client
+        .send_request::<request::ResolveCompletionItem>(dotfile_item)
+        .await
+        .unwrap();
+    assert_eq!(resolved_dotfile.documentation, None);
+
+    let colon_item = CompletionItem {
+        label: ":wq".to_string(),
+        kind: Some(CompletionItemKind::TEXT),
+        ..Default::default()
+    };
+    let resolved_colon = test_client
+        .send_request::<request::ResolveCompletionItem>(colon_item)
+        .await
+        .unwrap();
+    assert_eq!(resolved_colon.documentation, None);
+}

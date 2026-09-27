@@ -1248,3 +1248,56 @@ async fn test_stress_concurrent_50_clients_resolve() {
         h.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn test_stress_concurrent_50_clients_resolve_external_command_man_cache() {
+    use std::time::Duration;
+    use zshcs::completion::{ManCache, resolve_completion_item_async_with_timeout};
+
+    let count = 50;
+    let barrier = Arc::new(Barrier::new(count));
+    let cache = Arc::new(ManCache::new());
+
+    let git_item = CompletionItem {
+        label: "git".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        ..Default::default()
+    };
+
+    let handles: Vec<_> = (0..count)
+        .map(|i| {
+            let b = barrier.clone();
+            let cache_clone = Arc::clone(&cache);
+            let item = git_item.clone();
+            tokio::spawn(async move {
+                b.wait().await; // Synchronize simultaneous resolve burst
+
+                let resolved = resolve_completion_item_async_with_timeout(
+                    item,
+                    &cache_clone,
+                    Duration::from_millis(5000),
+                )
+                .await;
+                match resolved.documentation {
+                    Some(Documentation::MarkupContent(ref markup)) => {
+                        assert_eq!(markup.kind, MarkupKind::Markdown);
+                        assert!(
+                            markup.value.to_lowercase().contains("git")
+                                || markup.value.to_lowercase().contains("repository")
+                        );
+                    }
+                    other => panic!("Client {i}: Expected MarkupContent for git, got {other:?}"),
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    assert!(cache.contains_key("git"));
+    let cached = cache.get("git").unwrap();
+    let doc = cached.as_ref().expect("git man page should be cached");
+    assert!(doc.to_lowercase().contains("git") || doc.to_lowercase().contains("repository"));
+}
