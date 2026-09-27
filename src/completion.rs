@@ -1326,6 +1326,394 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
     symbols
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellContext {
+    Normal,
+    DoubleQuote,
+    SingleQuote,
+    Subshell,
+    Arithmetic,
+    Backtick,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionContext {
+    None,
+    Variable,
+    Arithmetic,
+    CommandOrWord,
+}
+
+/// Analyzes `line_prefix` to determine the active shell completion context and token.
+pub fn determine_completion_context(line_prefix: &str) -> (CompletionContext, &str) {
+    let bytes = line_prefix.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut stack: Vec<ShellContext> = vec![ShellContext::Normal];
+    let mut in_comment = false;
+    let mut param_brace_depth: usize = 0;
+
+    while i < len {
+        let b = bytes[i];
+        let current = *stack.last().unwrap_or(&ShellContext::Normal);
+
+        if b == b'\\' && current != ShellContext::SingleQuote && i + 1 < len {
+            i += 2;
+            continue;
+        }
+
+        match current {
+            ShellContext::SingleQuote => {
+                if b == b'\'' {
+                    stack.pop();
+                }
+            }
+            ShellContext::DoubleQuote => {
+                if b == b'"' {
+                    stack.pop();
+                } else if b == b'`' {
+                    stack.push(ShellContext::Backtick);
+                } else if b == b'$' && i + 2 < len && bytes[i + 1] == b'(' && bytes[i + 2] == b'(' {
+                    stack.push(ShellContext::Arithmetic);
+                    i += 3;
+                    continue;
+                } else if b == b'$' && i + 1 < len && bytes[i + 1] == b'(' {
+                    stack.push(ShellContext::Subshell);
+                    i += 2;
+                    continue;
+                } else if b == b'{' && i > 0 && bytes[i - 1] == b'$' {
+                    param_brace_depth += 1;
+                } else if b == b'}' && param_brace_depth > 0 {
+                    param_brace_depth -= 1;
+                }
+            }
+            ShellContext::Backtick => {
+                if b == b'`' {
+                    stack.pop();
+                } else if b == b'\'' {
+                    stack.push(ShellContext::SingleQuote);
+                } else if b == b'"' {
+                    stack.push(ShellContext::DoubleQuote);
+                }
+            }
+            ShellContext::Arithmetic => {
+                if b == b')' && i + 1 < len && bytes[i + 1] == b')' {
+                    stack.pop();
+                    i += 2;
+                    continue;
+                } else if b == b'$' && i + 1 < len && bytes[i + 1] == b'(' {
+                    stack.push(ShellContext::Subshell);
+                    i += 2;
+                    continue;
+                } else if b == b'`' {
+                    stack.push(ShellContext::Backtick);
+                } else if b == b'"' {
+                    stack.push(ShellContext::DoubleQuote);
+                } else if b == b'\'' {
+                    stack.push(ShellContext::SingleQuote);
+                }
+            }
+            ShellContext::Normal | ShellContext::Subshell => {
+                if b == b'{' && i > 0 && bytes[i - 1] == b'$' {
+                    param_brace_depth += 1;
+                } else if b == b'}' && param_brace_depth > 0 {
+                    param_brace_depth -= 1;
+                } else if param_brace_depth == 0 && b == b'#' {
+                    let is_comment_start = i == 0
+                        || bytes[i - 1].is_ascii_whitespace()
+                        || bytes[i - 1] == b';'
+                        || bytes[i - 1] == b'&'
+                        || bytes[i - 1] == b'|'
+                        || bytes[i - 1] == b'('
+                        || bytes[i - 1] == b'`';
+                    if is_comment_start {
+                        in_comment = true;
+                        break;
+                    }
+                } else if b == b'\'' {
+                    stack.push(ShellContext::SingleQuote);
+                } else if b == b'"' {
+                    stack.push(ShellContext::DoubleQuote);
+                } else if b == b'`' {
+                    stack.push(ShellContext::Backtick);
+                } else if b == b'$' && i + 2 < len && bytes[i + 1] == b'(' && bytes[i + 2] == b'(' {
+                    stack.push(ShellContext::Arithmetic);
+                    i += 3;
+                    continue;
+                } else if b == b'(' && i + 1 < len && bytes[i + 1] == b'(' {
+                    stack.push(ShellContext::Arithmetic);
+                    i += 2;
+                    continue;
+                } else if b == b'$' && i + 1 < len && bytes[i + 1] == b'(' {
+                    stack.push(ShellContext::Subshell);
+                    i += 2;
+                    continue;
+                } else if b == b'(' {
+                    stack.push(ShellContext::Subshell);
+                } else if b == b')' && current == ShellContext::Subshell {
+                    stack.pop();
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let current = *stack.last().unwrap_or(&ShellContext::Normal);
+    if in_comment || current == ShellContext::SingleQuote {
+        return (CompletionContext::None, "");
+    }
+
+    // 1. Check for variable context (`$VAR`, `${VAR}`, `${#VAR}`)
+    let mut var_ident_start = line_prefix.len();
+    for (idx, c) in line_prefix.char_indices().rev() {
+        if is_var_ident_char(c) {
+            var_ident_start = idx;
+        } else {
+            break;
+        }
+    }
+
+    let before_var_ident = &line_prefix[..var_ident_start];
+    let is_dollar_var = if before_var_ident.ends_with("${#") {
+        Some(&line_prefix[var_ident_start - 3..])
+    } else if before_var_ident.ends_with("${") {
+        Some(&line_prefix[var_ident_start - 2..])
+    } else if before_var_ident.ends_with('$') && !before_var_ident.ends_with("$$") {
+        Some(&line_prefix[var_ident_start - 1..])
+    } else {
+        None
+    };
+
+    if let Some(token) = is_dollar_var {
+        return (CompletionContext::Variable, token);
+    }
+
+    // 2. Non-dollar contexts
+    match current {
+        ShellContext::Arithmetic => {
+            if line_prefix.ends_with(|c: char| c.is_whitespace()) {
+                (CompletionContext::Arithmetic, "")
+            } else {
+                (
+                    CompletionContext::Arithmetic,
+                    &line_prefix[var_ident_start..],
+                )
+            }
+        }
+        ShellContext::DoubleQuote => {
+            // In a double-quoted string without a leading $, words are string literals,
+            // NOT executable functions or commands.
+            (CompletionContext::None, "")
+        }
+        ShellContext::Normal | ShellContext::Subshell | ShellContext::Backtick => {
+            if line_prefix.ends_with(|c: char| c.is_whitespace()) {
+                if is_command_position(line_prefix) {
+                    (CompletionContext::CommandOrWord, "")
+                } else {
+                    (CompletionContext::None, "")
+                }
+            } else {
+                let mut func_ident_start = line_prefix.len();
+                for (idx, c) in line_prefix.char_indices().rev() {
+                    if is_func_ident_char(c) {
+                        func_ident_start = idx;
+                    } else {
+                        break;
+                    }
+                }
+
+                let before_func_ident = &line_prefix[..func_ident_start];
+                if before_func_ident.ends_with('/')
+                    || before_func_ident.ends_with('=')
+                    || before_func_ident.ends_with(':')
+                    || before_func_ident.trim_end().ends_with(['>', '<'])
+                {
+                    return (CompletionContext::None, "");
+                }
+
+                (
+                    CompletionContext::CommandOrWord,
+                    &line_prefix[func_ident_start..],
+                )
+            }
+        }
+        ShellContext::SingleQuote => (CompletionContext::None, ""),
+    }
+}
+
+/// Extracts the token immediately preceding the cursor from `line_prefix`.
+pub fn extract_completion_token(line_prefix: &str) -> &str {
+    let (_, token) = determine_completion_context(line_prefix);
+    token
+}
+
+/// Checks whether `line_prefix` places the cursor in a command execution position.
+fn is_command_position(line_prefix: &str) -> bool {
+    let trimmed = line_prefix.trim_end();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.ends_with("((") {
+        return false;
+    }
+    if trimmed.ends_with(';')
+        || trimmed.ends_with('|')
+        || trimmed.ends_with('&')
+        || trimmed.ends_with('(')
+        || trimmed.ends_with('`')
+        || trimmed.ends_with('{')
+    {
+        return true;
+    }
+
+    let last_word = trimmed.split_whitespace().next_back().unwrap_or("");
+    matches!(last_word, "then" | "do" | "else" | "elif")
+}
+
+/// Filters and maps local symbols according to the current cursor context within `line_prefix`.
+pub fn filter_local_symbols(
+    local_symbols: &[LocalSymbol],
+    line_prefix: &str,
+) -> Vec<CompletionItem> {
+    let (context, token) = determine_completion_context(line_prefix);
+    let mut items = Vec::new();
+
+    match context {
+        CompletionContext::Variable => {
+            let var_prefix = if let Some(stripped) = token.strip_prefix("${#") {
+                stripped
+            } else if let Some(stripped) = token.strip_prefix("${") {
+                stripped
+            } else {
+                token.strip_prefix('$').unwrap_or("")
+            };
+
+            for sym in local_symbols {
+                if sym.kind == LocalSymbolKind::Variable && sym.name.starts_with(var_prefix) {
+                    items.push(CompletionItem {
+                        label: sym.name.clone(),
+                        kind: Some(CompletionItemKind::VARIABLE),
+                        detail: sym
+                            .detail
+                            .clone()
+                            .or_else(|| Some("(local variable)".to_string())),
+                        sort_text: Some(format!("00_{}", sym.name)),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        CompletionContext::Arithmetic => {
+            let var_prefix = if let Some(stripped) = token.strip_prefix('$') {
+                stripped
+            } else {
+                token
+            };
+
+            for sym in local_symbols {
+                if sym.kind == LocalSymbolKind::Variable && sym.name.starts_with(var_prefix) {
+                    items.push(CompletionItem {
+                        label: sym.name.clone(),
+                        kind: Some(CompletionItemKind::VARIABLE),
+                        detail: sym
+                            .detail
+                            .clone()
+                            .or_else(|| Some("(local variable)".to_string())),
+                        sort_text: Some(format!("00_{}", sym.name)),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        CompletionContext::CommandOrWord => {
+            let func_prefix = token;
+            let eligible = !func_prefix.is_empty() || is_command_position(line_prefix);
+            if eligible {
+                for sym in local_symbols {
+                    if sym.kind == LocalSymbolKind::Function && sym.name.starts_with(func_prefix) {
+                        items.push(CompletionItem {
+                            label: sym.name.clone(),
+                            kind: Some(CompletionItemKind::FUNCTION),
+                            detail: sym
+                                .detail
+                                .clone()
+                                .or_else(|| Some("(local function)".to_string())),
+                            sort_text: Some(format!("00_{}", sym.name)),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+        CompletionContext::None => {}
+    }
+
+    items
+}
+
+/// Determines whether a daemon candidate label matches a local candidate label,
+/// accounting for variable prefix variations like `$VAR` or `${VAR}`, as well as
+/// colon-separated descriptions like `VAR:description`.
+fn daemon_label_matches_local(daemon_label: &str, local_label: &str) -> bool {
+    let raw_daemon = daemon_label
+        .split_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(daemon_label)
+        .trim();
+
+    if raw_daemon == local_label {
+        return true;
+    }
+    if let Some(stripped) = raw_daemon.strip_prefix('$')
+        && stripped == local_label
+    {
+        return true;
+    }
+    if let Some(stripped) = raw_daemon.strip_prefix("${") {
+        let inner = stripped.strip_suffix('}').unwrap_or(stripped);
+        let unhashed = inner.strip_prefix('#').unwrap_or(inner);
+        if unhashed == local_label {
+            return true;
+        }
+    }
+    false
+}
+
+/// Merges candidates returned from the Zsh completion daemon with local symbols.
+///
+/// Local definitions are prioritized at the top of the candidate list with their
+/// corresponding `(local ...)` detail annotations. If any candidate returned by
+/// the daemon matches a local symbol, the duplicate daemon entry is omitted.
+pub fn merge_local_completions(
+    daemon_items: Vec<CompletionItem>,
+    local_symbols: &[LocalSymbol],
+    line_prefix: &str,
+) -> Vec<CompletionItem> {
+    let local_items = filter_local_symbols(local_symbols, line_prefix);
+    if local_items.is_empty() {
+        return daemon_items;
+    }
+
+    let mut merged = Vec::with_capacity(local_items.len() + daemon_items.len());
+
+    // 1. Add all filtered local items
+    for item in &local_items {
+        merged.push(item.clone());
+    }
+
+    // 2. Append non-duplicate daemon items
+    for daemon_item in daemon_items {
+        let is_duplicate = local_items
+            .iter()
+            .any(|loc| daemon_label_matches_local(&daemon_item.label, &loc.label));
+        if !is_duplicate {
+            merged.push(daemon_item);
+        }
+    }
+
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3388,5 +3776,341 @@ local \
             detect_heredoc_delimiter(line2),
             Some("MY_DELIM".to_string())
         );
+    }
+
+    #[test]
+    fn test_is_command_position_no_false_positives() {
+        assert!(is_command_position(""));
+        assert!(is_command_position("   "));
+        assert!(is_command_position("echo foo; "));
+        assert!(is_command_position("echo foo | "));
+        assert!(is_command_position("echo foo && "));
+        assert!(is_command_position("echo foo || "));
+        assert!(is_command_position("echo $( "));
+        assert!(is_command_position("if true; then "));
+        assert!(is_command_position("for x in 1 2; do "));
+        assert!(is_command_position("if true; then :; else "));
+
+        // Negative cases: words ending in "do", "then", "else" must NOT trigger command position
+        assert!(!is_command_position("echo todo "));
+        assert!(!is_command_position("echo pseudo "));
+        assert!(!is_command_position("cat /path/to/something_else "));
+        assert!(!is_command_position("grep lengthen "));
+    }
+
+    #[test]
+    fn test_extract_completion_token() {
+        assert_eq!(extract_completion_token("echo $MY_"), "$MY_");
+        assert_eq!(extract_completion_token("echo ${MY_"), "${MY_");
+        assert_eq!(extract_completion_token("echo \"$MY_"), "$MY_");
+        assert_eq!(extract_completion_token("echo \"${MY_"), "${MY_");
+        assert_eq!(extract_completion_token("FOO=$MY_"), "$MY_");
+        assert_eq!(extract_completion_token("FOO=${MY_"), "${MY_");
+        assert_eq!(extract_completion_token("PATH=$PATH:$MY_"), "$MY_");
+        assert_eq!(extract_completion_token("echo /path/to/$MY_"), "$MY_");
+        assert_eq!(extract_completion_token("echo -Dprop=$MY_"), "$MY_");
+        assert_eq!(extract_completion_token("arr[$MY_"), "$MY_");
+        assert_eq!(extract_completion_token("echo foo,$MY_"), "$MY_");
+        assert_eq!(extract_completion_token("FOO=$"), "$");
+        assert_eq!(extract_completion_token("FOO=${"), "${");
+        assert_eq!(extract_completion_token("echo ${#MY_"), "${#MY_");
+        assert_eq!(extract_completion_token("echo /path/to/my_"), "");
+        assert_eq!(extract_completion_token("./my_"), "");
+        assert_eq!(extract_completion_token("my_func"), "my_func");
+        assert_eq!(extract_completion_token("cat file.txt | my_"), "my_");
+        assert_eq!(extract_completion_token("foo; my_"), "my_");
+        assert_eq!(extract_completion_token("echo $(my_"), "my_");
+        assert_eq!(extract_completion_token("echo "), "");
+        assert_eq!(extract_completion_token("# echo $MY_"), "");
+        assert_eq!(extract_completion_token("echo '$MY_"), "");
+    }
+
+    #[test]
+    fn test_filter_local_symbols_sort_text_priority() {
+        let syms = vec![
+            LocalSymbol::new("my_var", LocalSymbolKind::Variable),
+            LocalSymbol::new("my_func", LocalSymbolKind::Function),
+        ];
+        let var_items = filter_local_symbols(&syms, "echo $my_");
+        assert_eq!(var_items.len(), 1);
+        assert_eq!(var_items[0].sort_text.as_deref(), Some("00_my_var"));
+
+        let func_items = filter_local_symbols(&syms, "my_");
+        assert_eq!(func_items.len(), 1);
+        assert_eq!(func_items[0].sort_text.as_deref(), Some("00_my_func"));
+    }
+
+    #[test]
+    fn test_daemon_label_matches_local_with_colon_description() {
+        assert!(daemon_label_matches_local("PATH:system path", "PATH"));
+        assert!(daemon_label_matches_local("$PATH:system path", "PATH"));
+        assert!(daemon_label_matches_local("${PATH}:system path", "PATH"));
+        assert!(daemon_label_matches_local(
+            "my_func:user function",
+            "my_func"
+        ));
+    }
+
+    #[test]
+    fn test_filter_local_symbols_variable_context() {
+        let symbols = vec![
+            LocalSymbol::new("MY_VAR", LocalSymbolKind::Variable),
+            LocalSymbol::new("OTHER_VAR", LocalSymbolKind::Variable),
+            LocalSymbol::new("my_func", LocalSymbolKind::Function),
+        ];
+
+        // 1. $MY_ matches only MY_VAR
+        let res = filter_local_symbols(&symbols, "echo $MY_");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].label, "MY_VAR");
+        assert_eq!(res[0].kind, Some(CompletionItemKind::VARIABLE));
+        assert_eq!(res[0].detail.as_deref(), Some("(local variable)"));
+
+        // 2. ${MY_ matches only MY_VAR
+        let res_braced = filter_local_symbols(&symbols, "echo ${MY_");
+        assert_eq!(res_braced.len(), 1);
+        assert_eq!(res_braced[0].label, "MY_VAR");
+
+        // 3. $ matches all variables, no functions
+        let res_all_vars = filter_local_symbols(&symbols, "echo $");
+        let labels: Vec<&str> = res_all_vars.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["MY_VAR", "OTHER_VAR"]);
+    }
+
+    #[test]
+    fn test_filter_local_symbols_function_context() {
+        let symbols = vec![
+            LocalSymbol::new("my_func", LocalSymbolKind::Function),
+            LocalSymbol::new("other_func", LocalSymbolKind::Function),
+            LocalSymbol::new("my_var", LocalSymbolKind::Variable),
+        ];
+
+        // 1. my_ matches only my_func
+        let res = filter_local_symbols(&symbols, "my_");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].label, "my_func");
+        assert_eq!(res[0].kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(res[0].detail.as_deref(), Some("(local function)"));
+
+        // 2. Pipe command position
+        let res_pipe = filter_local_symbols(&symbols, "echo foo | other_");
+        assert_eq!(res_pipe.len(), 1);
+        assert_eq!(res_pipe[0].label, "other_func");
+
+        // 3. Normal word input after space that is not command position
+        let res_arg = filter_local_symbols(&symbols, "echo ");
+        assert!(res_arg.is_empty());
+    }
+
+    #[test]
+    fn test_merge_local_completions_deduplication() {
+        let symbols = vec![
+            LocalSymbol::new("LOCAL_VAR", LocalSymbolKind::Variable),
+            LocalSymbol::new("SHARED_VAR", LocalSymbolKind::Variable),
+            LocalSymbol::new("my_func", LocalSymbolKind::Function),
+        ];
+
+        let daemon_items = vec![
+            CompletionItem {
+                label: "$SHARED_VAR".to_string(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some("global var".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "$DAEMON_VAR".to_string(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some("global var".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        // Complete $
+        let merged = merge_local_completions(daemon_items, &symbols, "echo $");
+
+        // LOCAL_VAR and SHARED_VAR should come from local items
+        // $SHARED_VAR from daemon should be omitted (deduplicated)
+        // $DAEMON_VAR should remain
+        let labels: Vec<&str> = merged.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["LOCAL_VAR", "SHARED_VAR", "$DAEMON_VAR"]);
+        assert_eq!(merged[1].detail.as_deref(), Some("(local variable)"));
+    }
+
+    #[test]
+    fn test_determine_completion_context() {
+        assert_eq!(
+            determine_completion_context("echo $VAR"),
+            (CompletionContext::Variable, "$VAR")
+        );
+        assert_eq!(
+            determine_completion_context("echo \"hello $VAR"),
+            (CompletionContext::Variable, "$VAR")
+        );
+        assert_eq!(
+            determine_completion_context("echo \"hello my_"),
+            (CompletionContext::None, "")
+        );
+        assert_eq!(
+            determine_completion_context("echo 'hello $VAR"),
+            (CompletionContext::None, "")
+        );
+        assert_eq!(
+            determine_completion_context("echo $((VAR"),
+            (CompletionContext::Arithmetic, "VAR")
+        );
+        assert_eq!(
+            determine_completion_context("echo $((1 + VAR"),
+            (CompletionContext::Arithmetic, "VAR")
+        );
+        assert_eq!(
+            determine_completion_context("((VAR"),
+            (CompletionContext::Arithmetic, "VAR")
+        );
+        assert_eq!(
+            determine_completion_context("echo \"$(my_"),
+            (CompletionContext::CommandOrWord, "my_")
+        );
+        assert_eq!(
+            determine_completion_context("echo `my_"),
+            (CompletionContext::CommandOrWord, "my_")
+        );
+        assert_eq!(
+            determine_completion_context("echo $(my_"),
+            (CompletionContext::CommandOrWord, "my_")
+        );
+    }
+
+    #[test]
+    fn test_filter_local_symbols_arithmetic_context() {
+        let syms = vec![
+            LocalSymbol::new("COUNT", LocalSymbolKind::Variable),
+            LocalSymbol::new("TOTAL", LocalSymbolKind::Variable),
+            LocalSymbol::new("calculate", LocalSymbolKind::Function),
+        ];
+
+        // 1. Inside $(( ... )) without $
+        let res = filter_local_symbols(&syms, "echo $((COU");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].label, "COUNT");
+        assert_eq!(res[0].kind, Some(CompletionItemKind::VARIABLE));
+
+        // 2. Inside $(( 1 + ... )) without $
+        let res_expr = filter_local_symbols(&syms, "echo $((1 + TOT");
+        assert_eq!(res_expr.len(), 1);
+        assert_eq!(res_expr[0].label, "TOTAL");
+
+        // 3. Inside (( ... ))
+        let res_cmd = filter_local_symbols(&syms, "((COU");
+        assert_eq!(res_cmd.len(), 1);
+        assert_eq!(res_cmd[0].label, "COUNT");
+
+        // 4. Inside $(( ... )) after space suggests all variables, NO functions
+        let res_space = filter_local_symbols(&syms, "echo $(( ");
+        let labels: Vec<&str> = res_space.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["COUNT", "TOTAL"]);
+    }
+
+    #[test]
+    fn test_filter_local_symbols_double_quote_no_function_false_positives() {
+        let syms = vec![
+            LocalSymbol::new("my_func", LocalSymbolKind::Function),
+            LocalSymbol::new("MY_VAR", LocalSymbolKind::Variable),
+        ];
+
+        // Normal double-quoted string: function should NOT be suggested
+        let res_str = filter_local_symbols(&syms, "echo \"hello my_");
+        assert!(
+            res_str.is_empty(),
+            "Function must not be suggested in string literal"
+        );
+
+        // Normal double-quoted string: variable SHOULD be suggested
+        let res_var = filter_local_symbols(&syms, "echo \"hello $MY_");
+        assert_eq!(res_var.len(), 1);
+        assert_eq!(res_var[0].label, "MY_VAR");
+    }
+
+    #[test]
+    fn test_filter_local_symbols_subshell_and_backtick() {
+        let syms = vec![
+            LocalSymbol::new("my_func", LocalSymbolKind::Function),
+            LocalSymbol::new("MY_VAR", LocalSymbolKind::Variable),
+        ];
+
+        // Subshell inside double quotes: function SHOULD be suggested
+        let res_subshell = filter_local_symbols(&syms, "echo \"$(my_");
+        assert_eq!(res_subshell.len(), 1);
+        assert_eq!(res_subshell[0].label, "my_func");
+
+        // Backtick inside double quotes: function SHOULD be suggested
+        let res_backtick = filter_local_symbols(&syms, "echo \"`my_");
+        assert_eq!(res_backtick.len(), 1);
+        assert_eq!(res_backtick[0].label, "my_func");
+    }
+
+    #[test]
+    fn test_filter_local_symbols_assignment_and_redirection_no_functions() {
+        let syms = vec![
+            LocalSymbol::new("my_func", LocalSymbolKind::Function),
+            LocalSymbol::new("MY_VAR", LocalSymbolKind::Variable),
+        ];
+
+        // 1. Direct assignment RHS: functions must not be suggested
+        let res_assign = filter_local_symbols(&syms, "TARGET=my_");
+        assert!(
+            res_assign.is_empty(),
+            "Function must not be suggested as assignment value"
+        );
+
+        // 2. Redirection target: functions must not be suggested
+        let res_redir_out = filter_local_symbols(&syms, "cat > my_");
+        assert!(
+            res_redir_out.is_empty(),
+            "Function must not be suggested as output redirect target"
+        );
+        let res_redir_in = filter_local_symbols(&syms, "cat < my_");
+        assert!(
+            res_redir_in.is_empty(),
+            "Function must not be suggested as input redirect target"
+        );
+
+        // 3. Colon path: functions must not be suggested
+        let res_colon = filter_local_symbols(&syms, "export PATH=/bin:my_");
+        assert!(
+            res_colon.is_empty(),
+            "Function must not be suggested in colon separated path"
+        );
+    }
+
+    #[test]
+    fn test_daemon_label_matches_local_variants() {
+        assert!(daemon_label_matches_local("MY_VAR", "MY_VAR"));
+        assert!(daemon_label_matches_local("$MY_VAR", "MY_VAR"));
+        assert!(daemon_label_matches_local("${MY_VAR}", "MY_VAR"));
+        assert!(daemon_label_matches_local("${MY_VAR", "MY_VAR"));
+        assert!(daemon_label_matches_local("MY_VAR:description", "MY_VAR"));
+        assert!(daemon_label_matches_local("$MY_VAR:description", "MY_VAR"));
+        assert!(daemon_label_matches_local(
+            "${MY_VAR}:description",
+            "MY_VAR"
+        ));
+        assert!(daemon_label_matches_local("${#MY_VAR}", "MY_VAR"));
+        assert!(daemon_label_matches_local("${#MY_VAR", "MY_VAR"));
+        assert!(daemon_label_matches_local("${#MY_VAR}:length", "MY_VAR"));
+        assert!(!daemon_label_matches_local("OTHER_VAR", "MY_VAR"));
+    }
+
+    #[test]
+    fn test_filter_local_symbols_arithmetic_nested_subshell() {
+        let syms = vec![
+            LocalSymbol::new("my_calc_func", LocalSymbolKind::Function),
+            LocalSymbol::new("MY_VAR", LocalSymbolKind::Variable),
+        ];
+
+        // Inside subshell within arithmetic expansion: function SHOULD be suggested
+        let res_subshell = filter_local_symbols(&syms, "echo $(( 1 + $(my_calc_");
+        assert_eq!(res_subshell.len(), 1);
+        assert_eq!(res_subshell[0].label, "my_calc_func");
+        assert_eq!(res_subshell[0].kind, Some(CompletionItemKind::FUNCTION));
     }
 }
