@@ -87,6 +87,9 @@
 
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
+              git
+              man-db
+              man-pages
               rustToolchain
               zsh
             ];

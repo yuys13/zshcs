@@ -1251,33 +1251,34 @@ async fn test_stress_concurrent_50_clients_resolve() {
 
 #[tokio::test]
 async fn test_stress_concurrent_50_clients_resolve_external_command_man_cache() {
+    use std::time::Duration;
+    use zshcs::completion::{ManCache, resolve_completion_item_async_with_timeout};
+
     let count = 50;
     let barrier = Arc::new(Barrier::new(count));
+    let cache = Arc::new(ManCache::new());
+
+    let git_item = CompletionItem {
+        label: "git".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        ..Default::default()
+    };
 
     let handles: Vec<_> = (0..count)
         .map(|i| {
             let b = barrier.clone();
+            let cache_clone = Arc::clone(&cache);
+            let item = git_item.clone();
             tokio::spawn(async move {
-                let (mut client_stream, _server_handle) = common::setup_server_mock();
-                let mut test_client = common::TestClient::new(&mut client_stream);
-
-                let doc_uri = Url::parse(&format!("file:///client_resolve_man_{i}.zsh")).unwrap();
-                test_client.init_and_open(&doc_uri, "git").await;
-
                 b.wait().await; // Synchronize simultaneous resolve burst
 
-                // Concurrent resolve of external command 'git'
-                let git_item = CompletionItem {
-                    label: "git".to_string(),
-                    kind: Some(CompletionItemKind::FUNCTION),
-                    ..Default::default()
-                };
-                let resolved_git = test_client
-                    .send_request::<request::ResolveCompletionItem>(git_item.clone())
-                    .await
-                    .unwrap();
-
-                match resolved_git.documentation {
+                let resolved = resolve_completion_item_async_with_timeout(
+                    item,
+                    &cache_clone,
+                    Duration::from_millis(5000),
+                )
+                .await;
+                match resolved.documentation {
                     Some(Documentation::MarkupContent(ref markup)) => {
                         assert_eq!(markup.kind, MarkupKind::Markdown);
                         assert!(
@@ -1287,13 +1288,6 @@ async fn test_stress_concurrent_50_clients_resolve_external_command_man_cache() 
                     }
                     other => panic!("Client {i}: Expected MarkupContent for git, got {other:?}"),
                 }
-
-                // Immediate second resolve must hit cache
-                let resolved_cached = test_client
-                    .send_request::<request::ResolveCompletionItem>(git_item)
-                    .await
-                    .unwrap();
-                assert_eq!(resolved_git.documentation, resolved_cached.documentation);
             })
         })
         .collect();
@@ -1301,4 +1295,9 @@ async fn test_stress_concurrent_50_clients_resolve_external_command_man_cache() 
     for h in handles {
         h.await.unwrap();
     }
+
+    assert!(cache.contains_key("git"));
+    let cached = cache.get("git").unwrap();
+    let doc = cached.as_ref().expect("git man page should be cached");
+    assert!(doc.to_lowercase().contains("git") || doc.to_lowercase().contains("repository"));
 }

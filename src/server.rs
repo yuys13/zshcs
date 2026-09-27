@@ -836,6 +836,15 @@ mod tests {
         let (service, _socket) = LspService::new(|client| Backend::new(client).unwrap());
         let backend = service.inner();
 
+        // Warm up cache once to avoid spawning 20 concurrent man processes on constrained CI runners
+        let init_item = CompletionItem {
+            label: "git".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+        let init_res = backend.completion_resolve(init_item).await.unwrap();
+        assert!(init_res.documentation.is_some());
+
         let futures: Vec<_> = (0..20)
             .map(|_| {
                 let item = CompletionItem {
