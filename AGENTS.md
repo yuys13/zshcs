@@ -20,9 +20,24 @@ engine, and data flow, please refer to:
 All new code should be written following the principles of Test-Driven
 Development (TDD) as described by Kent Beck. This involves the following cycle:
 
-1. **Red**: Write a failing test for a new feature.
+1. **Red**: Write a failing test for a new feature. Run only the targeted test
+   (e.g., `cargo test <test_name>`) to confirm failure.
 2. **Green**: Write the minimum amount of code required to make the test pass.
-3. **Refactor**: Improve the code design while ensuring all tests still pass.
+   Verify with the targeted test.
+3. **Refactor**: Improve code design while keeping tests green. Run relevant
+   targeted tests to verify changes. Do NOT run full test suites repeatedly
+   during local refactoring loops; rely on targeted tests and leave repository-wide
+   verification to the pre-commit hook.
+
+### Testing and Context Efficiency Guidelines
+
+To conserve LLM context window and prevent redundant execution:
+
+- **Targeted Testing**: Always run specific tests instead of full test suites
+  during development (e.g., `cargo test <test_name>`, `cargo test --lib -- <module>`).
+  Avoid running `cargo test --all-targets` for iterative development.
+- **Quiet Mode**: Use quiet flags (e.g., `cargo test -q <test_name>`) to suppress
+  lengthy output lists that consume context.
 
 ## Project Structure
 
@@ -41,49 +56,18 @@ Development (TDD) as described by Kent Beck. This involves the following cycle:
 
 ## Pre-commit Checks
 
-Before committing any changes, please ensure that the following checks pass
-locally. These are the same checks that run in our CI pipeline.
-
-1. **Check formatting:**
-
-   ```bash
-   cargo fmt --check
-   ```
-
-2. **Run Clippy (linter):**
-
-   ```bash
-   cargo clippy --no-deps --all-targets -- -D warnings
-   ```
-
-3. **Build the project:**
-
-   ```bash
-   cargo build
-   ```
-
-4. **Run tests:**
-
-   ```bash
-   cargo test --all-targets
-   ```
-
-5. **Run Zsh script unit tests:**
-
-   ```bash
-   zsh tests/zsh/run_tests.zsh
-   ```
-
-Running these commands will help ensure that your changes are consistent with the
-project's standards and that all tests pass.
-
-### Native Git Pre-commit Hook
-
-You can configure Git to automatically run all pre-commit checks:
+All pre-commit verification (formatting, Clippy linting, build, Rust test suite,
+and Zsh script unit tests) is fully automated via the repository's native Git hook.
+Agents must ensure the hook is active:
 
 ```bash
 git config core.hooksPath .githooks
 ```
+
+Once configured, simply run `git commit`. The hook will automatically execute the
+full verification suite before accepting the commit. Do NOT manually run the full
+check suite prior to `git commit`, as the hook guarantees verification and running
+it beforehand duplicates work and wastes quota.
 
 ## Commit Messages
 
