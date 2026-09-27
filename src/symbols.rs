@@ -46,12 +46,12 @@ const RESERVED_KEYWORDS: &[&str] = &[
 ];
 
 /// Checks if a word is a reserved shell keyword.
-fn is_reserved_keyword(word: &str) -> bool {
+pub(crate) fn is_reserved_keyword(word: &str) -> bool {
     RESERVED_KEYWORDS.contains(&word)
 }
 
 /// Skips flags (e.g. `-T`, `-u`, `+x`) in a string and returns the remaining slice.
-fn skip_flags(input: &str) -> &str {
+pub(crate) fn skip_flags(input: &str) -> &str {
     let mut rest = input.trim_start();
     while rest.starts_with('-') || rest.starts_with('+') {
         let flag_len = rest

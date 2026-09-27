@@ -11,8 +11,8 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::completion::{
-    CAPTURE_ZSH, CompletionRequest, ManCache, ZPTYRC_ZSH, resolve_completion_item_async,
-    run_completion_daemon,
+    CAPTURE_ZSH, CompletionRequest, ManCache, ZPTYRC_ZSH, extract_local_symbols,
+    merge_local_completions, resolve_completion_item_async, run_completion_daemon,
 };
 use crate::config::Config;
 use crate::definition::find_definition;
@@ -455,7 +455,7 @@ impl LanguageServer for Backend {
         // Request completion from the daemon
         let (tx, rx) = oneshot::channel();
         let req = CompletionRequest {
-            prefix,
+            prefix: prefix.clone(),
             cwd,
             responder: tx,
         };
@@ -477,7 +477,13 @@ impl LanguageServer for Backend {
                     count = items.len(),
                     "Completion items retrieved successfully"
                 );
-                Ok(Some(CompletionResponse::Array(items)))
+                let local_symbols = if let Some(doc) = self.document_manager.get(&uri) {
+                    extract_local_symbols(&doc, position)
+                } else {
+                    Vec::new()
+                };
+                let merged = merge_local_completions(items, &local_symbols, &prefix);
+                Ok(Some(CompletionResponse::Array(merged)))
             }
             Ok(Ok(Err(e))) => {
                 tracing::error!(error = %e, "Completion daemon returned error");
