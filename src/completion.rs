@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -6,9 +7,16 @@ use tokio::time::timeout;
 use tower_lsp::Client;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind, MessageType,
+    Position,
 };
 
+use crate::definition::{
+    byte_to_utf16_col, find_read_command, is_func_ident_char, is_var_ident_char,
+    split_declaration_tokens, split_line_statements,
+};
+use crate::document::DocumentState;
 use crate::error::{ZshcsError, ZshcsResult};
+use crate::symbols::{is_reserved_keyword, skip_flags};
 
 pub const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
 pub const ZPTYRC_ZSH: &str = include_str!("../bin/zptyrc.zsh");
@@ -636,6 +644,686 @@ pub async fn resolve_completion_item_async(
     cache: &ManCache,
 ) -> CompletionItem {
     resolve_completion_item_async_with_timeout(item, cache, DEFAULT_RESOLVE_MAN_TIMEOUT).await
+}
+
+/// Kind of a locally discovered symbol within a script document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LocalSymbolKind {
+    /// Shell variable or parameter (e.g. `VAR=1`, `local x`, `for item in ...`).
+    Variable,
+    /// Shell function (e.g. `my_func() { ... }`, `function my_func { ... }`).
+    Function,
+}
+
+/// A locally defined symbol extracted from document text up to a given position.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LocalSymbol {
+    pub name: String,
+    pub kind: LocalSymbolKind,
+    pub detail: Option<String>,
+}
+
+impl LocalSymbol {
+    /// Creates a new `LocalSymbol` with standard detail string.
+    pub fn new(name: impl Into<String>, kind: LocalSymbolKind) -> Self {
+        let name = name.into();
+        let detail = match kind {
+            LocalSymbolKind::Variable => Some("(local variable)".to_string()),
+            LocalSymbolKind::Function => Some("(local function)".to_string()),
+        };
+        Self { name, kind, detail }
+    }
+
+    /// Creates a new `LocalSymbol` with an explicit detail string.
+    pub fn with_detail(
+        name: impl Into<String>,
+        kind: LocalSymbolKind,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            detail,
+        }
+    }
+}
+
+/// Helper to split words with their start byte offsets in a string.
+fn split_words_with_offsets(input: &str) -> Vec<(usize, &str)> {
+    let mut words = Vec::new();
+    let mut in_word = false;
+    let mut start = 0;
+
+    for (i, c) in input.char_indices() {
+        if c.is_whitespace() {
+            if in_word {
+                words.push((start, &input[start..i]));
+                in_word = false;
+            }
+        } else if !in_word {
+            start = i;
+            in_word = true;
+        }
+    }
+    if in_word {
+        words.push((start, &input[start..]));
+    }
+    words
+}
+
+/// Extracts locally defined variables and functions from an open document state
+/// that were defined at or before the given `position`.
+pub fn extract_local_symbols(doc: &DocumentState, position: Position) -> Vec<LocalSymbol> {
+    extract_local_symbols_from_text(doc.text(), position)
+}
+
+/// Extracts the heredoc delimiter from a line if one is introduced, e.g. `cat <<EOF` -> `"EOF"`.
+/// Skips comments and string literals so that `<<` inside `# ...` or `"..."` is ignored.
+fn detect_heredoc_delimiter(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_quote: Option<u8> = None;
+
+    let mut param_brace_depth: usize = 0;
+
+    while i < len {
+        let b = bytes[i];
+
+        if b == b'\\' && in_quote != Some(b'\'') && i + 1 < len {
+            i += 2;
+            continue;
+        }
+
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' || b == b'\'' || b == b'`' {
+            in_quote = Some(b);
+            i += 1;
+            continue;
+        }
+
+        if b == b'{' && i > 0 && bytes[i - 1] == b'$' {
+            param_brace_depth += 1;
+        } else if b == b'}' && param_brace_depth > 0 {
+            param_brace_depth -= 1;
+        } else if param_brace_depth == 0 && b == b'#' {
+            let is_comment_start = i == 0
+                || bytes[i - 1].is_ascii_whitespace()
+                || bytes[i - 1] == b';'
+                || bytes[i - 1] == b'&'
+                || bytes[i - 1] == b'|'
+                || bytes[i - 1] == b'('
+                || bytes[i - 1] == b'`';
+            if is_comment_start {
+                break;
+            }
+        }
+
+        if b == b'<' && i + 1 < len && bytes[i + 1] == b'<' {
+            // Exclude here-strings (<<<) or sequences preceded by <
+            if (i > 0 && bytes[i - 1] == b'<') || (i + 2 < len && bytes[i + 2] == b'<') {
+                i += 2;
+                continue;
+            }
+            let mut rest = &line[i + 2..];
+            if let Some(stripped) = rest.strip_prefix('-') {
+                rest = stripped;
+            }
+            let trimmed = rest.trim_start();
+            let delim_token = if let Some(stripped) = trimmed.strip_prefix('\'') {
+                stripped.split('\'').next()
+            } else if let Some(stripped) = trimmed.strip_prefix('"') {
+                stripped.split('"').next()
+            } else if let Some(stripped) = trimmed.strip_prefix('\\') {
+                stripped.split_whitespace().next()
+            } else {
+                trimmed.split_whitespace().next()
+            };
+            if let Some(delim) = delim_token {
+                let clean_delim = delim.trim_matches(|c: char| {
+                    c == ';' || c == '|' || c == '&' || c == ')' || c == '(' || c == '>'
+                });
+                if !clean_delim.is_empty()
+                    && clean_delim
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                {
+                    return Some(clean_delim.to_string());
+                }
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Checks whether a line ends with an unescaped line continuation backslash.
+fn ends_with_line_continuation(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    let backslash_count = trimmed.chars().rev().take_while(|c| *c == '\\').count();
+    backslash_count % 2 == 1
+}
+
+/// Extracts locally defined variables and functions from document text
+/// that were defined at or before the given `position`.
+pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<LocalSymbol> {
+    let mut symbols = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut add_symbol = |name: &str, kind: LocalSymbolKind| {
+        let key = (name.to_string(), kind);
+        if seen.insert(key) {
+            symbols.push(LocalSymbol::new(name, kind));
+        }
+    };
+
+    let decl_keywords = [
+        "export", "typeset", "local", "declare", "readonly", "integer", "float",
+    ];
+
+    let mut heredoc_delimiter: Option<String> = None;
+    let mut pending_decl_kw: Option<&'static str> = None;
+    let mut pending_function_kw = false;
+    let mut pending_for_or_select_kw: Option<usize> = None;
+    let mut pending_read_kw = false;
+
+    for (line_idx, line) in text.lines().enumerate() {
+        if line_idx > position.line as usize {
+            break;
+        }
+
+        if let Some(ref delim) = heredoc_delimiter {
+            let trimmed = line.trim_start_matches('\t').trim_end();
+            if trimmed == delim {
+                heredoc_delimiter = None;
+            }
+            pending_decl_kw = None;
+            pending_function_kw = false;
+            pending_for_or_select_kw = None;
+            pending_read_kw = false;
+            continue;
+        }
+
+        if let Some(delim) = detect_heredoc_delimiter(line) {
+            heredoc_delimiter = Some(delim);
+            pending_decl_kw = None;
+            pending_function_kw = false;
+            pending_for_or_select_kw = None;
+            pending_read_kw = false;
+        }
+
+        let is_target_line = line_idx == position.line as usize;
+
+        let is_before_cursor = |name_end_byte: usize| -> bool {
+            if !is_target_line {
+                true
+            } else {
+                let end_u16 = byte_to_utf16_col(line, name_end_byte);
+                end_u16 <= position.character
+            }
+        };
+
+        let has_line_continuation = ends_with_line_continuation(line);
+        let mut current_pending_decl_kw = pending_decl_kw.take();
+        let mut current_pending_function_kw = std::mem::take(&mut pending_function_kw);
+        let mut current_pending_for_or_select_kw = pending_for_or_select_kw.take();
+        let mut current_pending_read_kw = std::mem::take(&mut pending_read_kw);
+
+        let mut next_pending_decl_kw: Option<&'static str> = None;
+        let mut next_pending_function_kw = false;
+        let mut next_pending_for_or_select_kw: Option<usize> = None;
+        let mut next_pending_read_kw = false;
+
+        let stmts = split_line_statements(line);
+        if stmts.is_empty() {
+            if has_line_continuation {
+                pending_decl_kw = current_pending_decl_kw;
+                pending_function_kw = current_pending_function_kw;
+                pending_for_or_select_kw = current_pending_for_or_select_kw;
+                pending_read_kw = current_pending_read_kw;
+            } else {
+                pending_decl_kw = None;
+                pending_function_kw = false;
+                pending_for_or_select_kw = None;
+                pending_read_kw = false;
+            }
+            continue;
+        }
+        let num_stmts = stmts.len();
+
+        for (stmt_idx, stmt) in stmts.into_iter().enumerate() {
+            let is_first_stmt = stmt_idx == 0;
+            let is_last_stmt = stmt_idx + 1 == num_stmts;
+
+            let pending_decl_for_this_stmt = if is_first_stmt {
+                current_pending_decl_kw.take()
+            } else {
+                None
+            };
+            let pending_function_for_this_stmt = if is_first_stmt {
+                std::mem::take(&mut current_pending_function_kw)
+            } else {
+                false
+            };
+            let pending_for_or_select_for_this_stmt = if is_first_stmt {
+                current_pending_for_or_select_kw.take()
+            } else {
+                None
+            };
+            let pending_read_for_this_stmt = if is_first_stmt {
+                std::mem::take(&mut current_pending_read_kw)
+            } else {
+                false
+            };
+
+            let trimmed = stmt.text.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                if is_last_stmt && has_line_continuation {
+                    if next_pending_decl_kw.is_none() {
+                        next_pending_decl_kw = pending_decl_for_this_stmt;
+                    }
+                    if !next_pending_function_kw {
+                        next_pending_function_kw = pending_function_for_this_stmt;
+                    }
+                    if next_pending_for_or_select_kw.is_none() {
+                        next_pending_for_or_select_kw = pending_for_or_select_for_this_stmt;
+                    }
+                    if !next_pending_read_kw {
+                        next_pending_read_kw = pending_read_for_this_stmt;
+                    }
+                }
+                continue;
+            }
+
+            let stmt_indent = stmt.text.len() - trimmed.len();
+            let stmt_offset = stmt.start_byte + stmt_indent;
+
+            // 1. Shell Functions
+            // 1.1 Keyword style: `function func ...`
+            if trimmed.starts_with("function ")
+                || trimmed.starts_with("function\t")
+                || trimmed == "function"
+                || pending_function_for_this_stmt
+            {
+                let (after_kw, kw_prefix_len) = if pending_function_for_this_stmt {
+                    (trimmed, 0)
+                } else if trimmed.len() > 8 {
+                    (&trimmed[8..], 8)
+                } else {
+                    ("", trimmed.len())
+                };
+                let after_kw_trimmed = after_kw.trim_start();
+                let kw_spaces = after_kw.len() - after_kw_trimmed.len();
+                let rest = skip_flags(after_kw_trimmed);
+                let flag_len = after_kw_trimmed.len() - rest.len();
+
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| is_func_ident_char(*c) && *c != '(' && *c != '{')
+                    .collect();
+
+                if name.is_empty()
+                    && is_last_stmt
+                    && has_line_continuation
+                    && !pending_function_for_this_stmt
+                {
+                    next_pending_function_kw = true;
+                    continue;
+                }
+
+                if !name.is_empty() && !is_reserved_keyword(&name) {
+                    let after_name = &rest[name.len()..].trim_start();
+                    let after_parens = if let Some(stripped) = after_name.strip_prefix("()") {
+                        stripped.trim_start()
+                    } else if after_name.starts_with('(')
+                        && let Some(close) = after_name.find(')')
+                    {
+                        after_name[close + 1..].trim_start()
+                    } else {
+                        after_name
+                    };
+
+                    if after_parens.is_empty()
+                        || after_parens.starts_with('{')
+                        || after_parens.starts_with(';')
+                        || after_parens.starts_with('#')
+                        || after_parens.starts_with('\\')
+                    {
+                        let name_start_byte = stmt_offset + kw_prefix_len + kw_spaces + flag_len;
+                        let name_end_byte = name_start_byte + name.len();
+                        if is_before_cursor(name_end_byte) {
+                            add_symbol(&name, LocalSymbolKind::Function);
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // 1.2 POSIX style: `func() { ... }` or `func () { ... }`
+            if let Some(open_paren_idx) = trimmed.find('(') {
+                let name_part = trimmed[..open_paren_idx].trim_end();
+                if !name_part.is_empty()
+                    && !name_part.starts_with('#')
+                    && !name_part.chars().next().unwrap().is_ascii_digit()
+                    && name_part.chars().all(is_func_ident_char)
+                    && !is_reserved_keyword(name_part)
+                {
+                    let after_open = trimmed[open_paren_idx + 1..].trim_start();
+                    if let Some(stripped_close) = after_open.strip_prefix(')') {
+                        let after_parens = stripped_close.trim_start();
+                        if after_parens.is_empty()
+                            || after_parens.starts_with('{')
+                            || after_parens.starts_with(';')
+                            || after_parens.starts_with('#')
+                            || after_parens.starts_with('\\')
+                        {
+                            let name_start_byte =
+                                stmt_offset + trimmed.find(name_part).unwrap_or(0);
+                            let name_end_byte = name_start_byte + name_part.len();
+                            if is_before_cursor(name_end_byte) {
+                                add_symbol(name_part, LocalSymbolKind::Function);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // 2. Keyword Variable Declarations: `local`, `export`, `typeset`, etc.
+            let mut matched_decl_kw = false;
+            let mut active_kw: Option<&'static str> = None;
+            let mut after_kw_slice = "";
+            let mut kw_offset = stmt_offset;
+
+            for &kw in &decl_keywords {
+                if trimmed.starts_with(kw)
+                    && (trimmed[kw.len()..].starts_with(' ')
+                        || trimmed[kw.len()..].starts_with('\t')
+                        || trimmed.len() == kw.len())
+                {
+                    matched_decl_kw = true;
+                    active_kw = Some(kw);
+                    after_kw_slice = &trimmed[kw.len()..];
+                    kw_offset = stmt_offset + kw.len();
+                    break;
+                }
+            }
+
+            if !matched_decl_kw && let Some(kw) = pending_decl_for_this_stmt {
+                active_kw = Some(kw);
+                after_kw_slice = trimmed;
+                kw_offset = stmt_offset;
+            }
+
+            if let Some(kw) = active_kw {
+                if is_last_stmt && has_line_continuation {
+                    next_pending_decl_kw = Some(kw);
+                }
+
+                for token in split_declaration_tokens(after_kw_slice) {
+                    if token.text.starts_with('-')
+                        || token.text.starts_with('+')
+                        || token.text == "\\"
+                    {
+                        continue;
+                    }
+
+                    let token_str = token.text;
+                    let token_start_in_line = kw_offset + token.byte_offset;
+
+                    let var_name_raw = if let Some(eq) = token_str.find('=') {
+                        let before_eq = &token_str[..eq];
+                        if let Some(stripped) = before_eq.strip_suffix('+') {
+                            stripped
+                        } else if let Some(br) = before_eq.find('[') {
+                            &before_eq[..br]
+                        } else {
+                            before_eq
+                        }
+                    } else if let Some(br) = token_str.find('[') {
+                        &token_str[..br]
+                    } else {
+                        token_str
+                    };
+
+                    let var_name = var_name_raw.trim().trim_end_matches('\\').trim();
+                    if !var_name.is_empty()
+                        && !var_name.chars().next().unwrap().is_ascii_digit()
+                        && var_name.chars().all(is_var_ident_char)
+                        && !is_reserved_keyword(var_name)
+                    {
+                        let name_start_byte =
+                            token_start_in_line + token_str.find(var_name).unwrap_or(0);
+                        let name_end_byte = name_start_byte + var_name.len();
+                        if is_before_cursor(name_end_byte) {
+                            add_symbol(var_name, LocalSymbolKind::Variable);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // 3. Loop Variables
+            // 3.1 C-style for loop: `for (( VAR = 0; ... ))`
+            if trimmed.starts_with("for ((") || trimmed.starts_with("for((") {
+                let after_for = if let Some(stripped) = trimmed.strip_prefix("for ((") {
+                    stripped
+                } else {
+                    trimmed.strip_prefix("for((").unwrap_or("")
+                };
+                let kw_offset = stmt.text.len() - after_for.len();
+                let init_part = if let Some(close_idx) = after_for.find("))") {
+                    &after_for[..close_idx]
+                } else {
+                    after_for
+                };
+                let first_semi = init_part.find(';').unwrap_or(init_part.len());
+                let clause = &init_part[..first_semi];
+                let mut comma_offset = 0;
+                for sub_clause in clause.split(',') {
+                    for token in split_declaration_tokens(sub_clause) {
+                        let token_text = token.text;
+                        if token_text == "\\" {
+                            continue;
+                        }
+                        let var_name_raw = if let Some(eq) = token_text.find('=') {
+                            &token_text[..eq]
+                        } else {
+                            token_text
+                        };
+                        let var_name = var_name_raw
+                            .strip_suffix('+')
+                            .unwrap_or(var_name_raw)
+                            .trim()
+                            .trim_end_matches('\\')
+                            .trim();
+                        if !var_name.is_empty()
+                            && !var_name.chars().next().unwrap().is_ascii_digit()
+                            && var_name.chars().all(is_var_ident_char)
+                            && !is_reserved_keyword(var_name)
+                        {
+                            let name_start_byte = stmt.start_byte
+                                + kw_offset
+                                + comma_offset
+                                + token.byte_offset
+                                + token_text.find(var_name).unwrap_or(0);
+                            let name_end_byte = name_start_byte + var_name.len();
+                            if is_before_cursor(name_end_byte) {
+                                add_symbol(var_name, LocalSymbolKind::Variable);
+                            }
+                        }
+                    }
+                    comma_offset += sub_clause.len() + 1;
+                }
+                continue;
+            }
+
+            // 3.2 `for VAR in ...`, `for VAR ( ... )`, `for VAR ; do`, `select VAR in ...`
+            let for_or_select_kw = if trimmed.starts_with("for ") || trimmed.starts_with("for\t") {
+                Some(4)
+            } else if trimmed.starts_with("select ") || trimmed.starts_with("select\t") {
+                Some(7)
+            } else {
+                pending_for_or_select_for_this_stmt
+            };
+
+            if let Some(kw_len) = for_or_select_kw {
+                let after_kw = if pending_for_or_select_for_this_stmt.is_some() {
+                    trimmed
+                } else {
+                    &trimmed[kw_len..]
+                };
+                let kw_offset = if pending_for_or_select_for_this_stmt.is_some() {
+                    0
+                } else {
+                    kw_len
+                };
+
+                let mut extracted_any = false;
+                for (word_offset, word) in split_words_with_offsets(after_kw) {
+                    if word == "in"
+                        || word == "do"
+                        || word.starts_with(';')
+                        || word.starts_with('(')
+                    {
+                        break;
+                    }
+                    let clean_word = word.trim_end_matches(';').trim_end_matches('\\');
+                    if !clean_word.is_empty()
+                        && !clean_word.chars().next().unwrap().is_ascii_digit()
+                        && clean_word.chars().all(is_var_ident_char)
+                        && !is_reserved_keyword(clean_word)
+                    {
+                        let name_start_byte = stmt_offset
+                            + kw_offset
+                            + word_offset
+                            + word.find(clean_word).unwrap_or(0);
+                        let name_end_byte = name_start_byte + clean_word.len();
+                        if is_before_cursor(name_end_byte) {
+                            add_symbol(clean_word, LocalSymbolKind::Variable);
+                            extracted_any = true;
+                        }
+                    }
+                    if word.ends_with(';') {
+                        break;
+                    }
+                }
+                if is_last_stmt
+                    && has_line_continuation
+                    && (!extracted_any || pending_for_or_select_for_this_stmt.is_some())
+                {
+                    next_pending_for_or_select_kw = Some(kw_len);
+                }
+                continue;
+            }
+
+            // 4. `read` statements: `read VAR`, `read -r line`, `while read ...`
+            let matched_read = find_read_command(trimmed);
+            if matched_read.is_some() || pending_read_for_this_stmt {
+                if is_last_stmt && has_line_continuation {
+                    next_pending_read_kw = true;
+                }
+                let (read_kw_offset, after_read) = if let Some((read_start, after)) = matched_read {
+                    (stmt_offset + read_start + 5, after)
+                } else {
+                    (stmt_offset, trimmed)
+                };
+
+                for token in split_declaration_tokens(after_read) {
+                    if token.text.starts_with('-')
+                        || token.text.starts_with('+')
+                        || token.text == "\\"
+                    {
+                        continue;
+                    }
+                    let token_str = token.text;
+                    let var_name_raw = token_str
+                        .split(['=', '?'])
+                        .next()
+                        .unwrap_or(token_str)
+                        .trim()
+                        .trim_end_matches('\\')
+                        .trim();
+                    if !var_name_raw.is_empty()
+                        && !var_name_raw.chars().next().unwrap().is_ascii_digit()
+                        && var_name_raw.chars().all(is_var_ident_char)
+                        && !is_reserved_keyword(var_name_raw)
+                    {
+                        let name_start_byte = read_kw_offset
+                            + token.byte_offset
+                            + token_str.find(var_name_raw).unwrap_or(0);
+                        let name_end_byte = name_start_byte + var_name_raw.len();
+                        if is_before_cursor(name_end_byte) {
+                            add_symbol(var_name_raw, LocalSymbolKind::Variable);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // 5. Direct Variable Assignments: `VAR=...`, `VAR+=...`, `VAR[k]=...`
+            for token in split_declaration_tokens(trimmed) {
+                let token_text = token.text;
+                if token_text == "\\" {
+                    continue;
+                }
+                if let Some(eq_idx) = token_text.find('=')
+                    && eq_idx > 0
+                    && !token_text.starts_with("==")
+                    && !token_text[eq_idx..].starts_with("==")
+                {
+                    let prev_char = token_text.as_bytes().get(eq_idx.saturating_sub(1)).copied();
+                    if !matches!(prev_char, Some(b'!' | b'<' | b'>' | b'=')) {
+                        let left_raw = &token_text[..eq_idx];
+                        let left_no_plus = if let Some(stripped) = left_raw.strip_suffix('+') {
+                            stripped
+                        } else {
+                            left_raw
+                        };
+                        let left_no_bracket = if let Some(br) = left_no_plus.find('[') {
+                            &left_no_plus[..br]
+                        } else {
+                            left_no_plus
+                        };
+
+                        let var_name = left_no_bracket.trim().trim_end_matches('\\').trim();
+                        if !var_name.is_empty()
+                            && !var_name.chars().next().unwrap().is_ascii_digit()
+                            && var_name.chars().all(is_var_ident_char)
+                            && !is_reserved_keyword(var_name)
+                        {
+                            let name_start_byte = stmt_offset
+                                + token.byte_offset
+                                + token_text.find(var_name).unwrap_or(0);
+                            let name_end_byte = name_start_byte + var_name.len();
+                            if is_before_cursor(name_end_byte) {
+                                add_symbol(var_name, LocalSymbolKind::Variable);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // Stop once a token is not a valid assignment (e.g. `cmd` in `VAR=1 cmd arg=2`)
+                break;
+            }
+        }
+
+        pending_decl_kw = next_pending_decl_kw;
+        pending_function_kw = next_pending_function_kw;
+        pending_for_or_select_kw = next_pending_for_or_select_kw;
+        pending_read_kw = next_pending_read_kw;
+    }
+
+    symbols
 }
 
 #[cfg(test)]
@@ -2297,5 +2985,408 @@ mod tests {
                 "Label '{label}' must not be stored in man_cache"
             );
         }
+    }
+
+    #[test]
+    fn test_extract_local_symbols_empty() {
+        let syms = extract_local_symbols_from_text("", Position::new(0, 0));
+        assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn test_extract_local_symbols_variables_and_functions() {
+        let text = r#"
+MY_VAR="hello"
+my_func() {
+    echo "inside"
+}
+function other_func {
+    return 0
+}
+echo "done"
+"#;
+        // Cursor at line 8 (after everything)
+        let syms = extract_local_symbols_from_text(text, Position::new(8, 0));
+        assert_eq!(
+            syms,
+            vec![
+                LocalSymbol::new("MY_VAR", LocalSymbolKind::Variable),
+                LocalSymbol::new("my_func", LocalSymbolKind::Function),
+                LocalSymbol::new("other_func", LocalSymbolKind::Function),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_local_symbols_scope_boundary_subsequent_line() {
+        let text = r#"
+BEFORE_VAR="visible"
+before_func() { : }
+echo $
+AFTER_VAR="hidden"
+after_func() { : }
+"#;
+        // Cursor at line 3: `echo $`
+        let syms = extract_local_symbols_from_text(text, Position::new(3, 6));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"BEFORE_VAR"));
+        assert!(names.contains(&"before_func"));
+        assert!(!names.contains(&"AFTER_VAR"));
+        assert!(!names.contains(&"after_func"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_scope_boundary_same_line() {
+        let text = "PRIOR_VAR=1; echo $; POST_VAR=2; post_fn() { : }";
+        // Cursor at `echo $` (character 18)
+        let syms = extract_local_symbols_from_text(text, Position::new(0, 18));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"PRIOR_VAR"));
+        assert!(!names.contains(&"POST_VAR"));
+        assert!(!names.contains(&"post_fn"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_loop_variables_and_read() {
+        let text = r#"
+for item in foo bar baz; do
+    echo $item
+done
+for k v in key1 val1; do
+    :
+done
+select choice in apple orange; do
+    :
+done
+read -r single_var
+while IFS= read -r line_a line_b; do
+    :
+done
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(15, 0));
+        let var_names: Vec<&str> = syms
+            .iter()
+            .filter(|s| s.kind == LocalSymbolKind::Variable)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(var_names.contains(&"item"));
+        assert!(var_names.contains(&"k"));
+        assert!(var_names.contains(&"v"));
+        assert!(var_names.contains(&"choice"));
+        assert!(var_names.contains(&"single_var"));
+        assert!(var_names.contains(&"line_a"));
+        assert!(var_names.contains(&"line_b"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_c_style_for_loop() {
+        let text = r#"
+for (( idx = 0, jdx = 10; idx < jdx; idx++ )); do
+    echo $idx
+done
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(4, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"idx"));
+        assert!(names.contains(&"jdx"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_declaration_keywords() {
+        let text = r#"
+local LOCAL_VAR="loc"
+typeset -a ARRAY_VAR=(1 2 3)
+export EXPORTED_VAR="exp"
+declare -i INT_VAR=42
+readonly RO_VAR="ro"
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(6, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"LOCAL_VAR"));
+        assert!(names.contains(&"ARRAY_VAR"));
+        assert!(names.contains(&"EXPORTED_VAR"));
+        assert!(names.contains(&"INT_VAR"));
+        assert!(names.contains(&"RO_VAR"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_multibyte_and_comments() {
+        let text = r#"
+# COMMENTED_VAR="invisible"
+# commented_fn() { : }
+🍣_VAR="sushi"
+こんにちは_func() {
+    echo "hello"
+}
+# trailing comment
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(8, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"COMMENTED_VAR"));
+        assert!(!names.contains(&"commented_fn"));
+        assert!(names.contains(&"🍣_VAR"));
+        assert!(names.contains(&"こんにちは_func"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_deduplication() {
+        let text = r#"
+VAR="first"
+VAR="second"
+my_fn() { : }
+my_fn() { : }
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(5, 0));
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "VAR");
+        assert_eq!(syms[0].kind, LocalSymbolKind::Variable);
+        assert_eq!(syms[1].name, "my_fn");
+        assert_eq!(syms[1].kind, LocalSymbolKind::Function);
+    }
+
+    #[test]
+    fn test_extract_local_symbols_heredoc_excluded() {
+        let text = r#"
+REAL_VAR="yes"
+cat <<EOF
+HEREDOC_VAR="no"
+heredoc_func() { :; }
+EOF
+REAL_FUNC() { :; }
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(8, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"REAL_VAR"));
+        assert!(names.contains(&"REAL_FUNC"));
+        assert!(!names.contains(&"HEREDOC_VAR"));
+        assert!(!names.contains(&"heredoc_func"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_multiple_assignments_single_line() {
+        let text = "VAR1=one VAR2=two VAR3=three";
+        let syms = extract_local_symbols_from_text(text, Position::new(1, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"VAR1"));
+        assert!(names.contains(&"VAR2"));
+        assert!(names.contains(&"VAR3"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_command_arguments_not_extracted() {
+        let text = "curl --header=foo http://localhost";
+        let syms = extract_local_symbols_from_text(text, Position::new(1, 0));
+        assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn test_extract_local_symbols_heredoc_not_triggered_in_comments_or_strings() {
+        let text = r#"
+# Example: cat <<EOF
+MY_COMMENT_PRESERVED_VAR="hello"
+echo "Here is <<EOF in a string"
+MY_STRING_PRESERVED_VAR="world"
+my_preserved_func() { :; }
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(7, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"MY_COMMENT_PRESERVED_VAR"),
+            "Variable after comment containing <<EOF must be extracted"
+        );
+        assert!(
+            names.contains(&"MY_STRING_PRESERVED_VAR"),
+            "Variable after string containing <<EOF must be extracted"
+        );
+        assert!(
+            names.contains(&"my_preserved_func"),
+            "Function after string containing <<EOF must be extracted"
+        );
+    }
+
+    #[test]
+    fn test_extract_local_symbols_heredoc_with_hyphen_delimiter() {
+        let text = r#"
+cat <<EOF-DATA
+HEREDOC_VAR="inside"
+EOF-DATA
+OUTSIDE_VAR="outside"
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(6, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"OUTSIDE_VAR"));
+        assert!(
+            !names.contains(&"HEREDOC_VAR"),
+            "Variable inside <<EOF-DATA must not be extracted"
+        );
+    }
+
+    #[test]
+    fn test_extract_local_symbols_c_style_for_loop_comma_separated_no_spaces() {
+        let text = r#"
+for ((i=0,j=0; i<10; i++)); do
+    :
+done
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(4, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"i"));
+        assert!(
+            names.contains(&"j"),
+            "Second loop variable j in comma-separated clause must be extracted"
+        );
+    }
+
+    #[test]
+    fn test_extract_local_symbols_multiline_backslash_variable_declarations() {
+        let text = r#"
+local \
+    VAR_A \
+    VAR_B=10 \
+    VAR_C
+
+export \
+    EXPORTED_ONE=foo \
+    EXPORTED_TWO
+
+typeset -r \
+    CONST_X=1 \
+    CONST_Y=2
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(14, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"VAR_A"));
+        assert!(names.contains(&"VAR_B"));
+        assert!(names.contains(&"VAR_C"));
+        assert!(names.contains(&"EXPORTED_ONE"));
+        assert!(names.contains(&"EXPORTED_TWO"));
+        assert!(names.contains(&"CONST_X"));
+        assert!(names.contains(&"CONST_Y"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_multiline_backslash_functions() {
+        let text = r#"
+my_posix_func() \
+{
+    echo hi
+}
+
+function my_ksh_func \
+{
+    echo hi
+}
+
+function \
+    my_split_ksh_func {
+    echo hi
+}
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(16, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"my_posix_func"));
+        assert!(names.contains(&"my_ksh_func"));
+        assert!(names.contains(&"my_split_ksh_func"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_c_style_for_loop_multiline() {
+        let text = r#"
+for (( i=0, j=10; \
+       i<10; \
+       i++, j-- )); do
+    :
+done
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(6, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"i"));
+        assert!(names.contains(&"j"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_utf16_surrogate_pairs() {
+        // Line with surrogate pairs (🚀 is 4 bytes UTF-8, 2 UTF-16 code units)
+        let text = "MSG=\"🚀\"; BEFORE_VAR=1; AFTER_VAR=2";
+        // Position right after BEFORE_VAR=1;
+        // In UTF-16: MSG=" (5) + 🚀 (2) + ";  (3) + BEFORE_VAR=1; (13) = 23
+        let syms_before = extract_local_symbols_from_text(text, Position::new(0, 23));
+        let names_before: Vec<&str> = syms_before.iter().map(|s| s.name.as_str()).collect();
+        assert!(names_before.contains(&"MSG"));
+        assert!(names_before.contains(&"BEFORE_VAR"));
+        assert!(!names_before.contains(&"AFTER_VAR"));
+
+        // Position at the end of line
+        let syms_all = extract_local_symbols_from_text(text, Position::new(0, 50));
+        let names_all: Vec<&str> = syms_all.iter().map(|s| s.name.as_str()).collect();
+        assert!(names_all.contains(&"AFTER_VAR"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_multiline_read() {
+        let text = r#"
+read -r \
+    READ_VAR1 \
+    READ_VAR2
+
+while IFS= read -r \
+    STREAM_LINE; do
+    :
+done
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(10, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"READ_VAR1"));
+        assert!(names.contains(&"READ_VAR2"));
+        assert!(names.contains(&"STREAM_LINE"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_multiline_semicolon_isolation() {
+        let text = r#"
+local VAR_A=1; echo \
+    not_a_variable
+
+local VAR_B=2; \
+echo also_not_a_variable
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(7, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"VAR_A"));
+        assert!(names.contains(&"VAR_B"));
+        assert!(
+            !names.contains(&"not_a_variable"),
+            "Argument to echo must not be extracted as local variable"
+        );
+        assert!(
+            !names.contains(&"also_not_a_variable"),
+            "Command after terminated local must not be extracted as local variable"
+        );
+    }
+
+    #[test]
+    fn test_extract_local_symbols_multiline_with_intermediate_comments() {
+        let text = r#"
+local \
+    VAR_ONE \
+    # Explanatory comment line \
+    VAR_TWO
+"#;
+        let syms = extract_local_symbols_from_text(text, Position::new(6, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"VAR_ONE"));
+        assert!(names.contains(&"VAR_TWO"));
+    }
+
+    #[test]
+    fn test_detect_heredoc_delimiter_with_length_expansion_and_hash_words() {
+        let line1 = "echo ${#ARRAY} <<EOF";
+        assert_eq!(detect_heredoc_delimiter(line1), Some("EOF".to_string()));
+
+        let line2 = "echo foo#bar <<MY_DELIM";
+        assert_eq!(
+            detect_heredoc_delimiter(line2),
+            Some("MY_DELIM".to_string())
+        );
     }
 }

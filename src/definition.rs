@@ -408,7 +408,7 @@ pub fn resolve_source_path(path_str: &str, base_uri: &Url) -> Option<Url> {
 }
 
 /// Extracts a `read` command from a statement (supporting `while read ...`, `IFS= read ...`, etc.).
-fn find_read_command(stmt_text: &str) -> Option<(usize, &str)> {
+pub(crate) fn find_read_command(stmt_text: &str) -> Option<(usize, &str)> {
     if stmt_text.starts_with("read ") || stmt_text.starts_with("read\t") {
         return Some((0, &stmt_text[5..]));
     }
