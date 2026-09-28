@@ -2906,3 +2906,63 @@ async fn test_no_completion_local_function_in_assignment_or_redirection() {
         "Function must NOT be suggested in redirection target"
     );
 }
+
+#[tokio::test]
+async fn test_completion_deduplication_builtin_resword() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///dedup_commands.zsh").unwrap();
+    // Test both 'exp' (e.g. export) and 'loc' (e.g. local)
+    test_client.init_and_open(&doc_uri, "exp\nloc").await;
+
+    // 1. Completion for 'exp' at line 0, char 3
+    let res_exp = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(0, 3),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .expect("Expected completion response for exp");
+
+    let items_exp = get_completion_items(res_exp);
+    assert!(!items_exp.is_empty(), "Expected completion items for 'exp'");
+    let export_count = items_exp.iter().filter(|i| i.label == "export").count();
+    assert_eq!(
+        export_count, 1,
+        "Expected exactly one 'export' candidate, but found {export_count}"
+    );
+
+    // 2. Completion for 'loc' at line 1, char 3
+    let res_loc = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(1, 3),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .expect("Expected completion response for loc");
+
+    let items_loc = get_completion_items(res_loc);
+    assert!(!items_loc.is_empty(), "Expected completion items for 'loc'");
+    let local_count = items_loc.iter().filter(|i| i.label == "local").count();
+    assert_eq!(
+        local_count, 1,
+        "Expected exactly one 'local' candidate, but found {local_count}"
+    );
+}

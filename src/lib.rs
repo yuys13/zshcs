@@ -13,9 +13,9 @@ pub mod symbols;
 
 pub use cli::{Cli, Commands};
 pub use completion::{
-    CAPTURE_ZSH, DEFAULT_RESOLVE_MAN_TIMEOUT, ManCache, ZPTYRC_ZSH, infer_completion_kind,
-    is_eligible_for_external_command, resolve_completion_item, resolve_completion_item_async,
-    resolve_completion_item_async_with_timeout,
+    CAPTURE_ZSH, DEFAULT_RESOLVE_MAN_TIMEOUT, ManCache, ZPTYRC_ZSH, deduplicate_completion_items,
+    infer_completion_kind, is_eligible_for_external_command, resolve_completion_item,
+    resolve_completion_item_async, resolve_completion_item_async_with_timeout,
 };
 pub use config::{
     Config, ExperimentalConfig, extract_experimental_definition, extract_experimental_diagnostics,

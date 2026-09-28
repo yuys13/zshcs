@@ -116,7 +116,7 @@ flowchart TD
     
     ReadStream --> CheckLine{Stream Line Type}
     CheckLine -- Candidate Record --> ParseCandidate[parse_candidate_line & infer_completion_kind] --> ReadStream
-    CheckLine -- End-of-Completion (\\x01EOC\\x01) --> SendSuccess[Send Ok(Vec&lt;CompletionItem&gt;) via oneshot] --> WaitReq
+    CheckLine -- End-of-Completion (\\x01EOC\\x01) --> Dedup[deduplicate_completion_items] --> SendSuccess[Send Ok(Vec&lt;CompletionItem&gt;) via oneshot] --> WaitReq
     
     ReadStream -- Timeout (> 5000ms) --> KillHung[proc.child.start_kill & proc = None] --> ReportTimeout[Send Daemon Timeout Err] --> WaitReq
     ReadStream -- I/O Failure / EOF --> KillDead[proc.child.start_kill & proc = None] --> ReportIOErr[Send IoError to Responder] --> WaitReq
@@ -234,6 +234,10 @@ classDiagram
      - `CompletionItemKind::FILE`: Files (`.zshrc`, `file.txt`, `archive.tar.gz`, or descriptions containing "file"/"archive").
      - `CompletionItemKind::FUNCTION`: Commands, builtins, functions, and aliases (descriptions containing "command", "builtin", "function", "alias", "executable").
      - `CompletionItemKind::TEXT`: General text fallback.
+5. **Candidate Deduplication & Description Enrichment (`deduplicate_completion_items`)**:
+   - Commands in Zsh (such as `export` and `local`) can be registered as both shell builtins and reserved words, causing completion hooks (`_command_names`) to invoke `compadd` multiple times.
+   - `deduplicate_completion_items` removes duplicate candidate entries in $O(N)$ time while strictly preserving the initial candidate order.
+   - If an initial entry lacks a description but a subsequent duplicate provides one, the candidate's `detail` and `kind` are automatically enriched.
 
 ---
 
@@ -501,6 +505,7 @@ sequenceDiagram
             Supervisor->>Supervisor: parse_candidate_line(line, &mut items)
             Supervisor->>Supervisor: infer_completion_kind(label, detail)
         end
+        Supervisor->>Supervisor: deduplicate_completion_items(&mut items)
 
         Supervisor->>Server: Send Ok(Vec<CompletionItem>) via oneshot
         Server-->>Client: CompletionResponse::Array(items)
