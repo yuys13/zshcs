@@ -86,15 +86,10 @@
           };
 
           devShells.default = pkgs.mkShell {
-            packages = with pkgs; [
-              git
-              man-db
-              man-pages
-              rustToolchain
-              zsh
-            ];
+            inputsFrom = [ config.packages.default ];
 
             shellHook = ''
+              export MANPATH="${pkgs.git}/share/man:${pkgs.man-pages}/share/man:$MANPATH"
               echo "Rust development environment loaded"
               cargo --version
             '';
