@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -217,6 +217,8 @@ pub async fn run_completion_daemon(
                 }
             }
 
+            deduplicate_completion_items(&mut items);
+
             tracing::debug!(
                 item_count = items.len(),
                 "Completed candidate stream parsing"
@@ -332,6 +334,104 @@ pub fn parse_candidate_line(line: &str, items: &mut Vec<CompletionItem>) {
         detail,
         ..Default::default()
     });
+}
+
+/// Deduplicates completion candidates while preserving original candidate order.
+///
+/// If multiple candidates share the same label:
+/// - The first candidate's position in the candidate sequence is preserved.
+/// - If the first candidate lacks fields (such as `detail`, specific `kind`, `documentation`,
+///   `insert_text`, `sort_text`, etc.) but a subsequent duplicate has them, the first candidate
+///   is enriched with those fields.
+/// - Redundant duplicate entries are removed in-place with zero string allocations during candidate lookup.
+pub fn deduplicate_completion_items(items: &mut Vec<CompletionItem>) {
+    if items.len() <= 1 {
+        return;
+    }
+
+    let mut seen_indices: HashMap<&str, usize> = HashMap::with_capacity(items.len());
+    let mut duplicate_pairs: Vec<(usize, usize)> = Vec::new();
+    let mut is_duplicate: Vec<bool> = vec![false; items.len()];
+
+    for (idx, item) in items.iter().enumerate() {
+        if let Some(&first_idx) = seen_indices.get(item.label.as_str()) {
+            is_duplicate[idx] = true;
+            duplicate_pairs.push((first_idx, idx));
+        } else {
+            seen_indices.insert(item.label.as_str(), idx);
+        }
+    }
+
+    if duplicate_pairs.is_empty() {
+        return;
+    }
+
+    // Drop seen_indices to release immutable borrow of items
+    drop(seen_indices);
+
+    for (first_idx, dup_idx) in duplicate_pairs {
+        if first_idx < dup_idx {
+            let (left, right) = items.split_at_mut(dup_idx);
+            let target = &mut left[first_idx];
+            let source = &right[0];
+            enrich_completion_item(target, source);
+        }
+    }
+
+    let mut idx = 0;
+    items.retain(|_| {
+        let keep = !is_duplicate[idx];
+        idx += 1;
+        keep
+    });
+}
+
+fn enrich_completion_item(target: &mut CompletionItem, source: &CompletionItem) {
+    if target.detail.is_none() && source.detail.is_some() {
+        target.detail = source.detail.clone();
+    }
+
+    match (target.kind, source.kind) {
+        (None, Some(s_kind)) => {
+            target.kind = Some(s_kind);
+        }
+        (Some(CompletionItemKind::TEXT), Some(s_kind)) if s_kind != CompletionItemKind::TEXT => {
+            target.kind = Some(s_kind);
+        }
+        _ => {}
+    }
+
+    if target.documentation.is_none() && source.documentation.is_some() {
+        target.documentation = source.documentation.clone();
+    }
+
+    if target.insert_text.is_none() && source.insert_text.is_some() {
+        target.insert_text = source.insert_text.clone();
+    }
+
+    if target.insert_text_format.is_none() && source.insert_text_format.is_some() {
+        target.insert_text_format = source.insert_text_format;
+    }
+
+    if target.sort_text.is_none() && source.sort_text.is_some() {
+        target.sort_text = source.sort_text.clone();
+    }
+
+    if target.filter_text.is_none() && source.filter_text.is_some() {
+        target.filter_text = source.filter_text.clone();
+    }
+
+    if target.text_edit.is_none() && source.text_edit.is_some() {
+        target.text_edit = source.text_edit.clone();
+    }
+
+    if target.tags.is_none() && source.tags.is_some() {
+        target.tags = source.tags.clone();
+    }
+
+    if target.deprecated.is_none() && source.deprecated.is_some() {
+        target.deprecated = source.deprecated;
+    }
 }
 
 /// Resolves detailed documentation for completion items on demand.
@@ -1685,20 +1785,25 @@ fn daemon_label_matches_local(daemon_label: &str, local_label: &str) -> bool {
 /// corresponding `(local ...)` detail annotations. If any candidate returned by
 /// the daemon matches a local symbol, the duplicate daemon entry is omitted.
 pub fn merge_local_completions(
-    daemon_items: Vec<CompletionItem>,
+    mut daemon_items: Vec<CompletionItem>,
     local_symbols: &[LocalSymbol],
     line_prefix: &str,
 ) -> Vec<CompletionItem> {
+    deduplicate_completion_items(&mut daemon_items);
+
     let local_items = filter_local_symbols(local_symbols, line_prefix);
     if local_items.is_empty() {
         return daemon_items;
     }
 
     let mut merged = Vec::with_capacity(local_items.len() + daemon_items.len());
+    let mut seen_labels: HashSet<String> = HashSet::new();
 
     // 1. Add all filtered local items
     for item in &local_items {
-        merged.push(item.clone());
+        if seen_labels.insert(item.label.clone()) {
+            merged.push(item.clone());
+        }
     }
 
     // 2. Append non-duplicate daemon items
@@ -1706,7 +1811,7 @@ pub fn merge_local_completions(
         let is_duplicate = local_items
             .iter()
             .any(|loc| daemon_label_matches_local(&daemon_item.label, &loc.label));
-        if !is_duplicate {
+        if !is_duplicate && seen_labels.insert(daemon_item.label.clone()) {
             merged.push(daemon_item);
         }
     }
@@ -3934,6 +4039,283 @@ local \
         let labels: Vec<&str> = merged.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["LOCAL_VAR", "SHARED_VAR", "$DAEMON_VAR"]);
         assert_eq!(merged[1].detail.as_deref(), Some("(local variable)"));
+    }
+
+    #[test]
+    fn test_merge_local_completions_daemon_internal_duplicates() {
+        let daemon_items = vec![
+            CompletionItem {
+                label: "export".to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                detail: None,
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "export".to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some("shell builtin".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "local".to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                detail: None,
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "local".to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                detail: None,
+                ..Default::default()
+            },
+        ];
+
+        // 1. With empty local symbols
+        let merged_empty = merge_local_completions(daemon_items.clone(), &[], "exp");
+        assert_eq!(merged_empty.len(), 2);
+        assert_eq!(merged_empty[0].label, "export");
+        assert_eq!(merged_empty[0].detail.as_deref(), Some("shell builtin"));
+        assert_eq!(merged_empty[0].kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(merged_empty[1].label, "local");
+
+        // 2. With local symbol present
+        let local_symbols = vec![LocalSymbol::new("custom_cmd", LocalSymbolKind::Function)];
+        let merged_local = merge_local_completions(daemon_items, &local_symbols, "");
+        assert_eq!(merged_local.len(), 3);
+        assert_eq!(merged_local[0].label, "custom_cmd");
+        assert_eq!(merged_local[1].label, "export");
+        assert_eq!(merged_local[2].label, "local");
+    }
+
+    #[test]
+    fn test_deduplicate_completion_items_empty_and_single() {
+        let mut empty: Vec<CompletionItem> = Vec::new();
+        deduplicate_completion_items(&mut empty);
+        assert!(empty.is_empty());
+
+        let mut single = vec![CompletionItem {
+            label: "single".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        }];
+        deduplicate_completion_items(&mut single);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].label, "single");
+    }
+
+    #[test]
+    fn test_deduplicate_completion_items_no_duplicates() {
+        let mut items = vec![
+            CompletionItem {
+                label: "alpha".to_string(),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "beta".to_string(),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "gamma".to_string(),
+                ..Default::default()
+            },
+        ];
+        deduplicate_completion_items(&mut items);
+        assert_eq!(items.len(), 3);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn test_deduplicate_completion_items_preserves_order() {
+        let mut items = vec![
+            CompletionItem {
+                label: "export".to_string(),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "expand".to_string(),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "export".to_string(),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "expr".to_string(),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "expand".to_string(),
+                ..Default::default()
+            },
+        ];
+        deduplicate_completion_items(&mut items);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["export", "expand", "expr"]);
+    }
+
+    #[test]
+    fn test_deduplicate_completion_items_detail_enrichment() {
+        // First occurrence has no detail and generic kind
+        // Second occurrence has detail and specific kind
+        let mut items = vec![
+            CompletionItem {
+                label: "export".to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                detail: None,
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "export".to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some("shell builtin".to_string()),
+                ..Default::default()
+            },
+        ];
+        deduplicate_completion_items(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "export");
+        assert_eq!(items[0].detail.as_deref(), Some("shell builtin"));
+        assert_eq!(items[0].kind, Some(CompletionItemKind::FUNCTION));
+    }
+
+    #[test]
+    fn test_deduplicate_completion_items_detail_preservation() {
+        // First occurrence already has detail; second occurrence does not
+        let mut items = vec![
+            CompletionItem {
+                label: "export".to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                detail: Some("reserved word".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "export".to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                detail: None,
+                ..Default::default()
+            },
+        ];
+        deduplicate_completion_items(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "export");
+        assert_eq!(items[0].detail.as_deref(), Some("reserved word"));
+        assert_eq!(items[0].kind, Some(CompletionItemKind::KEYWORD));
+    }
+
+    #[test]
+    fn test_deduplicate_completion_items_first_detail_wins_on_conflict() {
+        let mut items = vec![
+            CompletionItem {
+                label: "cmd".to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some("first description".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "cmd".to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                detail: Some("second description".to_string()),
+                ..Default::default()
+            },
+        ];
+        deduplicate_completion_items(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "cmd");
+        assert_eq!(items[0].detail.as_deref(), Some("first description"));
+        assert_eq!(items[0].kind, Some(CompletionItemKind::FUNCTION));
+    }
+
+    #[test]
+    fn test_deduplicate_completion_items_enrich_when_kind_is_none() {
+        let mut items = vec![
+            CompletionItem {
+                label: "export".to_string(),
+                kind: None,
+                detail: None,
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "export".to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some("shell builtin".to_string()),
+                ..Default::default()
+            },
+        ];
+        deduplicate_completion_items(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(items[0].detail.as_deref(), Some("shell builtin"));
+    }
+
+    #[test]
+    fn test_deduplicate_completion_items_do_not_downgrade_kind_to_none() {
+        let mut items = vec![
+            CompletionItem {
+                label: "export".to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                detail: None,
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "export".to_string(),
+                kind: None,
+                detail: Some("shell builtin".to_string()),
+                ..Default::default()
+            },
+        ];
+        deduplicate_completion_items(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, Some(CompletionItemKind::TEXT));
+        assert_eq!(items[0].detail.as_deref(), Some("shell builtin"));
+    }
+
+    #[test]
+    fn test_deduplicate_completion_items_enrich_kind_without_detail() {
+        let mut items = vec![
+            CompletionItem {
+                label: "export".to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                detail: None,
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "export".to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                detail: None,
+                ..Default::default()
+            },
+        ];
+        deduplicate_completion_items(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, Some(CompletionItemKind::KEYWORD));
+    }
+
+    #[test]
+    fn test_deduplicate_completion_items_documentation_and_insert_text_enrichment() {
+        let mut items = vec![
+            CompletionItem {
+                label: "func".to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "func".to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                documentation: Some(Documentation::String("Documentation for func".to_string())),
+                insert_text: Some("func()".to_string()),
+                sort_text: Some("10_func".to_string()),
+                ..Default::default()
+            },
+        ];
+        deduplicate_completion_items(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].documentation,
+            Some(Documentation::String("Documentation for func".to_string()))
+        );
+        assert_eq!(items[0].insert_text.as_deref(), Some("func()"));
+        assert_eq!(items[0].sort_text.as_deref(), Some("10_func"));
     }
 
     #[test]
