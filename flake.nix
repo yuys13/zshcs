@@ -34,10 +34,12 @@
         }:
         let
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          rustPlatform = pkgs.makeRustPlatform {
-            cargo = rustToolchain;
-            rustc = rustToolchain;
-          };
+          testInputs = with pkgs; [
+            git
+            man-db
+            man-pages
+            zsh
+          ];
         in
         {
           _module.args.pkgs = import inputs.nixpkgs {
@@ -57,7 +59,7 @@
             };
           };
 
-          packages.default = rustPlatform.buildRustPackage {
+          packages.default = pkgs.rustPlatform.buildRustPackage {
             pname = "zshcs";
             version = "0.1.0";
             src = pkgs.lib.cleanSource ./.;
@@ -66,12 +68,9 @@
               lockFile = ./Cargo.lock;
             };
 
-            nativeBuildInputs = with pkgs; [
-              git
-              man-db
-              man-pages
-              zsh
-            ];
+            nativeBuildInputs = testInputs;
+
+            disallowedReferences = [ pkgs.rustc.unwrapped ];
 
             preCheck = ''
               export HOME=$TMPDIR
@@ -86,7 +85,7 @@
           };
 
           devShells.default = pkgs.mkShell {
-            inputsFrom = [ config.packages.default ];
+            packages = [ rustToolchain ] ++ testInputs;
 
             shellHook = ''
               export MANPATH="${pkgs.git}/share/man:${pkgs.man-pages}/share/man:$MANPATH"
