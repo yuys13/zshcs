@@ -1,18 +1,19 @@
-name: Nix DevShell Diff
+name: Nix Diff
 on:
   pull_request:
 permissions:
   contents: read
-  pull-requests: write
 jobs:
   devshell-diff:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: cachix/install-nix-action@v31.11.2
-      - uses: natsukium/nix-diff-action@v1.1.1
+      - uses: natsukium/nix-diff-action@v1.2.1
         with:
-          comment-strategy: update
+          mode: diff-only
           attributes: |
             - displayName: devShell (x86_64-linux)
               attribute: devShells.x86_64-linux.default
@@ -20,3 +21,39 @@ jobs:
               attribute: devShells.aarch64-linux.default
             - displayName: devShell (aarch64-darwin)
               attribute: devShells.aarch64-darwin.default
+  package-diff:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            system: x86_64-linux
+          - os: ubuntu-24.04-arm
+            system: aarch64-linux
+          - os: macos-latest
+            system: aarch64-darwin
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: cachix/install-nix-action@v31.11.2
+      - uses: natsukium/nix-diff-action@v1.2.1
+        with:
+          mode: diff-only
+          build: true
+          attributes: |
+            - displayName: package (${{ matrix.system }})
+              attribute: packages.${{ matrix.system }}.default
+  comment:
+    needs:
+      - devshell-diff
+      - package-diff
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - uses: natsukium/nix-diff-action@v1.2.1
+        with:
+          mode: comment-only
+          comment-strategy: update
