@@ -47,6 +47,9 @@
 
           treefmt.config = {
             projectRootFile = "flake.nix";
+            settings.global.excludes = [
+              ".agents/skills/gh-actions-lock/**"
+            ];
             programs = {
               nixfmt.enable = true;
               rustfmt = {
