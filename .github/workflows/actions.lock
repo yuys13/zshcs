@@ -9,12 +9,12 @@ workflows:
         - 'k1low/octocov-action@v1.5.2'
     '.github/workflows/nix-diff.yml':
         - 'actions/checkout@v7.0.1'
-        - 'cachix/install-nix-action@v31.11.2'
+        - 'cachix/install-nix-action@v31.11.3'
         - 'natsukium/nix-diff-action@v1.2.1'
     '.github/workflows/nix.yml':
         - 'actions/cache@v6.1.0'
         - 'actions/checkout@v7.0.1'
-        - 'cachix/install-nix-action@v31.11.2'
+        - 'cachix/install-nix-action@v31.11.3'
     '.github/workflows/verify-lockfile.yml':
         - 'actions/checkout@v7.0.1'
 dependencies:
@@ -33,9 +33,9 @@ dependencies:
         commit: 'sha1-3a2844b7e9c422d3c10d287c895573f7108da1b3'
         owner_id: 44036562
         repo_id: 205262760
-    'cachix/install-nix-action@v31.11.2':
-        ref: 'v31.11.2'
-        commit: 'sha1-448cde739abec1eaf0646249e3d25bb8d9bc7702'
+    'cachix/install-nix-action@v31.11.3':
+        ref: 'v31.11.3'
+        commit: 'sha1-75c75c31ebece974e48ebc36b4ad125bd97bd97b'
         owner_id: 36824654
         repo_id: 212301524
     'k1low/gh-setup@5fb38d34ea857e5a942b6fe10f1723e55055f6c0':

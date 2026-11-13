@@ -10,7 +10,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: cachix/install-nix-action@v31.11.2
+      - uses: cachix/install-nix-action@v31.11.3
       - uses: natsukium/nix-diff-action@v1.2.1
         with:
           mode: diff-only
@@ -36,7 +36,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: cachix/install-nix-action@v31.11.2
+      - uses: cachix/install-nix-action@v31.11.3
       - uses: natsukium/nix-diff-action@v1.2.1
         with:
           mode: diff-only
