@@ -33,11 +33,22 @@
           ...
         }:
         let
-          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          rustPlatform = pkgs.makeRustPlatform {
-            cargo = rustToolchain;
-            rustc = rustToolchain;
+          toolchainToml = builtins.fromTOML (builtins.readFile ./rust-toolchain.toml);
+          rustDevToolchain = pkgs.rust-bin.fromRustupToolchain toolchainToml.toolchain;
+          rustBuildToolchain = pkgs.rust-bin.fromRustupToolchain {
+            inherit (toolchainToml.toolchain) channel;
+            profile = "minimal";
           };
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rustBuildToolchain;
+            rustc = rustBuildToolchain;
+          };
+          testInputs = with pkgs; [
+            git
+            man-db
+            man-pages
+            zsh
+          ];
         in
         {
           _module.args.pkgs = import inputs.nixpkgs {
@@ -54,7 +65,7 @@
               nixfmt.enable = true;
               rustfmt = {
                 enable = true;
-                package = rustToolchain;
+                package = rustDevToolchain;
               };
               yamlfmt.enable = true;
             };
@@ -69,12 +80,7 @@
               lockFile = ./Cargo.lock;
             };
 
-            nativeBuildInputs = with pkgs; [
-              git
-              man-db
-              man-pages
-              zsh
-            ];
+            nativeBuildInputs = testInputs;
 
             preCheck = ''
               export HOME=$TMPDIR
@@ -89,7 +95,7 @@
           };
 
           devShells.default = pkgs.mkShell {
-            inputsFrom = [ config.packages.default ];
+            packages = [ rustDevToolchain ] ++ testInputs;
 
             shellHook = ''
               export MANPATH="${pkgs.git}/share/man:${pkgs.man-pages}/share/man:$MANPATH"
