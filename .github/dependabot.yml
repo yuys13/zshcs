@@ -20,6 +20,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      exclude:
+        - "*"
     groups:
       nix:
         patterns:
