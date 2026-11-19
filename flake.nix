@@ -74,7 +74,17 @@
           packages.default = rustPlatform.buildRustPackage {
             pname = "zshcs";
             version = "0.1.0";
-            src = pkgs.lib.cleanSource ./.;
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                ./Cargo.lock
+                ./Cargo.toml
+                ./benches
+                ./bin
+                ./src
+                ./tests
+              ];
+            };
 
             cargoLock = {
               lockFile = ./Cargo.lock;
