@@ -5,9 +5,9 @@ license: MIT
 metadata:
     author: github
     github-path: skills/gh-actions-lock
-    github-ref: refs/tags/v0.4.1
+    github-ref: refs/tags/v0.5.0
     github-repo: https://github.com/github/gh-actions-lock
-    github-tree-sha: 263ebd6eacf43511cfa588be16628b5ab7bfe460
+    github-tree-sha: 3c24678b0d27fc3ea6f51ce0048777f84ff25627
     version: 0.1.0
 name: gh-actions-lock
 ---
@@ -67,11 +67,12 @@ action in the checkout uses remote actions, every mode reports a blocking `local
 Fix it with one of:
 
 ```bash
-gh actions-lock --migrate-local-actions   # rewrite same-repo ./… to $/… so they get locked
+gh actions-lock --migrate-local-actions   # rewrite workflows' same-repo ./… to $/… so they get locked
 gh actions-lock --ignore-local-actions    # keep ./… and downgrade it to a warning
 ```
 
-`$/…` refers to the same repository at the running commit and needs no lockfile entry. A `./…`
+`$/…` refers to the same repository at the running commit and needs no lockfile entry. Action files
+are never edited; change a `./…` inside one to `$/…` by hand. A `./…`
 inside a remote composite can't be rewritten, so only `--ignore-local-actions` applies there.
 
 ## Relocking and moved refs
@@ -94,7 +95,7 @@ automation, where it would silently accept a tampered pin.
 | Code | Meaning |
 |---|---|
 | 0 | Nothing to fix, or every finding was fixed |
-| 1 | Blocking findings remain; the report is well-formed |
+| 1 | Blocking findings remain, or `--fail-on-warning` is set and a read-only run reported a warning; the report is well-formed |
 | 2 | The tool itself failed (bad flag, IO, auth, malformed lockfile); read stderr |
 
 ```bash
