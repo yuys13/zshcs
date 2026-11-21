@@ -417,9 +417,9 @@ flowchart TD
      - Scans the document line-by-line for standard shell function definition constructs:
        - POSIX / Korn style: `func_name() { ... }` or `func_name () {`
        - Zsh / Bash keyword style: `function func_name { ... }` or `function func_name() { ... }`
-     - Skips commented lines (`# ...`) and returns precise 0-indexed UTF-16 line and character ranges pointing to the function identifier.
+     - Skips commented lines (`# ...`) and heredoc bodies (`<<EOF`, `<<-EOF`), returning precise 0-indexed UTF-16 line and character ranges pointing to the function identifier.
   3. **Shell Variable Declaration & Assignment Scanning (`scan_variable_definitions`)**:
-     - Resolves variable references (`$VAR`, `${VAR}`, or `VAR`).
+     - Resolves variable references (`$VAR`, `${VAR}`, or `VAR`), skipping heredoc bodies (`<<EOF`, `<<-EOF`).
      - Scans for direct assignments (`VAR=...`, `VAR+=...`) and keyword declarations (`export`, `typeset`, `local`, `declare`, `readonly`, `integer`, `float`).
      - Employs quote- and paren-aware token splitting (`split_declaration_tokens`) to accurately locate variable names even in multi-variable declarations (`local -r A="hello" B=20`) and array declarations (`typeset -a ARR=(1 2 3)`).
 
@@ -445,7 +445,7 @@ flowchart TD
 - **Three-Tier Symbol Extraction (`extract_document_symbols`)**:
   1. **Shell Function Extraction (`SymbolKind::FUNCTION`)**:
      - Scans for POSIX syntax (`func() { ... }`, `func () { ... }`) and keyword syntax (`function func { ... }`, `function func() { ... }`).
-     - Accurately tracks nested braces (`{ ... }`), string literals (`"..."`, `'...'`, `` `...` ``), escape characters, and comments to compute the full function range from start statement to matching closing `}`.
+     - Accurately tracks nested braces (`{ ... }`), heredoc bodies (`<<EOF`, `<<-EOF`), string literals (`"..."`, `'...'`, `` `...` ``), escape characters, and comments to compute the full function range from start statement to matching closing `}`.
      - Sets `selection_range` pointing to the exact function identifier.
   2. **Variable & Constant Declaration Extraction (`SymbolKind::VARIABLE`)**:
      - Captures keyword declarations: `export`, `typeset` (including `-g` global and `-a` array), `local`, `declare`, `readonly`, `integer`, and `float`.

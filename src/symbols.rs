@@ -1,8 +1,8 @@
 use tower_lsp::lsp_types::{DocumentSymbol, Position, Range, SymbolKind, Url};
 
 use crate::definition::{
-    byte_to_utf16_col, is_func_ident_char, is_var_ident_char, split_declaration_tokens,
-    split_line_statements,
+    byte_to_utf16_col, detect_heredoc_delimiter, is_func_ident_char, is_var_ident_char,
+    split_declaration_tokens, split_line_statements,
 };
 
 /// Keywords that should not be treated as function names or variable assignments.
@@ -72,8 +72,16 @@ fn find_matching_closing_brace(
     let mut in_single_quote = false;
     let mut in_double_quote = false;
     let mut in_backtick = false;
+    let mut heredoc_delimiter: Option<String> = None;
 
     for (line_idx, line) in lines.iter().enumerate().skip(open_line) {
+        if let Some(ref delim) = heredoc_delimiter {
+            if line.trim_start_matches('\t').trim_end() == delim {
+                heredoc_delimiter = None;
+            }
+            continue;
+        }
+
         let bytes = line.as_bytes();
         let len = bytes.len();
         let start_col = if line_idx == open_line {
@@ -126,6 +134,15 @@ fn find_matching_closing_brace(
                 }
             }
             i += 1;
+        }
+
+        if depth > 0
+            && !in_single_quote
+            && !in_double_quote
+            && !in_backtick
+            && let Some(delim) = detect_heredoc_delimiter(&line[start_col..])
+        {
+            heredoc_delimiter = Some(delim);
         }
     }
 
@@ -268,8 +285,19 @@ pub fn extract_document_symbols(text: &str, _uri: &Url) -> Vec<DocumentSymbol> {
     let decl_keywords = [
         "export", "typeset", "local", "declare", "readonly", "integer", "float",
     ];
+    let mut heredoc_delimiter: Option<String> = None;
 
     for (line_idx, line) in lines.iter().enumerate() {
+        if let Some(ref delim) = heredoc_delimiter {
+            if line.trim_start_matches('\t').trim_end() == delim {
+                heredoc_delimiter = None;
+            }
+            continue;
+        }
+        if let Some(delim) = detect_heredoc_delimiter(line) {
+            heredoc_delimiter = Some(delim);
+        }
+
         for stmt in split_line_statements(line) {
             let trimmed = stmt.text.trim_start();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1012,5 +1040,45 @@ my.func() { :; }
 
         assert_eq!(symbols[3].name, "d");
         assert_eq!(symbols[3].kind, SymbolKind::VARIABLE);
+    }
+
+    #[test]
+    fn test_extract_symbols_ignores_heredoc_and_unbalanced_braces_in_heredoc() {
+        let uri = dummy_uri();
+        let text = concat!(
+            "outer_fn() {\n",
+            "    local before_heredoc=1\n",
+            "    cat <<'EOF'\n",
+            "}\n",
+            "FAKE_IN_HEREDOC=99\n",
+            "fake_heredoc_fn() { : }\n",
+            "alias fake_alias='echo no'\n",
+            "EOF\n",
+            "    local after_heredoc=2\n",
+            "}\n",
+            "cat <<-END_DOC\n",
+            "\tANOTHER_FAKE=3\n",
+            "\tEND_DOC\n",
+            "TOP_VAR=10\n",
+        );
+
+        let symbols = extract_document_symbols(text, &uri);
+        assert_eq!(symbols.len(), 2); // outer_fn, TOP_VAR
+
+        let outer = &symbols[0];
+        assert_eq!(outer.name, "outer_fn");
+        assert_eq!(outer.kind, SymbolKind::FUNCTION);
+        assert_eq!(outer.range.start.line, 0);
+        assert_eq!(outer.range.end.line, 9);
+
+        let children = outer
+            .children
+            .as_ref()
+            .expect("outer_fn should have children");
+        let child_names: Vec<&str> = children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(child_names, vec!["before_heredoc", "after_heredoc"]);
+
+        assert_eq!(symbols[1].name, "TOP_VAR");
+        assert_eq!(symbols[1].kind, SymbolKind::VARIABLE);
     }
 }

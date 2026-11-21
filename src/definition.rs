@@ -424,6 +424,95 @@ pub(crate) fn find_read_command(stmt_text: &str) -> Option<(usize, &str)> {
     None
 }
 
+/// Extracts the heredoc delimiter from a line if one is introduced, e.g. `cat <<EOF` -> `"EOF"`.
+/// Skips comments and string literals so that `<<` inside `# ...` or `"..."` is ignored.
+pub(crate) fn detect_heredoc_delimiter(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_quote: Option<u8> = None;
+
+    let mut param_brace_depth: usize = 0;
+
+    while i < len {
+        let b = bytes[i];
+
+        if b == b'\\' && in_quote != Some(b'\'') && i + 1 < len {
+            i += 2;
+            continue;
+        }
+
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' || b == b'\'' || b == b'`' {
+            in_quote = Some(b);
+            i += 1;
+            continue;
+        }
+
+        if b == b'{' && i > 0 && bytes[i - 1] == b'$' {
+            param_brace_depth += 1;
+        } else if b == b'}' && param_brace_depth > 0 {
+            param_brace_depth -= 1;
+        } else if param_brace_depth == 0 && b == b'#' {
+            let is_comment_start = i == 0
+                || bytes[i - 1].is_ascii_whitespace()
+                || bytes[i - 1] == b';'
+                || bytes[i - 1] == b'&'
+                || bytes[i - 1] == b'|'
+                || bytes[i - 1] == b'('
+                || bytes[i - 1] == b'`';
+            if is_comment_start {
+                break;
+            }
+        }
+
+        if b == b'<' && i + 1 < len && bytes[i + 1] == b'<' {
+            // Exclude here-strings (<<<) or sequences preceded by <
+            if (i > 0 && bytes[i - 1] == b'<') || (i + 2 < len && bytes[i + 2] == b'<') {
+                i += 2;
+                continue;
+            }
+            let mut rest = &line[i + 2..];
+            if let Some(stripped) = rest.strip_prefix('-') {
+                rest = stripped;
+            }
+            let trimmed = rest.trim_start();
+            let delim_token = if let Some(stripped) = trimmed.strip_prefix('\'') {
+                stripped.split('\'').next()
+            } else if let Some(stripped) = trimmed.strip_prefix('"') {
+                stripped.split('"').next()
+            } else if let Some(stripped) = trimmed.strip_prefix('\\') {
+                stripped.split_whitespace().next()
+            } else {
+                trimmed.split_whitespace().next()
+            };
+            if let Some(delim) = delim_token {
+                let clean_delim = delim.trim_matches(|c: char| {
+                    c == ';' || c == '|' || c == '&' || c == ')' || c == '(' || c == '>'
+                });
+                if !clean_delim.is_empty()
+                    && clean_delim
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                {
+                    return Some(clean_delim.to_string());
+                }
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Extracts the definition target under the cursor along with its UTF-16 range.
 pub fn extract_word_and_target_at_position(
     text: &str,
@@ -605,8 +694,19 @@ pub fn extract_word_and_target_at_position(
 /// Scans the document for shell function definitions matching `func_name`.
 pub fn scan_function_definitions(text: &str, uri: &Url, func_name: &str) -> Vec<Location> {
     let mut locations = Vec::new();
+    let mut heredoc_delimiter: Option<String> = None;
 
     for (line_idx, line) in text.lines().enumerate() {
+        if let Some(ref delim) = heredoc_delimiter {
+            if line.trim_start_matches('\t').trim_end() == delim {
+                heredoc_delimiter = None;
+            }
+            continue;
+        }
+        if let Some(delim) = detect_heredoc_delimiter(line) {
+            heredoc_delimiter = Some(delim);
+        }
+
         for stmt in split_line_statements(line) {
             let trimmed = stmt.text.trim_start();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -684,8 +784,19 @@ pub fn scan_variable_definitions(text: &str, uri: &Url, var_name: &str) -> Vec<L
     let decl_keywords = [
         "export", "typeset", "local", "declare", "readonly", "integer", "float",
     ];
+    let mut heredoc_delimiter: Option<String> = None;
 
     for (line_idx, line) in text.lines().enumerate() {
+        if let Some(ref delim) = heredoc_delimiter {
+            if line.trim_start_matches('\t').trim_end() == delim {
+                heredoc_delimiter = None;
+            }
+            continue;
+        }
+        if let Some(delim) = detect_heredoc_delimiter(line) {
+            heredoc_delimiter = Some(delim);
+        }
+
         for stmt in split_line_statements(line) {
             let trimmed = stmt.text.trim_start();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1593,5 +1704,42 @@ done
         } else {
             panic!("Expected Scalar response for second source lib_b on multi-statement line");
         }
+    }
+
+    #[test]
+    fn test_scan_definitions_ignores_heredoc_body() {
+        let uri = Url::parse("file:///heredoc_def.zsh").unwrap();
+        let text = concat!(
+            "OUT=$(cat <<EOF\n",
+            "FAKE_VAR=1\n",
+            "local FAKE_LOCAL=2\n",
+            "fake_func() { : }\n",
+            "EOF\n",
+            ")\n",
+            "cat <<-INDENT_END\n",
+            "\tINDENT_VAR=3\n",
+            "\tfunction indent_func { : }\n",
+            "\tINDENT_END\n",
+            "REAL_VAR=42\n",
+            "real_func() { : }\n",
+        );
+
+        assert!(scan_variable_definitions(text, &uri, "FAKE_VAR").is_empty());
+        assert!(scan_variable_definitions(text, &uri, "FAKE_LOCAL").is_empty());
+        assert!(scan_variable_definitions(text, &uri, "INDENT_VAR").is_empty());
+        assert!(scan_function_definitions(text, &uri, "fake_func").is_empty());
+        assert!(scan_function_definitions(text, &uri, "indent_func").is_empty());
+
+        let out_locs = scan_variable_definitions(text, &uri, "OUT");
+        assert_eq!(out_locs.len(), 1);
+        assert_eq!(out_locs[0].range.start, Position::new(0, 0));
+
+        let real_var_locs = scan_variable_definitions(text, &uri, "REAL_VAR");
+        assert_eq!(real_var_locs.len(), 1);
+        assert_eq!(real_var_locs[0].range.start, Position::new(10, 0));
+
+        let real_fn_locs = scan_function_definitions(text, &uri, "real_func");
+        assert_eq!(real_fn_locs.len(), 1);
+        assert_eq!(real_fn_locs[0].range.start, Position::new(11, 0));
     }
 }
