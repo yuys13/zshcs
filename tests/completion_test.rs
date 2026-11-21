@@ -2966,3 +2966,49 @@ async fn test_completion_deduplication_builtin_resword() {
         "Expected exactly one 'local' candidate, but found {local_count}"
     );
 }
+
+#[tokio::test]
+async fn test_completion_multiline_backslash_continued_command() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    if [[ $line == input:* ]]; then
+        prefix=${line#input:}
+        if [[ $prefix == "git   st"* ]]; then
+            printf "status\tshow working tree status\n\x01EOC\x01\n"
+        else
+            printf "wrong_prefix:%s\tdesc\n\x01EOC\x01\n" "$prefix"
+        fi
+    fi
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///multiline_cmd.zsh").unwrap();
+    let text = "git \\\n  st";
+    test_client.init_and_open(&doc_uri, text).await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(1, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .expect("Expected completion response");
+
+    let items = get_completion_items(res);
+    assert!(
+        items.iter().any(|i| i.label == "status"),
+        "Expected 'status' from joined multiline prefix 'git   st', got: {items:?}"
+    );
+    assert!(
+        !items.iter().any(|i| i.label.starts_with("wrong_prefix:")),
+        "Daemon did not receive joined multiline prefix: {items:?}"
+    );
+}
