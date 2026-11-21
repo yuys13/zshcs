@@ -242,6 +242,9 @@ classDiagram
    - Commands in Zsh (such as `export` and `local`) can be registered as both shell builtins and reserved words, causing completion hooks (`_command_names`) to invoke `compadd` multiple times.
    - `deduplicate_completion_items` removes duplicate candidate entries in $O(N)$ time while strictly preserving the initial candidate order.
    - If an initial entry lacks a description but a subsequent duplicate provides one, the candidate's `detail` and `kind` are automatically enriched.
+6. **Local Symbol Extraction & Merging (`extract_local_symbols_from_text`, `merge_local_completions`)**:
+   - Extracts locally defined shell variables (`(local variable)`), functions (`(local function)`), and aliases (`(local alias)`) up to the cursor position.
+   - Filters candidates by active shell context (`Variable`, `Arithmetic`, `CommandOrWord`) and prioritizes local definitions ahead of daemon results while deduplicating matching labels.
 
 ---
 

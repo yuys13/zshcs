@@ -3012,3 +3012,42 @@ done
         "Daemon did not receive joined multiline prefix: {items:?}"
     );
 }
+
+#[tokio::test]
+async fn test_completion_local_alias_merged() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    if [[ $line == input:* ]]; then
+        printf "my_custom_other\texternal command\n\x01EOC\x01\n"
+    fi
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///local_alias.zsh").unwrap();
+    let text = "alias my_custom_alias='git status --short'\nmy_custom_";
+    test_client.init_and_open(&doc_uri, text).await;
+
+    let res = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(1, 10),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .expect("Expected completion response");
+
+    let items = get_completion_items(res);
+    let alias_item = items
+        .iter()
+        .find(|i| i.label == "my_custom_alias")
+        .expect("Expected 'my_custom_alias' in completion items");
+    assert_eq!(alias_item.kind, Some(CompletionItemKind::FUNCTION));
+    assert_eq!(alias_item.detail.as_deref(), Some("(local alias)"));
+}
