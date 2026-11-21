@@ -136,6 +136,8 @@ flowchart TD
 - **Asynchronous Stderr Monitoring**:
   - Spawns a dedicated background task reading the daemon's `stderr` stream line-by-line via `BufReader`.
   - Forwards diagnostic and warning output to the LSP client via `window/logMessage` (`MessageType::WARNING`) without blocking completion data on `stdout`.
+- **Graceful Shutdown (`CompletionRequest::Shutdown`)**:
+  - Upon receiving an LSP `shutdown` request, `Backend::shutdown` sends `CompletionRequest::Shutdown` to the supervisor loop, terminating the child PTY daemon and exiting the supervisor loop cleanly.
 
 ---
 
@@ -350,7 +352,8 @@ flowchart TD
   - Safely clamps out-of-bounds line numbers (e.g. trailing syntax errors or empty documents) without panicking.
   - Sets `severity: DiagnosticSeverity::ERROR` and `source: "zshcs"`.
 - **Debouncing & Stale Run Elimination**:
-  - Debounces `did_change` notifications by 150ms to coalesce rapid keystrokes during active typing.
+  - Tracks per-URI active diagnostic tasks via `AbortHandle` (`Backend::diagnostic_tasks`) and debounces `did_change` notifications by 150ms.
+  - Superseding edits, `did_close`, `did_change_configuration` (disable), and `shutdown` immediately abort any pending diagnostic task for the affected document(s).
   - Compares document version tokens before spawning validation and before publishing results to drop obsolete diagnostic results.
 - **Dynamic Configuration Transitions & Buffer Cleanup**:
   - Transitioning `diagnostics` from enabled to disabled immediately broadcasts empty diagnostic arrays (`vec![]`) to all open buffers.
