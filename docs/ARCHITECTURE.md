@@ -383,9 +383,9 @@ flowchart TD
 - **Two-Tier Documentation Resolution**:
   1. **Zsh Builtins & Reserved Words Markdown Dictionary (`get_builtin_or_reserved_doc`)**:
      - Fast static lookup containing curated, formatted Markdown documentation for over 50 builtins (`cd`, `echo`, `export`, `set`, `setopt`, `unsetopt`, `autoload`, `compadd`, `typeset`, `print`, `printf`, `source`, `eval`, `alias`, `read`, `return`, `exit`, `shift`, `test`, `trap`, `unset`, `local`, `declare`, `which`, `where`, `whence`, `type`, `bindkey`, `zstyle`, `zmodload`, `zpty`, `zparseopts`, `pushd`, `popd`, `dirs`, `pwd`, `history`, `fc`, `bg`, `fg`, `jobs`, `kill`, `wait`, `disown`, `exec`, `hash`, `rehash`, `umask`, `true`, `false`, `:`) and 20 reserved words (`if`, `then`, `elif`, `else`, `fi`, `for`, `do`, `done`, `while`, `until`, `case`, `esac`, `select`, `function`, `repeat`, `time`, `coproc`, `nocorrect`, `foreach`, `end`).
-  2. **Asynchronous `man` Page Retrieval Engine (`get_man_page`)**:
-     - For external commands not in the static dictionary, spawns `man <word>` asynchronously with `MANPAGER=cat`, `PAGER=cat`, and `TERM=dumb`.
-     - Guarded by a 2000ms timeout (`DEFAULT_HOVER_MAN_TIMEOUT`) to prevent subprocess deadlocks.
+  2. **Asynchronous `man` Page Retrieval Engine (`get_hover_info_cached` / `get_man_page`)**:
+     - For external commands not in the static dictionary, checks and populates the shared `Backend` `ManCache` (including negative caching) with Single-Flight request coalescing (`resolve_man_markdown_with_fetcher`) shared with `completionItem/resolve`.
+     - On cache miss, spawns `man <word>` asynchronously with `MANPAGER=cat`, `PAGER=cat`, and `TERM=dumb`, guarded by `DEFAULT_HOVER_MAN_TIMEOUT` (5000ms) to prevent subprocess deadlocks.
      - Strips backspace overstrikes (bold `c\bc`, underline `_\bc`) and ANSI escape sequences via `clean_man_text`.
      - Formats the plain text in Markdown code blocks (````text ... ````) matching Vim/Neovim standard behavior.
 
@@ -579,13 +579,15 @@ sequenceDiagram
             Server-->>Client: Ok(None)
         else Word extracted
             Hover-->>Server: Some((word, range))
-            Server->>Hover: get_hover_info(word)
+            Server->>Hover: get_hover_info_cached(word, &man_cache)
             alt Builtin / Reserved Word Match
                 Hover-->>Server: Some(MarkupContent { Markdown doc })
-            else External Command with man page
-                Hover->>OS: Spawn `man <word>` (2s timeout)
+            else Shared ManCache Hit
+                Hover-->>Server: Cached Markdown / None (Negative Cache)
+            else External Command with man page (Single-Flight)
+                Hover->>OS: Spawn `man <word>` (5s timeout)
                 OS-->>Hover: stdout (man text)
-                Hover->>Hover: clean_man_text(stdout)
+                Hover->>Hover: clean_man_text(stdout) & update ManCache
                 Hover-->>Server: Some(MarkupContent { ````text ... ```` })
             else Not found / Error
                 Hover-->>Server: None
