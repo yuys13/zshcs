@@ -11,8 +11,8 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::definition::{
-    byte_to_utf16_col, find_read_command, is_func_ident_char, is_var_ident_char,
-    split_declaration_tokens, split_line_statements,
+    byte_to_utf16_col, detect_heredoc_delimiter, find_read_command, is_func_ident_char,
+    is_var_ident_char, split_declaration_tokens, split_line_statements,
 };
 use crate::document::DocumentState;
 use crate::error::{ZshcsError, ZshcsResult};
@@ -818,95 +818,6 @@ fn split_words_with_offsets(input: &str) -> Vec<(usize, &str)> {
 /// that were defined at or before the given `position`.
 pub fn extract_local_symbols(doc: &DocumentState, position: Position) -> Vec<LocalSymbol> {
     extract_local_symbols_from_text(doc.text(), position)
-}
-
-/// Extracts the heredoc delimiter from a line if one is introduced, e.g. `cat <<EOF` -> `"EOF"`.
-/// Skips comments and string literals so that `<<` inside `# ...` or `"..."` is ignored.
-fn detect_heredoc_delimiter(line: &str) -> Option<String> {
-    let bytes = line.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut in_quote: Option<u8> = None;
-
-    let mut param_brace_depth: usize = 0;
-
-    while i < len {
-        let b = bytes[i];
-
-        if b == b'\\' && in_quote != Some(b'\'') && i + 1 < len {
-            i += 2;
-            continue;
-        }
-
-        if let Some(q) = in_quote {
-            if b == q {
-                in_quote = None;
-            }
-            i += 1;
-            continue;
-        }
-
-        if b == b'"' || b == b'\'' || b == b'`' {
-            in_quote = Some(b);
-            i += 1;
-            continue;
-        }
-
-        if b == b'{' && i > 0 && bytes[i - 1] == b'$' {
-            param_brace_depth += 1;
-        } else if b == b'}' && param_brace_depth > 0 {
-            param_brace_depth -= 1;
-        } else if param_brace_depth == 0 && b == b'#' {
-            let is_comment_start = i == 0
-                || bytes[i - 1].is_ascii_whitespace()
-                || bytes[i - 1] == b';'
-                || bytes[i - 1] == b'&'
-                || bytes[i - 1] == b'|'
-                || bytes[i - 1] == b'('
-                || bytes[i - 1] == b'`';
-            if is_comment_start {
-                break;
-            }
-        }
-
-        if b == b'<' && i + 1 < len && bytes[i + 1] == b'<' {
-            // Exclude here-strings (<<<) or sequences preceded by <
-            if (i > 0 && bytes[i - 1] == b'<') || (i + 2 < len && bytes[i + 2] == b'<') {
-                i += 2;
-                continue;
-            }
-            let mut rest = &line[i + 2..];
-            if let Some(stripped) = rest.strip_prefix('-') {
-                rest = stripped;
-            }
-            let trimmed = rest.trim_start();
-            let delim_token = if let Some(stripped) = trimmed.strip_prefix('\'') {
-                stripped.split('\'').next()
-            } else if let Some(stripped) = trimmed.strip_prefix('"') {
-                stripped.split('"').next()
-            } else if let Some(stripped) = trimmed.strip_prefix('\\') {
-                stripped.split_whitespace().next()
-            } else {
-                trimmed.split_whitespace().next()
-            };
-            if let Some(delim) = delim_token {
-                let clean_delim = delim.trim_matches(|c: char| {
-                    c == ';' || c == '|' || c == '&' || c == ')' || c == '(' || c == '>'
-                });
-                if !clean_delim.is_empty()
-                    && clean_delim
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-                {
-                    return Some(clean_delim.to_string());
-                }
-            }
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Checks whether a line ends with an unescaped line continuation backslash.
