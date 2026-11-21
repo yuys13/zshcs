@@ -30,6 +30,8 @@ pub struct Backend {
     completion_tx: mpsc::Sender<CompletionRequest>,
     config: Arc<RwLock<Config>>,
     man_cache: Arc<ManCache>,
+    diagnostic_tasks: Arc<dashmap::DashMap<Url, (u64, tokio::task::AbortHandle)>>,
+    diagnostic_task_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Backend {
@@ -78,6 +80,8 @@ impl Backend {
             completion_tx: tx,
             config: Arc::new(RwLock::new(Config::default())),
             man_cache: Arc::new(dashmap::DashMap::new()),
+            diagnostic_tasks: Arc::new(dashmap::DashMap::new()),
+            diagnostic_task_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -126,6 +130,8 @@ impl Backend {
             completion_tx: tx,
             config: Arc::new(RwLock::new(Config::default())),
             man_cache: Arc::new(dashmap::DashMap::new()),
+            diagnostic_tasks: Arc::new(dashmap::DashMap::new()),
+            diagnostic_task_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -155,6 +161,72 @@ impl Backend {
 
     pub async fn is_symbols_enabled(&self) -> bool {
         self.config.read().await.experimental_symbols()
+    }
+
+    pub fn active_diagnostic_task_count(&self) -> usize {
+        self.diagnostic_tasks.len()
+    }
+
+    fn cancel_diagnostic_task(&self, uri: &Url) {
+        if let Some((_, (_, handle))) = self.diagnostic_tasks.remove(uri) {
+            handle.abort();
+        }
+    }
+
+    fn cancel_all_diagnostic_tasks(&self) {
+        self.diagnostic_tasks.retain(|_, (_, handle)| {
+            handle.abort();
+            false
+        });
+    }
+
+    fn spawn_diagnostics_task(&self, uri: Url, version: i32, debounce: Option<Duration>) {
+        let task_id = self
+            .diagnostic_task_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let client = self.client.clone();
+        let uri_clone = uri.clone();
+        let doc_mgr = self.document_manager.clone();
+        let config = Arc::clone(&self.config);
+        let tasks = Arc::clone(&self.diagnostic_tasks);
+
+        let join_handle = tokio::spawn(async move {
+            if let Some(delay) = debounce {
+                tokio::time::sleep(delay).await;
+            }
+
+            let text = match doc_mgr.get(&uri_clone) {
+                Some(doc)
+                    if doc.version() == version
+                        && config.read().await.experimental_diagnostics() =>
+                {
+                    doc.text().to_string()
+                }
+                _ => {
+                    tasks.remove_if(&uri_clone, |_, (id, _)| *id == task_id);
+                    return;
+                }
+            };
+
+            let diagnostics = check_syntax(&text).await;
+            tasks.remove_if(&uri_clone, |_, (id, _)| *id == task_id);
+
+            if let Some(doc_after) = doc_mgr.get(&uri_clone)
+                && doc_after.version() == version
+                && config.read().await.experimental_diagnostics()
+            {
+                client
+                    .publish_diagnostics(uri_clone, diagnostics, Some(version))
+                    .await;
+            }
+        });
+
+        if let Some((_, prev_handle)) = self
+            .diagnostic_tasks
+            .insert(uri, (task_id, join_handle.abort_handle()))
+        {
+            prev_handle.abort();
+        }
     }
 }
 
@@ -234,6 +306,16 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> Result<()> {
         tracing::info!("LSP server shutting down");
+        self.cancel_all_diagnostic_tasks();
+        let (tx, rx) = oneshot::channel();
+        if self
+            .completion_tx
+            .send(CompletionRequest::Shutdown { responder: tx })
+            .await
+            .is_ok()
+        {
+            let _ = timeout(Duration::from_millis(1000), rx).await;
+        }
         Ok(())
     }
 
@@ -255,7 +337,8 @@ impl LanguageServer for Backend {
         );
 
         if was_enabled && !is_enabled {
-            // Clear all diagnostics for all open documents
+            // Cancel any pending diagnostics and clear all open documents
+            self.cancel_all_diagnostic_tasks();
             for item in self.document_manager.iter() {
                 let uri = item.key().clone();
                 let version = item.value().version();
@@ -268,21 +351,7 @@ impl LanguageServer for Backend {
             for item in self.document_manager.iter() {
                 let uri = item.key().clone();
                 let version = item.value().version();
-                let text = item.value().text().to_string();
-                let client = self.client.clone();
-                let doc_mgr = self.document_manager.clone();
-                let config = Arc::clone(&self.config);
-                tokio::spawn(async move {
-                    let diagnostics = check_syntax(&text).await;
-                    if let Some(doc) = doc_mgr.get(&uri)
-                        && doc.version() == version
-                        && config.read().await.experimental_diagnostics()
-                    {
-                        client
-                            .publish_diagnostics(uri, diagnostics, Some(version))
-                            .await;
-                    }
-                });
+                self.spawn_diagnostics_task(uri, version, None);
             }
         }
     }
@@ -302,21 +371,7 @@ impl LanguageServer for Backend {
             .await;
 
         if self.is_diagnostics_enabled().await {
-            let client = self.client.clone();
-            let uri_clone = uri.clone();
-            let doc_mgr = self.document_manager.clone();
-            let config = Arc::clone(&self.config);
-            tokio::spawn(async move {
-                let diagnostics = check_syntax(&text).await;
-                if let Some(doc) = doc_mgr.get(&uri_clone)
-                    && doc.version() == version
-                    && config.read().await.experimental_diagnostics()
-                {
-                    client
-                        .publish_diagnostics(uri_clone, diagnostics, Some(version))
-                        .await;
-                }
-            });
+            self.spawn_diagnostics_task(uri, version, None);
         }
     }
 
@@ -350,30 +405,7 @@ impl LanguageServer for Backend {
             .await;
 
         if self.is_diagnostics_enabled().await {
-            let client = self.client.clone();
-            let uri_clone = uri.clone();
-            let doc_mgr = self.document_manager.clone();
-            let config = Arc::clone(&self.config);
-            tokio::spawn(async move {
-                // Debounce delay to coalesce rapid keystrokes
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                if let Some(doc) = doc_mgr.get(&uri_clone)
-                    && doc.version() == version
-                    && config.read().await.experimental_diagnostics()
-                {
-                    let text = doc.text().to_string();
-                    drop(doc);
-                    let diagnostics = check_syntax(&text).await;
-                    if let Some(doc_after) = doc_mgr.get(&uri_clone)
-                        && doc_after.version() == version
-                        && config.read().await.experimental_diagnostics()
-                    {
-                        client
-                            .publish_diagnostics(uri_clone, diagnostics, Some(version))
-                            .await;
-                    }
-                }
-            });
+            self.spawn_diagnostics_task(uri, version, Some(Duration::from_millis(150)));
         }
     }
 
@@ -385,28 +417,14 @@ impl LanguageServer for Backend {
             && let Some(doc) = self.document_manager.get(&uri)
         {
             let version = doc.version();
-            let text = doc.text().to_string();
             drop(doc);
-            let client = self.client.clone();
-            let uri_clone = uri.clone();
-            let doc_mgr = self.document_manager.clone();
-            let config = Arc::clone(&self.config);
-            tokio::spawn(async move {
-                let diagnostics = check_syntax(&text).await;
-                if let Some(doc_after) = doc_mgr.get(&uri_clone)
-                    && doc_after.version() == version
-                    && config.read().await.experimental_diagnostics()
-                {
-                    client
-                        .publish_diagnostics(uri_clone, diagnostics, Some(version))
-                        .await;
-                }
-            });
+            self.spawn_diagnostics_task(uri, version, None);
         }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
+        self.cancel_diagnostic_task(&uri);
         if self.document_manager.close(&uri).is_some() {
             tracing::info!(uri = %uri, "textDocument/didClose");
             self.client
@@ -454,7 +472,7 @@ impl LanguageServer for Backend {
 
         // Request completion from the daemon
         let (tx, rx) = oneshot::channel();
-        let req = CompletionRequest {
+        let req = CompletionRequest::Complete {
             prefix: prefix.clone(),
             cwd,
             responder: tx,
@@ -948,5 +966,140 @@ mod tests {
             }
             other => panic!("Expected MarkupContent from shared cache, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_backend_diagnostics_task_cancelled_on_superseding_change_and_close() {
+        let (service, mut socket) = LspService::new(|client| Backend::new(client).unwrap());
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
+        let backend = service.inner();
+
+        backend
+            .initialize(InitializeParams {
+                initialization_options: Some(serde_json::json!({
+                    "zshcs": {
+                        "experimental": {
+                            "diagnostics": true
+                        }
+                    }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let uri = Url::parse("file:///diag_cancel.zsh").unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: "echo ok\n".to_string(),
+                },
+            })
+            .await;
+
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(uri.clone(), 2),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "echo v2\n".to_string(),
+                }],
+            })
+            .await;
+        assert_eq!(backend.active_diagnostic_task_count(), 1);
+
+        // Superseding didChange should replace/abort the previous task handle, keeping count at 1
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(uri.clone(), 3),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "echo v3\n".to_string(),
+                }],
+            })
+            .await;
+        assert_eq!(backend.active_diagnostic_task_count(), 1);
+
+        // Closing the document should immediately cancel the pending diagnostic task
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri },
+            })
+            .await;
+        assert_eq!(backend.active_diagnostic_task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_backend_shutdown_cancels_diagnostics_and_stops_daemon() {
+        let (service, mut socket) = LspService::new(|client| Backend::new(client).unwrap());
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
+        let backend = service.inner();
+
+        backend
+            .initialize(InitializeParams {
+                initialization_options: Some(serde_json::json!({
+                    "zshcs": {
+                        "experimental": {
+                            "diagnostics": true
+                        }
+                    }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let uri = Url::parse("file:///shutdown_cleanup.zsh").unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: "echo ".to_string(),
+                },
+            })
+            .await;
+
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(uri.clone(), 2),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "echo hi".to_string(),
+                }],
+            })
+            .await;
+        assert_eq!(backend.active_diagnostic_task_count(), 1);
+
+        backend.shutdown().await.unwrap();
+        assert_eq!(backend.active_diagnostic_task_count(), 0);
+
+        // Completion daemon loop should have exited cleanly, so completion returns Ok(None)
+        let res = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position::new(0, 4),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await;
+        assert!(res.is_ok());
+        assert!(res.unwrap().is_none());
     }
 }

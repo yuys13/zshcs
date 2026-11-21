@@ -22,10 +22,15 @@ pub const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
 pub const ZPTYRC_ZSH: &str = include_str!("../bin/zptyrc.zsh");
 pub const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_millis(5000);
 
-pub struct CompletionRequest {
-    pub prefix: String,
-    pub cwd: Option<PathBuf>,
-    pub responder: oneshot::Sender<ZshcsResult<Vec<CompletionItem>>>,
+pub enum CompletionRequest {
+    Complete {
+        prefix: String,
+        cwd: Option<PathBuf>,
+        responder: oneshot::Sender<ZshcsResult<Vec<CompletionItem>>>,
+    },
+    Shutdown {
+        responder: oneshot::Sender<()>,
+    },
 }
 
 struct DaemonProcess {
@@ -119,9 +124,26 @@ pub async fn run_completion_daemon(
     let mut daemon: Option<DaemonProcess> = None;
 
     while let Some(req) = rx.recv().await {
-        if req.responder.is_closed() {
+        let (prefix, cwd, responder) = match req {
+            CompletionRequest::Shutdown { responder } => {
+                tracing::info!("Shutting down completion daemon process");
+                if let Some(mut p) = daemon.take() {
+                    let _ = p.child.start_kill();
+                    let _ = timeout(Duration::from_millis(500), p.child.wait()).await;
+                }
+                let _ = responder.send(());
+                break;
+            }
+            CompletionRequest::Complete {
+                prefix,
+                cwd,
+                responder,
+            } => (prefix, cwd, responder),
+        };
+
+        if responder.is_closed() {
             tracing::debug!(
-                prefix = %req.prefix,
+                prefix = %prefix,
                 "Completion request cancelled by client; discarding"
             );
             continue;
@@ -156,7 +178,7 @@ pub async fn run_completion_daemon(
                             format!("Failed to spawn completion daemon: {e}"),
                         )
                         .await;
-                    let _ = req.responder.send(Err(ZshcsError::Io(e)));
+                    let _ = responder.send(Err(ZshcsError::Io(e)));
                     continue;
                 }
             }
@@ -169,7 +191,7 @@ pub async fn run_completion_daemon(
         // Execute request with timeout to protect supervisor against hung processes
         let exec_result = timeout(DAEMON_REQUEST_TIMEOUT, async {
             // Synchronize working directory if specified and changed
-            if let Some(target_cwd) = &req.cwd {
+            if let Some(target_cwd) = &cwd {
                 let need_chdir = match &proc.current_cwd {
                     Some(current) => current != target_cwd,
                     None => true,
@@ -184,7 +206,7 @@ pub async fn run_completion_daemon(
             }
 
             // Send input message to daemon (sanitizing newlines)
-            let sanitized_prefix = req.prefix.replace(['\r', '\n'], "");
+            let sanitized_prefix = prefix.replace(['\r', '\n'], "");
             tracing::trace!(prefix = %sanitized_prefix, "Sending input to completion daemon");
             let msg = format!("input:{sanitized_prefix}\n");
             proc.stdin.write_all(msg.as_bytes()).await?;
@@ -229,7 +251,7 @@ pub async fn run_completion_daemon(
 
         match exec_result {
             Ok(Ok(items)) => {
-                let _ = req.responder.send(Ok(items));
+                let _ = responder.send(Ok(items));
             }
             Ok(Err(e)) => {
                 tracing::error!(error = %e, "Completion daemon I/O failure; killing process");
@@ -242,7 +264,7 @@ pub async fn run_completion_daemon(
                 if let Some(mut p) = daemon.take() {
                     let _ = p.child.start_kill();
                 }
-                let _ = req.responder.send(Err(ZshcsError::Io(e)));
+                let _ = responder.send(Err(ZshcsError::Io(e)));
             }
             Err(_) => {
                 tracing::error!(
@@ -261,11 +283,15 @@ pub async fn run_completion_daemon(
                 if let Some(mut p) = daemon.take() {
                     let _ = p.child.start_kill();
                 }
-                let _ = req.responder.send(Err(ZshcsError::Daemon(
+                let _ = responder.send(Err(ZshcsError::Daemon(
                     "Completion request timed out".to_string(),
                 )));
             }
         }
+    }
+
+    if let Some(mut p) = daemon.take() {
+        let _ = p.child.start_kill();
     }
 }
 
@@ -2151,7 +2177,7 @@ mod tests {
         // 1. Send cancelled request (drop receiver immediately)
         let (tx_resp1, rx_resp1) = oneshot::channel();
         drop(rx_resp1);
-        tx.send(CompletionRequest {
+        tx.send(CompletionRequest::Complete {
             prefix: "cancelled".to_string(),
             cwd: None,
             responder: tx_resp1,
@@ -2161,7 +2187,7 @@ mod tests {
 
         // 2. Send active request
         let (tx_resp2, rx_resp2) = oneshot::channel();
-        tx.send(CompletionRequest {
+        tx.send(CompletionRequest::Complete {
             prefix: "active".to_string(),
             cwd: None,
             responder: tx_resp2,
