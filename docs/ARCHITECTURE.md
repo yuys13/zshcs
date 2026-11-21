@@ -88,6 +88,8 @@ The `DocumentManager` subsystem maintains accurate in-memory representations of 
   - Converts LSP 0-based UTF-16 line/character coordinates to Rust UTF-8 byte indices.
   - Handles multibyte characters (CJK ideographs, 4-byte SMP characters such as `𩸽`), Unicode surrogate pairs, complex emoji sequences (skin tone modifiers, ZWJ sequences like `👨‍👩‍👧‍👦`, regional indicator flags `🇯🇵`), and combining diacritical marks.
   - Safely normalizes LF (`\n`), CRLF (`\r\n`), and mixed line endings without out-of-bounds panics.
+- **Multiline Line-Continuation Prefix Extraction (`get_line_prefix`)**:
+  - Joins preceding backslash-continued lines (`\`) up to the cursor position so multiline commands preserve their command context, while ignoring trailing backslashes inside comments (`#`), single-quoted strings (`'...'`), or escaped double backslashes (`\\`).
 
 ---
 
@@ -484,6 +486,7 @@ sequenceDiagram
     User->>Client: Type trigger character (e.g., 'git s')
     Client->>Server: textDocument/completion (uri, position)
     Server->>DocMgr: get_line_prefix(uri, position)
+    Note over DocMgr: Joins preceding backslash-continued lines (`\`)
     DocMgr-->>Server: Some("git s")
     Server->>Server: Derive cwd from uri
 

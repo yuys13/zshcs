@@ -84,12 +84,102 @@ impl DocumentState {
         Ok(())
     }
 
-    /// Retrieves the text on the line of `position` from the start of the line up to `position`.
+    /// Retrieves the text on the line of `position` from the start of the line up to `position`,
+    /// joining any preceding backslash-continued lines.
     pub fn get_line_prefix(&self, position: Position) -> Option<String> {
         let offset = position_to_byte_offset(&self.text, position)?;
         let line_start = self.text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        Some(self.text[line_start..offset].to_string())
+        let current_segment = &self.text[line_start..offset];
+
+        let mut segments: Vec<&str> = Vec::new();
+        let mut scan_end = line_start;
+        while scan_end > 0 {
+            let prev_newline_idx = scan_end - 1;
+            let prev_line_start = self.text[..prev_newline_idx]
+                .rfind('\n')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let prev_line_raw = &self.text[prev_line_start..prev_newline_idx];
+            let prev_line = prev_line_raw.strip_suffix('\r').unwrap_or(prev_line_raw);
+            if line_has_continuation(prev_line) {
+                segments.push(&prev_line[..prev_line.len() - 1]);
+                scan_end = prev_line_start;
+            } else {
+                break;
+            }
+        }
+
+        if segments.is_empty() {
+            return Some(current_segment.to_string());
+        }
+
+        segments.reverse();
+        let total_len: usize =
+            segments.iter().map(|s| s.len()).sum::<usize>() + current_segment.len();
+        let mut joined = String::with_capacity(total_len);
+        for seg in segments {
+            joined.push_str(seg);
+        }
+        joined.push_str(current_segment);
+        Some(joined)
     }
+}
+
+/// Checks whether a single line (without trailing `\r`/`\n`) ends with an unescaped
+/// backslash continuation outside comments and single-quoted strings.
+fn line_has_continuation(line: &str) -> bool {
+    if !line.ends_with('\\') {
+        return false;
+    }
+
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_quote: Option<u8> = None;
+    let mut param_brace_depth: usize = 0;
+
+    while i < len {
+        let b = bytes[i];
+
+        if in_quote == Some(b'\'') {
+            if b == b'\'' {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'\\' {
+            if i + 1 < len {
+                i += 2;
+                continue;
+            }
+            return true;
+        }
+
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+        } else if b == b'\'' || b == b'"' || b == b'`' {
+            in_quote = Some(b);
+        } else if b == b'{' && i > 0 && bytes[i - 1] == b'$' {
+            param_brace_depth += 1;
+        } else if b == b'}' && param_brace_depth > 0 {
+            param_brace_depth -= 1;
+        } else if param_brace_depth == 0 && b == b'#' {
+            let is_comment_start = i == 0
+                || bytes[i - 1].is_ascii_whitespace()
+                || matches!(bytes[i - 1], b';' | b'&' | b'|' | b'(' | b'`');
+            if is_comment_start {
+                return false;
+            }
+        }
+
+        i += 1;
+    }
+
+    false
 }
 
 /// Thread-safe manager for all open documents.
@@ -640,6 +730,60 @@ mod tests {
 
         // Line 10 out of bounds
         assert_eq!(state.get_line_prefix(Position::new(10, 0)), None);
+    }
+
+    #[test]
+    fn test_document_state_get_line_prefix_backslash_continuation() {
+        let uri = Url::parse("file:///multiline.zsh").unwrap();
+
+        // 1. Two-line continued command
+        let state1 = DocumentState::new(uri.clone(), 1, "git commit \\\n  --am".to_string());
+        assert_eq!(
+            state1.get_line_prefix(Position::new(1, 6)),
+            Some("git commit   --am".to_string())
+        );
+
+        // 2. Three-line continued command with CRLF
+        let state2 = DocumentState::new(
+            uri.clone(),
+            1,
+            "git \\\r\n  commit \\\r\n  --amend".to_string(),
+        );
+        assert_eq!(
+            state2.get_line_prefix(Position::new(2, 9)),
+            Some("git   commit   --amend".to_string())
+        );
+
+        // 3. Escaped trailing double backslash should NOT join
+        let state3 = DocumentState::new(uri.clone(), 1, "echo hello \\\\\ngit st".to_string());
+        assert_eq!(
+            state3.get_line_prefix(Position::new(1, 6)),
+            Some("git st".to_string())
+        );
+
+        // 4. Comment lines ending with backslash should NOT join
+        let state4 = DocumentState::new(uri.clone(), 1, "# comment \\\ngit st".to_string());
+        assert_eq!(
+            state4.get_line_prefix(Position::new(1, 6)),
+            Some("git st".to_string())
+        );
+
+        let state5 = DocumentState::new(
+            uri.clone(),
+            1,
+            "echo hi # inline comment \\\ngit st".to_string(),
+        );
+        assert_eq!(
+            state5.get_line_prefix(Position::new(1, 6)),
+            Some("git st".to_string())
+        );
+
+        // 5. Single-quoted line ending with backslash should NOT join
+        let state6 = DocumentState::new(uri, 1, "echo 'literal \\\ngit st".to_string());
+        assert_eq!(
+            state6.get_line_prefix(Position::new(1, 6)),
+            Some("git st".to_string())
+        );
     }
 
     #[test]
