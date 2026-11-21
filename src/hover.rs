@@ -563,6 +563,67 @@ pub async fn get_hover_info_with_timeout(
     }))
 }
 
+/// Generates hover information for a word asynchronously using a shared `ManCache` and default timeout.
+pub async fn get_hover_info_cached(
+    word: &str,
+    cache: &crate::completion::ManCache,
+) -> Option<HoverContents> {
+    get_hover_info_cached_with_timeout(word, cache, DEFAULT_HOVER_MAN_TIMEOUT).await
+}
+
+/// Generates hover information for a word asynchronously using a shared `ManCache` and custom timeout.
+///
+/// Priority:
+/// 1. Zsh builtins & reserved words static Markdown dictionary.
+/// 2. External command `man` page resolved via shared cache and single-flight deduplication.
+pub async fn get_hover_info_cached_with_timeout(
+    word: &str,
+    cache: &crate::completion::ManCache,
+    timeout_dur: Duration,
+) -> Option<HoverContents> {
+    // 1. Check static dictionary for word or basename
+    if let Some(doc) = get_builtin_or_reserved_doc(word) {
+        return Some(HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: doc.to_string(),
+        }));
+    }
+
+    let target = if let Some(slash_idx) = word.rfind('/') {
+        &word[slash_idx + 1..]
+    } else {
+        word
+    };
+
+    if !target.is_empty()
+        && target != word
+        && let Some(doc) = get_builtin_or_reserved_doc(target)
+    {
+        return Some(HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: doc.to_string(),
+        }));
+    }
+
+    if !crate::completion::is_eligible_for_external_command(None, target) {
+        return None;
+    }
+
+    // 2. Query man page asynchronously with shared cache and single-flight coalescing
+    let markdown = crate::completion::resolve_man_markdown_with_fetcher(
+        target,
+        cache,
+        timeout_dur,
+        |cmd, dur| async move { get_man_page_result(&cmd, dur).await },
+    )
+    .await?;
+
+    Some(HoverContents::Markup(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value: markdown,
+    }))
+}
+
 /// Formats raw manual page text into a Markdown code block with dynamic fence escaping.
 pub fn format_man_markdown(man_text: &str) -> String {
     let mut fence_len = 3;
@@ -1051,5 +1112,45 @@ mod tests {
             format_man_markdown(with_backticks),
             "````text\nRun ```command``` to execute.\n````"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_hover_info_cached_populates_and_reuses_cache() {
+        let cache = crate::completion::ManCache::new();
+        assert!(!cache.contains_key("git"));
+
+        // First call should resolve man page and populate cache
+        let first = get_hover_info_cached("git", &cache).await;
+        assert!(first.is_some(), "Expected hover info for 'git'");
+        assert!(cache.contains_key("git"));
+        assert!(cache.get("git").unwrap().is_some());
+
+        // Replace cache value with sentinel to verify second call reads from cache
+        cache.insert(
+            "git".to_string(),
+            Some("```text\ncached sentinel\n```".to_string()),
+        );
+        let second = get_hover_info_cached("git", &cache).await;
+        match second {
+            Some(HoverContents::Markup(markup)) => {
+                assert_eq!(markup.value, "```text\ncached sentinel\n```");
+            }
+            other => panic!("Expected cached MarkupContent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_hover_info_cached_negative_cache() {
+        let cache = crate::completion::ManCache::new();
+        let dummy = "nonexistent_hover_cmd_xyz123";
+
+        let first = get_hover_info_cached(dummy, &cache).await;
+        assert!(first.is_none());
+        assert!(cache.contains_key(dummy));
+        assert_eq!(*cache.get(dummy).unwrap(), None);
+
+        // Even if we don't spawn man again, negative cache returns None
+        let second = get_hover_info_cached(dummy, &cache).await;
+        assert!(second.is_none());
     }
 }

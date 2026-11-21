@@ -524,28 +524,25 @@ pub(crate) fn is_in_flight(key: &str) -> bool {
     IN_FLIGHT.contains_key(key)
 }
 
-fn apply_single_flight_result(
+fn apply_single_flight_markdown_result(
     result: &SingleFlightResult,
-    mut item: CompletionItem,
     cache: &ManCache,
     trimmed_label: &str,
-) -> CompletionItem {
+) -> Option<String> {
     match result {
         SingleFlightResult::Found(md) => {
             cache.insert(trimmed_label.to_string(), Some(md.clone()));
-            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: md.clone(),
-            }));
+            Some(md.clone())
         }
         SingleFlightResult::NotFound => {
             cache.insert(trimmed_label.to_string(), None);
+            None
         }
         SingleFlightResult::Timeout | SingleFlightResult::Error => {
             // Do not cache transient timeouts or execution errors so future attempts can retry
+            None
         }
     }
-    item
 }
 
 /// Determines whether a completion item is eligible for external command man page lookup.
@@ -570,6 +567,104 @@ pub fn is_eligible_for_external_command(kind: Option<CompletionItemKind>, label:
     trimmed
         .chars()
         .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
+/// Resolves formatted Markdown documentation for an external command using `ManCache`,
+/// single-flight request coalescing, negative caching, and timeout protection.
+pub(crate) async fn resolve_man_markdown_with_fetcher<F, Fut>(
+    trimmed_label: &str,
+    cache: &ManCache,
+    timeout_dur: Duration,
+    fetcher: F,
+) -> Option<String>
+where
+    F: FnOnce(String, Duration) -> Fut,
+    Fut: std::future::Future<Output = crate::hover::ManPageResult>,
+{
+    // 1. Fast path: check cache
+    if let Some(entry) = cache.get(trimmed_label) {
+        return entry.value().clone();
+    }
+
+    // 2. Single-Flight request deduplication
+    enum FlightRole {
+        Leader(
+            InFlightGuard,
+            tokio::sync::watch::Sender<Option<SingleFlightResult>>,
+        ),
+        Waiter(tokio::sync::watch::Receiver<Option<SingleFlightResult>>),
+    }
+
+    let role = match IN_FLIGHT.entry(trimmed_label.to_string()) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => FlightRole::Waiter(entry.get().clone()),
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            // Double-check cache in case a previous in-flight request completed just before locking
+            if let Some(entry_cache) = cache.get(trimmed_label) {
+                return entry_cache.value().clone();
+            }
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            entry.insert(rx);
+            let guard = InFlightGuard::new(trimmed_label.to_string());
+            FlightRole::Leader(guard, tx)
+        }
+    };
+
+    match role {
+        FlightRole::Leader(guard, tx) => {
+            match fetcher(trimmed_label.to_string(), timeout_dur).await {
+                crate::hover::ManPageResult::Found(raw_man) => {
+                    let md = crate::hover::format_man_markdown(&raw_man);
+                    cache.insert(trimmed_label.to_string(), Some(md.clone()));
+                    let _ = tx.send(Some(SingleFlightResult::Found(md.clone())));
+                    guard.complete();
+                    Some(md)
+                }
+                crate::hover::ManPageResult::NotFound => {
+                    cache.insert(trimmed_label.to_string(), None);
+                    let _ = tx.send(Some(SingleFlightResult::NotFound));
+                    guard.complete();
+                    None
+                }
+                crate::hover::ManPageResult::Timeout => {
+                    let _ = tx.send(Some(SingleFlightResult::Timeout));
+                    guard.complete();
+                    None
+                }
+                crate::hover::ManPageResult::Error(_) => {
+                    let _ = tx.send(Some(SingleFlightResult::Error));
+                    guard.complete();
+                    None
+                }
+            }
+        }
+        FlightRole::Waiter(mut rx) => {
+            // Check if the result was already published before subscription
+            if let Some(ref res) = *rx.borrow() {
+                return apply_single_flight_markdown_result(res, cache, trimmed_label);
+            }
+
+            match timeout(timeout_dur, rx.changed()).await {
+                Ok(Ok(())) => {
+                    if let Some(ref res) = *rx.borrow() {
+                        return apply_single_flight_markdown_result(res, cache, trimmed_label);
+                    }
+                }
+                Ok(Err(_)) => {
+                    // Leader disconnected or dropped without a new value
+                    if let Some(ref res) = *rx.borrow() {
+                        return apply_single_flight_markdown_result(res, cache, trimmed_label);
+                    }
+                    if let Some(entry) = cache.get(trimmed_label) {
+                        return entry.value().clone();
+                    }
+                }
+                Err(_) => {
+                    // Waiter timed out waiting for the in-flight resolution
+                }
+            }
+            None
+        }
+    }
 }
 
 /// Resolves detailed documentation for a `CompletionItem` asynchronously using an underlying fetcher
@@ -611,108 +706,16 @@ where
         return item;
     }
 
-    // 3. Fast path: check cache
-    if let Some(entry) = cache.get(&trimmed_label) {
-        if let Some(markdown) = entry.value() {
-            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: markdown.clone(),
-            }));
-        }
-        return item;
+    if let Some(markdown) =
+        resolve_man_markdown_with_fetcher(&trimmed_label, cache, timeout_dur, fetcher).await
+    {
+        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: markdown,
+        }));
     }
 
-    // 4. Single-Flight request deduplication
-    enum FlightRole {
-        Leader(
-            InFlightGuard,
-            tokio::sync::watch::Sender<Option<SingleFlightResult>>,
-        ),
-        Waiter(tokio::sync::watch::Receiver<Option<SingleFlightResult>>),
-    }
-
-    let role = match IN_FLIGHT.entry(trimmed_label.clone()) {
-        dashmap::mapref::entry::Entry::Occupied(entry) => FlightRole::Waiter(entry.get().clone()),
-        dashmap::mapref::entry::Entry::Vacant(entry) => {
-            // Double-check cache in case a previous in-flight request completed just before locking
-            if let Some(entry_cache) = cache.get(&trimmed_label) {
-                if let Some(markdown) = entry_cache.value() {
-                    item.documentation = Some(Documentation::MarkupContent(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: markdown.clone(),
-                    }));
-                }
-                return item;
-            }
-            let (tx, rx) = tokio::sync::watch::channel(None);
-            entry.insert(rx);
-            let guard = InFlightGuard::new(trimmed_label.clone());
-            FlightRole::Leader(guard, tx)
-        }
-    };
-
-    match role {
-        FlightRole::Leader(guard, tx) => {
-            match fetcher(trimmed_label.clone(), timeout_dur).await {
-                crate::hover::ManPageResult::Found(raw_man) => {
-                    let md = crate::hover::format_man_markdown(&raw_man);
-                    cache.insert(trimmed_label.clone(), Some(md.clone()));
-                    let _ = tx.send(Some(SingleFlightResult::Found(md.clone())));
-                    guard.complete();
-                    item.documentation = Some(Documentation::MarkupContent(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: md,
-                    }));
-                }
-                crate::hover::ManPageResult::NotFound => {
-                    cache.insert(trimmed_label.clone(), None);
-                    let _ = tx.send(Some(SingleFlightResult::NotFound));
-                    guard.complete();
-                }
-                crate::hover::ManPageResult::Timeout => {
-                    let _ = tx.send(Some(SingleFlightResult::Timeout));
-                    guard.complete();
-                }
-                crate::hover::ManPageResult::Error(_) => {
-                    let _ = tx.send(Some(SingleFlightResult::Error));
-                    guard.complete();
-                }
-            }
-            item
-        }
-        FlightRole::Waiter(mut rx) => {
-            // Check if the result was already published before subscription
-            if let Some(ref res) = *rx.borrow() {
-                return apply_single_flight_result(res, item, cache, &trimmed_label);
-            }
-
-            match timeout(timeout_dur, rx.changed()).await {
-                Ok(Ok(())) => {
-                    if let Some(ref res) = *rx.borrow() {
-                        return apply_single_flight_result(res, item, cache, &trimmed_label);
-                    }
-                }
-                Ok(Err(_)) => {
-                    // Leader disconnected or dropped without a new value
-                    if let Some(ref res) = *rx.borrow() {
-                        return apply_single_flight_result(res, item, cache, &trimmed_label);
-                    }
-                    if let Some(entry) = cache.get(&trimmed_label)
-                        && let Some(markdown) = entry.value()
-                    {
-                        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: markdown.clone(),
-                        }));
-                    }
-                }
-                Err(_) => {
-                    // Waiter timed out waiting for the in-flight resolution
-                }
-            }
-            item
-        }
-    }
+    item
 }
 
 /// Resolves detailed documentation for a `CompletionItem` asynchronously with a custom timeout.

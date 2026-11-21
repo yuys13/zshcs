@@ -19,7 +19,7 @@ use crate::definition::find_definition;
 use crate::diagnostics::check_syntax;
 use crate::document::DocumentManager;
 use crate::error::{ZshcsError, ZshcsResult};
-use crate::hover::{extract_word_at_position, get_hover_info};
+use crate::hover::{extract_word_at_position, get_hover_info_cached};
 use crate::symbols::extract_document_symbols;
 
 #[derive(Debug)]
@@ -564,7 +564,7 @@ impl LanguageServer for Backend {
             "Extracted word for hover; querying hover info"
         );
 
-        match get_hover_info(word).await {
+        match get_hover_info_cached(word, &self.man_cache).await {
             Some(contents) => Ok(Some(Hover {
                 contents,
                 range: Some(range),
@@ -879,5 +879,74 @@ mod tests {
         // Shared cache must contain git
         assert!(backend.man_cache().contains_key("git"));
         assert!(backend.man_cache().get("git").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_backend_hover_shares_man_cache_with_completion_resolve() {
+        let (service, _socket) = LspService::new(|client| Backend::new(client).unwrap());
+        let backend = service.inner();
+
+        let init_params = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "zshcs": {
+                    "experimental": {
+                        "hover": true
+                    }
+                }
+            })),
+            ..Default::default()
+        };
+        backend.initialize(init_params).await.unwrap();
+
+        let uri = Url::parse("file:///hover_cache_share.zsh").unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: "git status\n".to_string(),
+                },
+            })
+            .await;
+
+        assert!(!backend.man_cache().contains_key("git"));
+
+        // 1. Hover on `git` should populate Backend's shared man_cache
+        let hover_res = backend
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position::new(0, 1),
+                },
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(hover_res.is_some());
+        assert!(backend.man_cache().contains_key("git"));
+        let cached_md = backend
+            .man_cache()
+            .get("git")
+            .unwrap()
+            .value()
+            .clone()
+            .expect("Expected cached markdown for git");
+
+        // 2. Subsequent completionItem/resolve for `git` should reuse the exact cached markdown
+        let resolved = backend
+            .completion_resolve(CompletionItem {
+                label: "git".to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        match resolved.documentation {
+            Some(Documentation::MarkupContent(markup)) => {
+                assert_eq!(markup.value, cached_md);
+            }
+            other => panic!("Expected MarkupContent from shared cache, got {other:?}"),
+        }
     }
 }
