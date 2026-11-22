@@ -180,37 +180,64 @@ pub fn resolve_sourced_script(
     Some((primary_uri, raw_uri, content))
 }
 
+struct ResolvedSourceUris {
+    raw_path: PathBuf,
+    raw_uri: Option<Url>,
+    canon_uri: Option<Url>,
+    primary_uri: Url,
+}
+
+fn resolve_source_uris(path_str: &str, base_uri: &Url) -> Option<ResolvedSourceUris> {
+    let raw_path = expand_and_normalize_source_path(path_str, base_uri)?;
+    let raw_uri = Url::from_file_path(&raw_path).ok();
+    let canon_uri = resolve_source_path(path_str, base_uri);
+    let primary_uri = canon_uri.clone().or_else(|| raw_uri.clone())?;
+    Some(ResolvedSourceUris {
+        raw_path,
+        raw_uri,
+        canon_uri,
+        primary_uri,
+    })
+}
+
+fn load_sourced_script_with_index(
+    uris: &ResolvedSourceUris,
+    doc_manager: Option<&DocumentManager>,
+) -> Option<(String, Arc<DocumentIndex>)> {
+    #[cfg(test)]
+    tests::increment_load_count();
+
+    if let Some(mgr) = doc_manager {
+        let open_doc = uris
+            .canon_uri
+            .as_ref()
+            .and_then(|u| mgr.get(u))
+            .or_else(|| uris.raw_uri.as_ref().and_then(|u| mgr.get(u)));
+        if let Some(doc) = open_doc {
+            return Some((doc.text().to_string(), doc.index()));
+        }
+    }
+
+    let content = if let Some(ref u) = uris.canon_uri
+        && let Ok(p) = u.to_file_path()
+    {
+        read_sourced_file_bounded(&p)
+    } else {
+        read_sourced_file_bounded(&uris.raw_path)
+    }?;
+
+    let index = Arc::new(parse_document(&content));
+    Some((content, index))
+}
+
 fn resolve_sourced_script_with_index(
     path_str: &str,
     base_uri: &Url,
     doc_manager: Option<&DocumentManager>,
 ) -> Option<(Url, Option<Url>, String, Arc<DocumentIndex>)> {
-    let raw_path = expand_and_normalize_source_path(path_str, base_uri)?;
-    let raw_uri = Url::from_file_path(&raw_path).ok();
-    let canon_uri = resolve_source_path(path_str, base_uri);
-
-    if let Some(mgr) = doc_manager {
-        let open_doc = canon_uri
-            .as_ref()
-            .and_then(|u| mgr.get(u))
-            .or_else(|| raw_uri.as_ref().and_then(|u| mgr.get(u)));
-        if let Some(doc) = open_doc {
-            let primary_uri = canon_uri.or_else(|| raw_uri.clone())?;
-            return Some((primary_uri, raw_uri, doc.text().to_string(), doc.index()));
-        }
-    }
-
-    let content = if let Some(ref u) = canon_uri
-        && let Ok(p) = u.to_file_path()
-    {
-        read_sourced_file_bounded(&p)
-    } else {
-        read_sourced_file_bounded(&raw_path)
-    }?;
-
-    let primary_uri = canon_uri.or_else(|| raw_uri.clone())?;
-    let index = Arc::new(parse_document(&content));
-    Some((primary_uri, raw_uri, content, index))
+    let uris = resolve_source_uris(path_str, base_uri)?;
+    let (content, index) = load_sourced_script_with_index(&uris, doc_manager)?;
+    Some((uris.primary_uri, uris.raw_uri, content, index))
 }
 
 pub(crate) fn prioritized_source_paths(
@@ -262,34 +289,39 @@ impl<'a> WorkspaceCollector<'a> {
                 break;
             }
 
-            let Some((target_uri, alt_uri, content, child_index)) =
-                resolve_sourced_script_with_index(&path_str, base_uri, self.doc_manager)
-            else {
+            let Some(uris) = resolve_source_uris(&path_str, base_uri) else {
                 continue;
             };
 
-            let already_visited = self.visited_uris.contains(&target_uri)
-                || alt_uri
+            let already_visited = self.visited_uris.contains(&uris.primary_uri)
+                || uris
+                    .raw_uri
                     .as_ref()
                     .is_some_and(|u| self.visited_uris.contains(u));
             if already_visited {
                 continue;
             }
 
-            self.visited_uris.insert(target_uri.clone());
-            if let Some(alt) = alt_uri {
-                self.visited_uris.insert(alt);
+            let Some((content, child_index)) =
+                load_sourced_script_with_index(&uris, self.doc_manager)
+            else {
+                continue;
+            };
+
+            self.visited_uris.insert(uris.primary_uri.clone());
+            if let Some(raw_uri) = uris.raw_uri {
+                self.visited_uris.insert(raw_uri);
             }
 
             self.docs.push(SourcedDocument {
-                uri: target_uri.clone(),
+                uri: uris.primary_uri.clone(),
                 text: content,
                 index: Arc::clone(&child_index),
             });
 
             self.collect(
                 &child_index,
-                &target_uri,
+                &uris.primary_uri,
                 Position::new(u32::MAX, u32::MAX),
                 true,
                 depth + 1,
@@ -328,7 +360,24 @@ pub fn collect_sourced_documents(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use tempfile::tempdir;
+
+    thread_local! {
+        static SOURCED_LOAD_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn increment_load_count() {
+        SOURCED_LOAD_COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    fn reset_load_count() {
+        SOURCED_LOAD_COUNT.with(|c| c.set(0));
+    }
+
+    fn get_load_count() -> usize {
+        SOURCED_LOAD_COUNT.with(|c| c.get())
+    }
 
     #[test]
     fn test_collect_sourced_documents_cycle_and_in_memory_priority() {
@@ -366,5 +415,85 @@ mod tests {
         // Open buffer should reuse the exact same cached Arc<DocumentIndex>
         let cached_a = doc_mgr.get_index(&a_uri).unwrap();
         assert!(Arc::ptr_eq(&sourced[0].index, &cached_a));
+    }
+
+    #[test]
+    fn test_collect_sourced_documents_diamond_dependency_loads_common_once() {
+        let dir = tempdir().unwrap();
+        let sub_dir = dir.path().join("sub");
+        std::fs::create_dir(&sub_dir).unwrap();
+
+        let main_path = dir.path().join("main.zsh");
+        let a_path = dir.path().join("a.zsh");
+        let b_path = dir.path().join("b.zsh");
+        let common_path = dir.path().join("common.zsh");
+
+        std::fs::write(&common_path, "common_fn() { : }\nCOMMON_VAR=1\n").unwrap();
+        std::fs::write(&a_path, "source ./common.zsh\na_fn() { : }\n").unwrap();
+        // Relative path alias via sub/../common.zsh
+        std::fs::write(&b_path, "source ./sub/../common.zsh\nb_fn() { : }\n").unwrap();
+
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let main_text = "source ./a.zsh\nsource ./b.zsh\necho hi\n";
+        let main_idx = parse_document(main_text);
+
+        reset_load_count();
+        let sourced =
+            collect_sourced_documents(&main_idx, &main_uri, Position::new(2, 0), None, false);
+
+        assert_eq!(sourced.len(), 3);
+        let common_canon_uri = Url::from_file_path(common_path.canonicalize().unwrap()).unwrap();
+        let common_count = sourced.iter().filter(|d| d.uri == common_canon_uri).count();
+        assert_eq!(common_count, 1);
+        // Must only load a.zsh, common.zsh, and b.zsh once each (3 loads total)
+        assert_eq!(get_load_count(), 3);
+    }
+
+    #[test]
+    fn test_collect_sourced_documents_cycle_skips_reloading_visited_files() {
+        let dir = tempdir().unwrap();
+        let main_path = dir.path().join("main.zsh");
+        let a_path = dir.path().join("a.zsh");
+        let b_path = dir.path().join("b.zsh");
+
+        std::fs::write(&main_path, "source ./a.zsh\n").unwrap();
+        std::fs::write(&a_path, "source ./b.zsh\nfn_a() { : }\n").unwrap();
+        std::fs::write(&b_path, "source ./a.zsh\nsource ./main.zsh\nfn_b() { : }\n").unwrap();
+
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let main_idx = parse_document("source ./a.zsh\n");
+
+        reset_load_count();
+        let sourced =
+            collect_sourced_documents(&main_idx, &main_uri, Position::new(1, 0), None, true);
+
+        assert_eq!(sourced.len(), 2);
+        // Must only load a.zsh and b.zsh once each; back-edges to a.zsh and main.zsh must not load
+        assert_eq!(get_load_count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_sourced_documents_symlink_alias_loads_once() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let main_path = dir.path().join("main.zsh");
+        let target_path = dir.path().join("real.zsh");
+        let link_path = dir.path().join("alias.zsh");
+
+        std::fs::write(&target_path, "real_fn() { : }\n").unwrap();
+        symlink(&target_path, &link_path).unwrap();
+
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let main_text = "source ./real.zsh\nsource ./alias.zsh\n";
+        let main_idx = parse_document(main_text);
+
+        reset_load_count();
+        let sourced =
+            collect_sourced_documents(&main_idx, &main_uri, Position::new(2, 0), None, true);
+
+        assert_eq!(sourced.len(), 1);
+        assert_eq!(get_load_count(), 1);
     }
 }
