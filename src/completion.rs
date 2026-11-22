@@ -844,6 +844,7 @@ fn split_words_with_offsets(input: &str) -> Vec<(usize, &str)> {
 }
 
 const MAX_SOURCE_DEPTH: usize = 4;
+const MAX_SOURCED_FILES: usize = 64;
 const MAX_SOURCED_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
 
 /// Extracts sourced script path arguments (`source <path>` or `. <path>`) from `text`
@@ -1077,15 +1078,20 @@ struct SourcedSymbolCollector<'a> {
     visited_uris: HashSet<Url>,
     seen: HashSet<(String, LocalSymbolKind)>,
     symbols: Vec<LocalSymbol>,
+    files_loaded: usize,
 }
 
 impl<'a> SourcedSymbolCollector<'a> {
     fn collect(&mut self, source_text: &str, base_uri: &Url, position: Position, depth: usize) {
-        if depth >= MAX_SOURCE_DEPTH {
+        if depth >= MAX_SOURCE_DEPTH || self.files_loaded >= MAX_SOURCED_FILES {
             return;
         }
 
         for path_str in extract_sourced_paths_from_text(source_text, position) {
+            if self.files_loaded >= MAX_SOURCED_FILES {
+                break;
+            }
+
             let Some((target_uri, alt_uri, content)) =
                 resolve_sourced_script(&path_str, base_uri, self.doc_manager)
             else {
@@ -1104,6 +1110,7 @@ impl<'a> SourcedSymbolCollector<'a> {
             if let Some(alt) = alt_uri {
                 self.visited_uris.insert(alt);
             }
+            self.files_loaded += 1;
 
             let end_pos = Position::new(u32::MAX, u32::MAX);
             for sym in extract_local_symbols_from_text(&content, end_pos) {
@@ -1149,6 +1156,7 @@ pub fn extract_local_symbols_with_manager(
         visited_uris,
         seen,
         symbols,
+        files_loaded: 0,
     };
     collector.collect(doc.text(), doc.uri(), position, 0);
 
@@ -4979,5 +4987,32 @@ local \
             !names.contains(&"oversized_func"),
             "Oversized sourced file must be skipped, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn test_sourced_symbol_collector_enforces_max_files_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let total = MAX_SOURCED_FILES + 5;
+        let mut main_text = String::new();
+        for i in 0..total {
+            let file_path = dir.path().join(format!("f_{i}.zsh"));
+            std::fs::write(&file_path, format!("sourced_fn_{i}() {{ : }}\n")).unwrap();
+            main_text.push_str(&format!("source ./f_{i}.zsh\n"));
+        }
+
+        let main_path = dir.path().join("main.zsh");
+        let main_uri = tower_lsp::lsp_types::Url::from_file_path(&main_path).unwrap();
+        let doc = DocumentState::new(main_uri, 1, main_text);
+        let syms = extract_local_symbols(&doc, Position::new(total as u32 + 1, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+
+        assert!(names.contains(&"sourced_fn_0"));
+        assert!(names.contains(&"sourced_fn_63"));
+        assert!(
+            !names.contains(&"sourced_fn_64"),
+            "Files beyond MAX_SOURCED_FILES ({MAX_SOURCED_FILES}) must not be scanned"
+        );
+        assert!(!names.contains(&"sourced_fn_68"));
+        assert_eq!(syms.len(), MAX_SOURCED_FILES);
     }
 }

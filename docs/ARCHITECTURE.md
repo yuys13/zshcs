@@ -243,7 +243,7 @@ classDiagram
    - `deduplicate_completion_items` removes duplicate candidate entries in $O(N)$ time while strictly preserving the initial candidate order.
    - If an initial entry lacks a description but a subsequent duplicate provides one, the candidate's `detail` and `kind` are automatically enriched.
 6. **Local Symbol Extraction & Merging (`extract_local_symbols_with_manager`, `merge_local_completions`)**:
-   - Extracts locally defined shell variables (`(local variable)`), functions (`(local function)`), and aliases (`(local alias)`) up to the cursor position, as well as symbols from scripts referenced via `source` or `.` at or before the cursor (preferring open buffers in `DocumentManager` and falling back to disk reads, with bounded recursion depth and cycle detection).
+   - Extracts locally defined shell variables (`(local variable)`), functions (`(local function)`), and aliases (`(local alias)`) up to the cursor position, as well as symbols from scripts referenced via `source` or `.` at or before the cursor (preferring open buffers in `DocumentManager` and falling back to bounded disk reads of regular files up to 1 MiB, with bounded recursion depth, total file count cap, and cycle detection).
    - Filters candidates by active shell context (`Variable`, `Arithmetic`, `CommandOrWord`) and prioritizes local definitions ahead of daemon results while deduplicating matching labels.
 
 ---
