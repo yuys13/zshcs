@@ -15,16 +15,34 @@ flowchart TB
     end
 
     subgraph RustServer [Rust LSP Server Process (zshcs)]
-        LSPBackend["LSP Backend (`src/server.rs`)<br/>• LanguageServer Trait<br/>• Request Routing & Commands"]
-        ConfigMgr["Config Subsystem (`src/config.rs`)<br/>• Opt-In Schema Parsing<br/>• Experimental Diagnostics, Hover, Definition & Symbols Flags"]
+        subgraph LSPLayer [LSP Protocol Layer (`src/lsp/`)]
+            LSPBackend["LSP Backend (`src/lsp/server.rs`)<br/>• LanguageServer Trait<br/>• Request Routing & Commands"]
+            CompletionAdapter["Completion Adapter (`src/lsp/completion.rs`)<br/>• Candidate Parsing & Kind Inference<br/>• Local Symbol Merging & Resolve"]
+            DiagAdapter["Diagnostics Adapter (`src/lsp/diagnostics.rs`)<br/>• Debounced Stderr-to-Diagnostic Parser"]
+            HoverAdapter["Hover Adapter (`src/lsp/hover.rs`)<br/>• Word Extraction & Markdown Formatting"]
+            DefAdapter["Definition Adapter (`src/lsp/definition.rs`)<br/>• Location & Cross-File Jump Resolution"]
+            SymbolsAdapter["Document Symbol Adapter (`src/lsp/symbols.rs`)<br/>• Hierarchical Symbol Tree Builder"]
+        end
+
+        subgraph AnalysisLayer [Pure Zsh Analysis Layer (`src/analysis/`)]
+            Workspace["Workspace Resolver (`src/analysis/workspace.rs`)<br/>• Recursive `source`/`.` Traversal & Cycle Guard"]
+            Scope["Scope Resolver (`src/analysis/scope.rs`)<br/>• Function-Local Scoping & Visible Symbols"]
+            Parser["Unified Parser (`src/analysis/parser.rs`)<br/>• Single-Pass DocumentIndex Builder"]
+            Model["Symbol IR (`src/analysis/model.rs`)<br/>• DocumentIndex / Function / Variable / Alias IR"]
+            Syntax["Syntax Primitives (`src/analysis/syntax.rs`)<br/>• Statement/Token Splitting, Heredoc & UTF-16"]
+            Builtins["Builtins Dict (`src/analysis/builtins.rs`)<br/>• Builtin & Reserved Words Markdown"]
+        end
+
+        subgraph RuntimeLayer [External Process Runtime (`src/runtime/`)]
+            Supervisor["Daemon Supervisor (`src/runtime/daemon.rs`)<br/>• run_completion_daemon & HoL Cancellation<br/>• Process Recovery & chdir Sync"]
+            ManRuntime["Man Page Runtime (`src/runtime/man.rs`)<br/>• Async `man` Runner, ManCache & Single-Flight"]
+            SyntaxCheck["Syntax Check Runner (`src/runtime/syntax_check.rs`)<br/>• Non-blocking `zsh -n` Runner"]
+        end
+
+        ConfigMgr["Config Subsystem (`src/config.rs`)<br/>• Opt-In Schema Parsing<br/>• Experimental Flags"]
         DocMgr["DocumentManager (`src/document.rs`)<br/>• In-Memory Arc&lt;DashMap&lt;Url, DocumentState&gt;&gt;<br/>• Incremental Sync & UTF-16/UTF-8 Mapping"]
-        DiagEngine["Diagnostics Engine (`src/diagnostics.rs`)<br/>• Non-blocking `zsh -n` Runner<br/>• Debounced Stderr Parser"]
-        HoverEngine["Hover Engine (`src/hover.rs`)<br/>• Word Extraction & Range Mapping<br/>• Builtin & Reserved Words Dictionary<br/>• Async manpage Full-Text Retrieval"]
-        DefinitionEngine["Definition Engine (`src/definition.rs`)<br/>• Function, Variable & Source Resolvers<br/>• UTF-16 Code Unit Location Mapping"]
-        SymbolsEngine["Document Symbol Engine (`src/symbols.rs`)<br/>• Function, Variable & Alias Extraction<br/>• Hierarchical Symbol Tree & UTF-16 Bounds"]
-        Supervisor["Daemon Supervisor (`src/completion.rs`)<br/>• run_completion_daemon<br/>• HoL Cancellation & Timeout Guard<br/>• Process Recovery & chdir Sync"]
-        Logging["Logging Subsystem (`src/logging.rs`)<br/>• tracing & tracing-subscriber<br/>• Stderr Destination & EnvFilter"]
-        ErrHandling["Error Hierarchy (`src/error.rs`)<br/>• ZshcsError / ZshcsResult<br/>• Type-Safe Conversions"]
+        Logging["Logging Subsystem (`src/logging.rs`)<br/>• tracing & tracing-subscriber"]
+        ErrHandling["Error Hierarchy (`src/error.rs`)<br/>• ZshcsError / ZshcsResult"]
     end
 
     subgraph ZshEngine [Embedded Zsh Completion Engine]
@@ -35,12 +53,17 @@ flowchart TB
     Editor <-->|LSP JSON-RPC / stdio (stdout)| LSPBackend
     LSPBackend <-->|Config State| ConfigMgr
     LSPBackend <-->|CRUD & Offset Conversion| DocMgr
-    LSPBackend -->|Debounced Syntax Validation| DiagEngine
-    DiagEngine -.->|publishDiagnostics| Editor
-    LSPBackend -->|Cursor Word Hover Query| HoverEngine
-    LSPBackend -->|Definition Jump Query| DefinitionEngine
-    LSPBackend -->|Document Symbol Outline Query| SymbolsEngine
-    LSPBackend -->|mpsc / oneshot| Supervisor
+    LSPBackend --> CompletionAdapter & DiagAdapter & HoverAdapter & DefAdapter & SymbolsAdapter
+    CompletionAdapter -->|mpsc / oneshot| Supervisor
+    CompletionAdapter --> Scope & Workspace & Builtins & ManRuntime
+    DiagAdapter --> SyntaxCheck
+    HoverAdapter --> Scope & Workspace & Builtins & ManRuntime
+    DefAdapter --> Scope & Workspace
+    SymbolsAdapter --> Parser
+    Workspace --> Parser & DocMgr
+    Scope --> Model & Syntax
+    Parser --> Model & Syntax
+    DiagAdapter -.->|publishDiagnostics| Editor
     RustServer -.->|Structured Logs (stderr)| Editor
     Supervisor <-->|Piped stdin/stdout (RPC: input / chdir)| CaptureScript
     CaptureScript <-->|PTY (C-U / C-I / C-J / \0 Delimiters)| ZptySubshell

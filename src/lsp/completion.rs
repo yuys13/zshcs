@@ -1,300 +1,22 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
-use tower_lsp::Client;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind, MessageType,
-    Position, Range, Url,
+    CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind, Position,
 };
 
-use crate::definition::{
-    byte_to_utf16_col, detect_heredoc_delimiter, find_innermost_enclosing_function,
-    find_read_command, is_func_ident_char, is_var_ident_char, resolve_source_path,
-    scan_function_body_ranges, split_declaration_tokens, split_line_statements,
-};
+use crate::analysis::builtins::get_builtin_or_reserved_doc;
+use crate::analysis::parser::parse_document;
+use crate::analysis::scope::{VisibleSymbolKind, visible_symbols_at};
+use crate::analysis::syntax::{is_func_ident_char, is_var_ident_char};
+use crate::analysis::workspace::collect_sourced_documents;
 use crate::document::{DocumentManager, DocumentState};
-use crate::error::{ZshcsError, ZshcsResult};
-use crate::symbols::{is_reserved_keyword, range_contains, skip_flags};
-
-pub const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
-pub const ZPTYRC_ZSH: &str = include_str!("../bin/zptyrc.zsh");
-pub const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_millis(5000);
-
-pub enum CompletionRequest {
-    Complete {
-        prefix: String,
-        cwd: Option<PathBuf>,
-        responder: oneshot::Sender<ZshcsResult<Vec<CompletionItem>>>,
-    },
-    Shutdown {
-        responder: oneshot::Sender<()>,
-    },
-}
-
-struct DaemonProcess {
-    child: tokio::process::Child,
-    stdin: tokio::process::ChildStdin,
-    stdout_reader: BufReader<tokio::process::ChildStdout>,
-    current_cwd: Option<PathBuf>,
-}
-
-impl DaemonProcess {
-    fn spawn(
-        script_path: &Path,
-        cache_dir: Option<&Path>,
-        client: &Client,
-    ) -> std::io::Result<Self> {
-        tracing::info!(
-            script = ?script_path,
-            ?cache_dir,
-            "Spawning completion daemon process"
-        );
-
-        let mut cmd = tokio::process::Command::new("zsh");
-        cmd.arg(script_path);
-        if let Some(dir) = cache_dir {
-            std::fs::create_dir_all(dir)?;
-            cmd.env("ZSHCS_CACHE_DIR", dir);
-        }
-
-        let mut child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            tracing::error!("Failed to open stdin for completion daemon");
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to open stdin")
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            tracing::error!("Failed to open stdout for completion daemon");
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to open stdout")
-        })?;
-        let mut stderr = child.stderr.take().ok_or_else(|| {
-            tracing::error!("Failed to open stderr for completion daemon");
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to open stderr")
-        })?;
-
-        // Spawn stderr logger
-        let client_for_stderr = client.clone();
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(&mut stderr);
-            let mut line = String::new();
-            while let Ok(len) = reader.read_line(&mut line).await {
-                if len == 0 {
-                    break;
-                }
-                let trimmed = line.trim_end();
-                tracing::warn!(stderr = %trimmed, "capture.zsh stderr output");
-                client_for_stderr
-                    .log_message(
-                        MessageType::WARNING,
-                        format!("capture.zsh stderr: {trimmed}"),
-                    )
-                    .await;
-                line.clear();
-            }
-        });
-
-        let stdout_reader = BufReader::new(stdout);
-        Ok(DaemonProcess {
-            child,
-            stdin,
-            stdout_reader,
-            current_cwd: None,
-        })
-    }
-
-    fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
-    }
-}
-
-pub async fn run_completion_daemon(
-    script_path: PathBuf,
-    cache_dir: Option<PathBuf>,
-    mut rx: mpsc::Receiver<CompletionRequest>,
-    client: Client,
-) {
-    tracing::info!("Starting completion daemon supervisor loop");
-    let mut daemon: Option<DaemonProcess> = None;
-
-    while let Some(req) = rx.recv().await {
-        let (prefix, cwd, responder) = match req {
-            CompletionRequest::Shutdown { responder } => {
-                tracing::info!("Shutting down completion daemon process");
-                if let Some(mut p) = daemon.take() {
-                    let _ = p.child.start_kill();
-                    let _ = timeout(Duration::from_millis(500), p.child.wait()).await;
-                }
-                let _ = responder.send(());
-                break;
-            }
-            CompletionRequest::Complete {
-                prefix,
-                cwd,
-                responder,
-            } => (prefix, cwd, responder),
-        };
-
-        if responder.is_closed() {
-            tracing::debug!(
-                prefix = %prefix,
-                "Completion request cancelled by client; discarding"
-            );
-            continue;
-        }
-
-        // Check if existing daemon process has terminated
-        if let Some(proc) = daemon.as_mut()
-            && !proc.is_alive()
-        {
-            tracing::warn!("Completion daemon process terminated, restarting...");
-            client
-                .log_message(
-                    MessageType::WARNING,
-                    "Completion daemon process terminated, restarting...",
-                )
-                .await;
-            daemon = None;
-        }
-
-        // Spawn daemon if not currently running
-        if daemon.is_none() {
-            match DaemonProcess::spawn(&script_path, cache_dir.as_deref(), &client) {
-                Ok(p) => {
-                    tracing::info!("Completion daemon process spawned successfully");
-                    daemon = Some(p);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to spawn completion daemon");
-                    client
-                        .log_message(
-                            MessageType::ERROR,
-                            format!("Failed to spawn completion daemon: {e}"),
-                        )
-                        .await;
-                    let _ = responder.send(Err(ZshcsError::Io(e)));
-                    continue;
-                }
-            }
-        }
-
-        let Some(proc) = daemon.as_mut() else {
-            continue;
-        };
-
-        // Execute request with timeout to protect supervisor against hung processes
-        let exec_result = timeout(DAEMON_REQUEST_TIMEOUT, async {
-            // Synchronize working directory if specified and changed
-            if let Some(target_cwd) = &cwd {
-                let need_chdir = match &proc.current_cwd {
-                    Some(current) => current != target_cwd,
-                    None => true,
-                };
-                if need_chdir {
-                    tracing::debug!(?target_cwd, "Changing daemon working directory");
-                    let sanitized_cwd = target_cwd.to_string_lossy().replace(['\r', '\n'], "");
-                    let chdir_msg = format!("chdir:{sanitized_cwd}\n");
-                    proc.stdin.write_all(chdir_msg.as_bytes()).await?;
-                    proc.current_cwd = Some(target_cwd.clone());
-                }
-            }
-
-            // Send input message to daemon (sanitizing newlines)
-            let sanitized_prefix = prefix.replace(['\r', '\n'], "");
-            tracing::trace!(prefix = %sanitized_prefix, "Sending input to completion daemon");
-            let msg = format!("input:{sanitized_prefix}\n");
-            proc.stdin.write_all(msg.as_bytes()).await?;
-
-            // Read response until EOC
-            let mut items = Vec::new();
-            let mut line = String::new();
-
-            loop {
-                line.clear();
-                let len = proc.stdout_reader.read_line(&mut line).await?;
-                if len == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "Completion daemon stdout closed unexpectedly",
-                    ));
-                }
-
-                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-                tracing::trace!(line = %trimmed, "Received line from completion daemon stdout");
-                if trimmed.ends_with("\x01EOC\x01") {
-                    let content = trimmed.trim_end_matches("\x01EOC\x01");
-                    if !content.is_empty() {
-                        parse_candidate_line(content, &mut items);
-                    }
-                    break;
-                }
-                if !trimmed.is_empty() {
-                    parse_candidate_line(trimmed, &mut items);
-                }
-            }
-
-            deduplicate_completion_items(&mut items);
-
-            tracing::debug!(
-                item_count = items.len(),
-                "Completed candidate stream parsing"
-            );
-            Ok(items)
-        })
-        .await;
-
-        match exec_result {
-            Ok(Ok(items)) => {
-                let _ = responder.send(Ok(items));
-            }
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, "Completion daemon I/O failure; killing process");
-                client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Completion daemon I/O failure: {e}"),
-                    )
-                    .await;
-                if let Some(mut p) = daemon.take() {
-                    let _ = p.child.start_kill();
-                }
-                let _ = responder.send(Err(ZshcsError::Io(e)));
-            }
-            Err(_) => {
-                tracing::error!(
-                    timeout_ms = DAEMON_REQUEST_TIMEOUT.as_millis(),
-                    "Completion request timed out; terminating hung daemon"
-                );
-                client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!(
-                            "Completion request timed out after {}ms, terminating hung daemon...",
-                            DAEMON_REQUEST_TIMEOUT.as_millis()
-                        ),
-                    )
-                    .await;
-                if let Some(mut p) = daemon.take() {
-                    let _ = p.child.start_kill();
-                }
-                let _ = responder.send(Err(ZshcsError::Daemon(
-                    "Completion request timed out".to_string(),
-                )));
-            }
-        }
-    }
-
-    if let Some(mut p) = daemon.take() {
-        let _ = p.child.start_kill();
-    }
-}
+pub use crate::runtime::daemon::{
+    CAPTURE_ZSH, CompletionRequest, DAEMON_REQUEST_TIMEOUT, ZPTYRC_ZSH, run_completion_daemon,
+};
+pub use crate::runtime::man::{
+    DEFAULT_RESOLVE_MAN_TIMEOUT, ManCache, is_eligible_for_external_command,
+};
+use crate::runtime::man::{ManPageResult, get_man_page_result, resolve_man_markdown_with_fetcher};
 
 /// Infers an intelligent `CompletionItemKind` based on candidate prefix and description.
 pub fn infer_completion_kind(label: &str, detail: Option<&str>) -> CompletionItemKind {
@@ -495,7 +217,7 @@ pub fn resolve_completion_item(mut item: CompletionItem) -> CompletionItem {
         }
     }
 
-    if let Some(doc) = crate::hover::get_builtin_or_reserved_doc(trimmed_label) {
+    if let Some(doc) = get_builtin_or_reserved_doc(trimmed_label) {
         item.documentation = Some(Documentation::MarkupContent(MarkupContent {
             kind: MarkupKind::Markdown,
             value: doc.to_string(),
@@ -503,195 +225,6 @@ pub fn resolve_completion_item(mut item: CompletionItem) -> CompletionItem {
     }
 
     item
-}
-
-pub type ManCache = dashmap::DashMap<String, Option<String>>;
-
-/// Default timeout for asynchronous man page retrieval during completion resolution (2000 milliseconds).
-pub const DEFAULT_RESOLVE_MAN_TIMEOUT: Duration = Duration::from_millis(2000);
-
-#[derive(Clone, Debug)]
-pub(crate) enum SingleFlightResult {
-    Found(String),
-    NotFound,
-    Timeout,
-    Error,
-}
-
-static IN_FLIGHT: std::sync::LazyLock<
-    dashmap::DashMap<String, tokio::sync::watch::Receiver<Option<SingleFlightResult>>>,
-> = std::sync::LazyLock::new(dashmap::DashMap::new);
-
-struct InFlightGuard {
-    key: String,
-    active: bool,
-}
-
-impl InFlightGuard {
-    fn new(key: String) -> Self {
-        Self { key, active: true }
-    }
-
-    fn complete(mut self) {
-        self.active = false;
-        IN_FLIGHT.remove(&self.key);
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if self.active {
-            IN_FLIGHT.remove(&self.key);
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn is_in_flight(key: &str) -> bool {
-    IN_FLIGHT.contains_key(key)
-}
-
-fn apply_single_flight_markdown_result(
-    result: &SingleFlightResult,
-    cache: &ManCache,
-    trimmed_label: &str,
-) -> Option<String> {
-    match result {
-        SingleFlightResult::Found(md) => {
-            cache.insert(trimmed_label.to_string(), Some(md.clone()));
-            Some(md.clone())
-        }
-        SingleFlightResult::NotFound => {
-            cache.insert(trimmed_label.to_string(), None);
-            None
-        }
-        SingleFlightResult::Timeout | SingleFlightResult::Error => {
-            // Do not cache transient timeouts or execution errors so future attempts can retry
-            None
-        }
-    }
-}
-
-/// Determines whether a completion item is eligible for external command man page lookup.
-pub fn is_eligible_for_external_command(kind: Option<CompletionItemKind>, label: &str) -> bool {
-    if let Some(k) = kind
-        && !matches!(k, CompletionItemKind::FUNCTION | CompletionItemKind::TEXT)
-    {
-        return false;
-    }
-    let trimmed = label.trim();
-    if trimmed.is_empty()
-        || trimmed.len() > 256
-        || trimmed.starts_with('-')
-        || trimmed.starts_with('.')
-        || trimmed.starts_with(':')
-        || trimmed.ends_with('.')
-        || trimmed.ends_with(':')
-        || !trimmed.chars().any(|c| c.is_alphanumeric())
-    {
-        return false;
-    }
-    trimmed
-        .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
-}
-
-/// Resolves formatted Markdown documentation for an external command using `ManCache`,
-/// single-flight request coalescing, negative caching, and timeout protection.
-pub(crate) async fn resolve_man_markdown_with_fetcher<F, Fut>(
-    trimmed_label: &str,
-    cache: &ManCache,
-    timeout_dur: Duration,
-    fetcher: F,
-) -> Option<String>
-where
-    F: FnOnce(String, Duration) -> Fut,
-    Fut: std::future::Future<Output = crate::hover::ManPageResult>,
-{
-    // 1. Fast path: check cache
-    if let Some(entry) = cache.get(trimmed_label) {
-        return entry.value().clone();
-    }
-
-    // 2. Single-Flight request deduplication
-    enum FlightRole {
-        Leader(
-            InFlightGuard,
-            tokio::sync::watch::Sender<Option<SingleFlightResult>>,
-        ),
-        Waiter(tokio::sync::watch::Receiver<Option<SingleFlightResult>>),
-    }
-
-    let role = match IN_FLIGHT.entry(trimmed_label.to_string()) {
-        dashmap::mapref::entry::Entry::Occupied(entry) => FlightRole::Waiter(entry.get().clone()),
-        dashmap::mapref::entry::Entry::Vacant(entry) => {
-            // Double-check cache in case a previous in-flight request completed just before locking
-            if let Some(entry_cache) = cache.get(trimmed_label) {
-                return entry_cache.value().clone();
-            }
-            let (tx, rx) = tokio::sync::watch::channel(None);
-            entry.insert(rx);
-            let guard = InFlightGuard::new(trimmed_label.to_string());
-            FlightRole::Leader(guard, tx)
-        }
-    };
-
-    match role {
-        FlightRole::Leader(guard, tx) => {
-            match fetcher(trimmed_label.to_string(), timeout_dur).await {
-                crate::hover::ManPageResult::Found(raw_man) => {
-                    let md = crate::hover::format_man_markdown(&raw_man);
-                    cache.insert(trimmed_label.to_string(), Some(md.clone()));
-                    let _ = tx.send(Some(SingleFlightResult::Found(md.clone())));
-                    guard.complete();
-                    Some(md)
-                }
-                crate::hover::ManPageResult::NotFound => {
-                    cache.insert(trimmed_label.to_string(), None);
-                    let _ = tx.send(Some(SingleFlightResult::NotFound));
-                    guard.complete();
-                    None
-                }
-                crate::hover::ManPageResult::Timeout => {
-                    let _ = tx.send(Some(SingleFlightResult::Timeout));
-                    guard.complete();
-                    None
-                }
-                crate::hover::ManPageResult::Error(_) => {
-                    let _ = tx.send(Some(SingleFlightResult::Error));
-                    guard.complete();
-                    None
-                }
-            }
-        }
-        FlightRole::Waiter(mut rx) => {
-            // Check if the result was already published before subscription
-            if let Some(ref res) = *rx.borrow() {
-                return apply_single_flight_markdown_result(res, cache, trimmed_label);
-            }
-
-            match timeout(timeout_dur, rx.changed()).await {
-                Ok(Ok(())) => {
-                    if let Some(ref res) = *rx.borrow() {
-                        return apply_single_flight_markdown_result(res, cache, trimmed_label);
-                    }
-                }
-                Ok(Err(_)) => {
-                    // Leader disconnected or dropped without a new value
-                    if let Some(ref res) = *rx.borrow() {
-                        return apply_single_flight_markdown_result(res, cache, trimmed_label);
-                    }
-                    if let Some(entry) = cache.get(trimmed_label) {
-                        return entry.value().clone();
-                    }
-                }
-                Err(_) => {
-                    // Waiter timed out waiting for the in-flight resolution
-                }
-            }
-            None
-        }
-    }
 }
 
 /// Resolves detailed documentation for a `CompletionItem` asynchronously using an underlying fetcher
@@ -704,7 +237,7 @@ pub(crate) async fn resolve_completion_item_async_with_fetcher<F, Fut>(
 ) -> CompletionItem
 where
     F: FnOnce(String, Duration) -> Fut,
-    Fut: std::future::Future<Output = crate::hover::ManPageResult>,
+    Fut: std::future::Future<Output = ManPageResult>,
 {
     // 1. Preserve existing documentation if present and non-empty
     let has_doc = match &item.documentation {
@@ -761,9 +294,7 @@ pub async fn resolve_completion_item_async_with_timeout(
         item,
         cache,
         timeout_dur,
-        |cmd: String, dur: Duration| async move {
-            crate::hover::get_man_page_result(&cmd, dur).await
-        },
+        |cmd: String, dur: Duration| async move { get_man_page_result(&cmd, dur).await },
     )
     .await
 }
@@ -821,355 +352,12 @@ impl LocalSymbol {
     }
 }
 
-/// Helper to split words with their start byte offsets in a string.
-fn split_words_with_offsets(input: &str) -> Vec<(usize, &str)> {
-    let mut words = Vec::new();
-    let mut in_word = false;
-    let mut start = 0;
-
-    for (i, c) in input.char_indices() {
-        if c.is_whitespace() {
-            if in_word {
-                words.push((start, &input[start..i]));
-                in_word = false;
-            }
-        } else if !in_word {
-            start = i;
-            in_word = true;
-        }
-    }
-    if in_word {
-        words.push((start, &input[start..]));
-    }
-    words
-}
-
-pub(crate) const MAX_SOURCE_DEPTH: usize = 4;
-pub(crate) const MAX_SOURCED_FILES: usize = 64;
-const MAX_SOURCED_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
-
-fn scan_sourced_paths_with_split(
-    text: &str,
-    position: Position,
-    stop_after_position: bool,
-) -> (Vec<String>, Vec<String>) {
-    let mut before_paths = Vec::new();
-    let mut after_paths = Vec::new();
-    let mut heredoc_delimiter: Option<String> = None;
-    let mut pending_source_kw = false;
-
-    for (line_idx, line) in text.lines().enumerate() {
-        if stop_after_position && line_idx > position.line as usize {
-            break;
-        }
-
-        if let Some(ref delim) = heredoc_delimiter {
-            let trimmed = line.trim_start_matches('\t').trim_end();
-            if trimmed == delim {
-                heredoc_delimiter = None;
-            }
-            pending_source_kw = false;
-            continue;
-        }
-
-        if let Some(delim) = detect_heredoc_delimiter(line) {
-            heredoc_delimiter = Some(delim);
-            pending_source_kw = false;
-        }
-
-        let is_before_line = line_idx < position.line as usize;
-        let is_target_line = line_idx == position.line as usize;
-        let has_line_continuation = ends_with_line_continuation(line);
-        let mut current_pending_source_kw = std::mem::take(&mut pending_source_kw);
-        let mut next_pending_source_kw = false;
-
-        let stmts = split_line_statements(line);
-        if stmts.is_empty() {
-            pending_source_kw = if has_line_continuation {
-                current_pending_source_kw
-            } else {
-                false
-            };
-            continue;
-        }
-
-        let num_stmts = stmts.len();
-        for (stmt_idx, stmt) in stmts.into_iter().enumerate() {
-            let is_first_stmt = stmt_idx == 0;
-            let is_last_stmt = stmt_idx + 1 == num_stmts;
-            let pending_source_for_this_stmt = if is_first_stmt {
-                std::mem::take(&mut current_pending_source_kw)
-            } else {
-                false
-            };
-
-            let trimmed = stmt.text.trim_start();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                if is_last_stmt && has_line_continuation && !next_pending_source_kw {
-                    next_pending_source_kw = pending_source_for_this_stmt;
-                }
-                continue;
-            }
-
-            let stmt_indent = stmt.text.len() - trimmed.len();
-            let stmt_offset = stmt.start_byte + stmt_indent;
-
-            let (after_cmd, cmd_end_byte) = if pending_source_for_this_stmt {
-                (trimmed, stmt_offset)
-            } else if trimmed == "source" || trimmed == "source\\" {
-                if is_last_stmt && has_line_continuation {
-                    next_pending_source_kw = true;
-                }
-                continue;
-            } else if trimmed.starts_with("source ") || trimmed.starts_with("source\t") {
-                (&trimmed[6..], stmt_offset + 6)
-            } else if trimmed == "." || trimmed == ".\\" {
-                if is_last_stmt && has_line_continuation {
-                    next_pending_source_kw = true;
-                }
-                continue;
-            } else if trimmed.starts_with(". ") || trimmed.starts_with(".\t") {
-                (&trimmed[1..], stmt_offset + 1)
-            } else {
-                continue;
-            };
-
-            let after_trimmed = after_cmd.trim_start();
-            if after_trimmed.is_empty() || after_trimmed == "\\" {
-                if is_last_stmt && has_line_continuation {
-                    next_pending_source_kw = true;
-                }
-                continue;
-            }
-
-            let arg_trim_len = after_cmd.len() - after_trimmed.len();
-            let arg_start_byte = cmd_end_byte + arg_trim_len;
-
-            let (unquoted, arg_end_byte) = if let Some(stripped) = after_trimmed.strip_prefix('"') {
-                if let Some(close_idx) = stripped.find('"') {
-                    (&stripped[..close_idx], arg_start_byte + 1 + close_idx + 1)
-                } else {
-                    (stripped, arg_start_byte + after_trimmed.len())
-                }
-            } else if let Some(stripped) = after_trimmed.strip_prefix('\'') {
-                if let Some(close_idx) = stripped.find('\'') {
-                    (&stripped[..close_idx], arg_start_byte + 1 + close_idx + 1)
-                } else {
-                    (stripped, arg_start_byte + after_trimmed.len())
-                }
-            } else {
-                let token_len = after_trimmed
-                    .find(|c: char| c.is_whitespace() || c == '#' || c == ';' || c == '\\')
-                    .unwrap_or(after_trimmed.len());
-                (&after_trimmed[..token_len], arg_start_byte + token_len)
-            };
-
-            if unquoted.is_empty() {
-                continue;
-            }
-
-            let is_before_cursor = is_before_line
-                || (is_target_line && byte_to_utf16_col(line, arg_end_byte) <= position.character);
-            if is_before_cursor {
-                before_paths.push(unquoted.to_string());
-            } else if !stop_after_position {
-                after_paths.push(unquoted.to_string());
-            }
-        }
-
-        pending_source_kw = next_pending_source_kw;
-    }
-
-    (before_paths, after_paths)
-}
-
-/// Extracts sourced script path arguments (`source <path>` or `. <path>`) from `text`
-/// that appear at or before the given `position`, ignoring heredoc bodies and comments.
-pub fn extract_sourced_paths_from_text(text: &str, position: Position) -> Vec<String> {
-    scan_sourced_paths_with_split(text, position, true).0
-}
-
-/// Extracts all sourced script path arguments from `text` in a single pass,
-/// prioritizing paths at or before `position` ahead of those after `position`
-/// and deduplicating in O(N) time.
-pub(crate) fn extract_sourced_paths_prioritized(text: &str, position: Position) -> Vec<String> {
-    let (before_paths, after_paths) = scan_sourced_paths_with_split(text, position, false);
-    let mut seen: HashSet<String> = HashSet::with_capacity(before_paths.len() + after_paths.len());
-    let mut result = Vec::with_capacity(before_paths.len() + after_paths.len());
-
-    for path in before_paths.into_iter().chain(after_paths) {
-        if seen.insert(path.clone()) {
-            result.push(path);
-        }
-    }
-
-    result
-}
-
-fn normalize_lexical_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut stack: Vec<Component<'_>> = Vec::new();
-    for comp in path.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(stack.last(), Some(Component::Normal(_))) {
-                    stack.pop();
-                } else if !matches!(
-                    stack.last(),
-                    Some(Component::RootDir | Component::Prefix(_))
-                ) {
-                    stack.push(comp);
-                }
-            }
-            _ => stack.push(comp),
-        }
-    }
-    stack.iter().collect()
-}
-
-fn read_sourced_file_bounded(path: &Path) -> Option<String> {
-    use std::io::Read;
-
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_SOURCED_FILE_BYTES {
-        return None;
-    }
-
-    let file = std::fs::File::open(path).ok()?;
-    let opened_metadata = file.metadata().ok()?;
-    if !opened_metadata.is_file() || opened_metadata.len() > MAX_SOURCED_FILE_BYTES {
-        return None;
-    }
-
-    let mut buf = Vec::new();
-    file.take(MAX_SOURCED_FILE_BYTES + 1)
-        .read_to_end(&mut buf)
-        .ok()?;
-    if buf.len() as u64 > MAX_SOURCED_FILE_BYTES {
-        return None;
-    }
-
-    String::from_utf8(buf).ok()
-}
-
-fn expand_and_normalize_source_path(path_str: &str, base_uri: &Url) -> Option<PathBuf> {
-    if path_str.is_empty() {
-        return None;
-    }
-
-    let mut expanded_str = path_str.to_string();
-    if let Ok(home) = std::env::var("HOME") {
-        expanded_str = expanded_str
-            .replace("$HOME", &home)
-            .replace("${HOME}", &home);
-        if expanded_str == "~" {
-            expanded_str = home;
-        } else if let Some(sub) = expanded_str.strip_prefix("~/") {
-            expanded_str = PathBuf::from(home).join(sub).to_string_lossy().into_owned();
-        }
-    }
-
-    let p = Path::new(&expanded_str);
-    if p.is_absolute() {
-        Some(normalize_lexical_path(p))
-    } else {
-        let base_path = base_uri.to_file_path().ok()?;
-        let parent = base_path.parent()?;
-        Some(normalize_lexical_path(&parent.join(p)))
-    }
-}
-
-pub(crate) fn resolve_open_sourced_uri(
-    path_str: &str,
-    base_uri: &Url,
-    doc_manager: Option<&DocumentManager>,
-) -> Option<Url> {
-    let raw_path = expand_and_normalize_source_path(path_str, base_uri)?;
-    let raw_uri = Url::from_file_path(&raw_path).ok()?;
-    if doc_manager?.get(&raw_uri).is_some() {
-        Some(raw_uri)
-    } else {
-        None
-    }
-}
-
-pub(crate) fn resolve_sourced_script(
-    path_str: &str,
-    base_uri: &Url,
-    doc_manager: Option<&DocumentManager>,
-) -> Option<(Url, Option<Url>, String)> {
-    let raw_path = expand_and_normalize_source_path(path_str, base_uri)?;
-    let raw_uri = Url::from_file_path(&raw_path).ok();
-    let canon_uri = resolve_source_path(path_str, base_uri);
-
-    let content = doc_manager
-        .and_then(|mgr| {
-            canon_uri
-                .as_ref()
-                .and_then(|u| mgr.get_content(u))
-                .or_else(|| raw_uri.as_ref().and_then(|u| mgr.get_content(u)))
-        })
-        .or_else(|| {
-            if let Some(ref u) = canon_uri
-                && let Ok(p) = u.to_file_path()
-            {
-                return read_sourced_file_bounded(&p);
-            }
-            read_sourced_file_bounded(&raw_path)
-        })?;
-
-    let primary_uri = canon_uri.or_else(|| raw_uri.clone())?;
-    Some((primary_uri, raw_uri, content))
-}
-
-struct SourcedSymbolCollector<'a> {
-    doc_manager: Option<&'a DocumentManager>,
-    visited_uris: HashSet<Url>,
-    seen: HashSet<(String, LocalSymbolKind)>,
-    symbols: Vec<LocalSymbol>,
-    files_loaded: usize,
-}
-
-impl<'a> SourcedSymbolCollector<'a> {
-    fn collect(&mut self, source_text: &str, base_uri: &Url, position: Position, depth: usize) {
-        if depth >= MAX_SOURCE_DEPTH || self.files_loaded >= MAX_SOURCED_FILES {
-            return;
-        }
-
-        for path_str in extract_sourced_paths_from_text(source_text, position) {
-            if self.files_loaded >= MAX_SOURCED_FILES {
-                break;
-            }
-
-            let Some((target_uri, alt_uri, content)) =
-                resolve_sourced_script(&path_str, base_uri, self.doc_manager)
-            else {
-                continue;
-            };
-
-            let already_visited = self.visited_uris.contains(&target_uri)
-                || alt_uri
-                    .as_ref()
-                    .is_some_and(|u| self.visited_uris.contains(u));
-            if already_visited {
-                continue;
-            }
-
-            self.visited_uris.insert(target_uri.clone());
-            if let Some(alt) = alt_uri {
-                self.visited_uris.insert(alt);
-            }
-            self.files_loaded += 1;
-
-            let end_pos = Position::new(u32::MAX, u32::MAX);
-            for sym in extract_local_symbols_from_text(&content, end_pos) {
-                if self.seen.insert((sym.name.clone(), sym.kind)) {
-                    self.symbols.push(sym);
-                }
-            }
-
-            self.collect(&content, &target_uri, end_pos, depth + 1);
+impl From<VisibleSymbolKind> for LocalSymbolKind {
+    fn from(kind: VisibleSymbolKind) -> Self {
+        match kind {
+            VisibleSymbolKind::Variable => LocalSymbolKind::Variable,
+            VisibleSymbolKind::Function => LocalSymbolKind::Function,
+            VisibleSymbolKind::Alias => LocalSymbolKind::Alias,
         }
     }
 }
@@ -1188,675 +376,35 @@ pub fn extract_local_symbols_with_manager(
     position: Position,
     doc_manager: Option<&DocumentManager>,
 ) -> Vec<LocalSymbol> {
-    let symbols = extract_local_symbols_from_text(doc.text(), position);
-    let seen: HashSet<(String, LocalSymbolKind)> =
+    let index = parse_document(doc.text());
+    let mut symbols: Vec<LocalSymbol> = visible_symbols_at(&index, position)
+        .into_iter()
+        .map(|s| LocalSymbol::new(s.name, s.kind.into()))
+        .collect();
+    let mut seen: HashSet<(String, LocalSymbolKind)> =
         symbols.iter().map(|s| (s.name.clone(), s.kind)).collect();
 
-    let mut visited_uris = HashSet::new();
-    visited_uris.insert(doc.uri().clone());
-    if let Ok(path) = doc.uri().to_file_path()
-        && let Ok(canon) = path.canonicalize()
-        && let Ok(canon_uri) = Url::from_file_path(canon)
-    {
-        visited_uris.insert(canon_uri);
+    let end_pos = Position::new(u32::MAX, u32::MAX);
+    for sourced in collect_sourced_documents(&index, doc.uri(), position, doc_manager, false) {
+        for s in visible_symbols_at(&sourced.index, end_pos) {
+            let kind: LocalSymbolKind = s.kind.into();
+            if seen.insert((s.name.clone(), kind)) {
+                symbols.push(LocalSymbol::new(s.name, kind));
+            }
+        }
     }
 
-    let mut collector = SourcedSymbolCollector {
-        doc_manager,
-        visited_uris,
-        seen,
-        symbols,
-        files_loaded: 0,
-    };
-    collector.collect(doc.text(), doc.uri(), position, 0);
-
-    collector.symbols
-}
-
-/// Checks whether a line ends with an unescaped line continuation backslash.
-fn ends_with_line_continuation(line: &str) -> bool {
-    let trimmed = line.trim_end();
-    let backslash_count = trimmed.chars().rev().take_while(|c| *c == '\\').count();
-    backslash_count % 2 == 1
+    symbols
 }
 
 /// Extracts locally defined variables and functions from document text
 /// that were defined at or before the given `position`.
 pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<LocalSymbol> {
-    let mut symbols = Vec::new();
-    let mut seen = HashSet::new();
-    let fn_ranges = scan_function_body_ranges(text);
-    let cursor_pos_range = Range::new(position, position);
-    let mut out_of_scope_locals: Vec<(Range, String)> = Vec::new();
-
-    let mut add_symbol = |name: &str, kind: LocalSymbolKind| {
-        let key = (name.to_string(), kind);
-        if seen.insert(key) {
-            symbols.push(LocalSymbol::new(name, kind));
-        }
-    };
-
-    let decl_keywords = [
-        "export", "typeset", "local", "declare", "readonly", "integer", "float",
-    ];
-
-    let mut heredoc_delimiter: Option<String> = None;
-    let mut pending_decl_kw: Option<&'static str> = None;
-    let mut pending_decl_has_global_flag = false;
-    let mut pending_function_kw = false;
-    let mut pending_for_or_select_kw: Option<usize> = None;
-    let mut pending_read_kw = false;
-    let mut pending_alias_kw = false;
-
-    for (line_idx, line) in text.lines().enumerate() {
-        if line_idx > position.line as usize {
-            break;
-        }
-
-        if let Some(ref delim) = heredoc_delimiter {
-            let trimmed = line.trim_start_matches('\t').trim_end();
-            if trimmed == delim {
-                heredoc_delimiter = None;
-            }
-            pending_decl_kw = None;
-            pending_function_kw = false;
-            pending_for_or_select_kw = None;
-            pending_read_kw = false;
-            pending_alias_kw = false;
-            continue;
-        }
-
-        if let Some(delim) = detect_heredoc_delimiter(line) {
-            heredoc_delimiter = Some(delim);
-            pending_decl_kw = None;
-            pending_function_kw = false;
-            pending_for_or_select_kw = None;
-            pending_read_kw = false;
-            pending_alias_kw = false;
-        }
-
-        let is_target_line = line_idx == position.line as usize;
-
-        let is_before_cursor = |name_end_byte: usize| -> bool {
-            if !is_target_line {
-                true
-            } else {
-                let end_u16 = byte_to_utf16_col(line, name_end_byte);
-                end_u16 <= position.character
-            }
-        };
-
-        let has_line_continuation = ends_with_line_continuation(line);
-        let mut current_pending_decl_kw = pending_decl_kw.take();
-        let mut current_pending_decl_global = std::mem::take(&mut pending_decl_has_global_flag);
-        let mut current_pending_function_kw = std::mem::take(&mut pending_function_kw);
-        let mut current_pending_for_or_select_kw = pending_for_or_select_kw.take();
-        let mut current_pending_read_kw = std::mem::take(&mut pending_read_kw);
-        let mut current_pending_alias_kw = std::mem::take(&mut pending_alias_kw);
-
-        let mut next_pending_decl_kw: Option<&'static str> = None;
-        let mut next_pending_decl_global = false;
-        let mut next_pending_function_kw = false;
-        let mut next_pending_for_or_select_kw: Option<usize> = None;
-        let mut next_pending_read_kw = false;
-        let mut next_pending_alias_kw = false;
-
-        let stmts = split_line_statements(line);
-        if stmts.is_empty() {
-            if has_line_continuation {
-                pending_decl_kw = current_pending_decl_kw;
-                pending_decl_has_global_flag = current_pending_decl_global;
-                pending_function_kw = current_pending_function_kw;
-                pending_for_or_select_kw = current_pending_for_or_select_kw;
-                pending_read_kw = current_pending_read_kw;
-                pending_alias_kw = current_pending_alias_kw;
-            } else {
-                pending_decl_kw = None;
-                pending_decl_has_global_flag = false;
-                pending_function_kw = false;
-                pending_for_or_select_kw = None;
-                pending_read_kw = false;
-                pending_alias_kw = false;
-            }
-            continue;
-        }
-        let num_stmts = stmts.len();
-
-        for (stmt_idx, stmt) in stmts.into_iter().enumerate() {
-            let is_first_stmt = stmt_idx == 0;
-            let is_last_stmt = stmt_idx + 1 == num_stmts;
-
-            let pending_decl_for_this_stmt = if is_first_stmt {
-                current_pending_decl_kw.take()
-            } else {
-                None
-            };
-            let pending_decl_global_for_this_stmt = if is_first_stmt {
-                std::mem::take(&mut current_pending_decl_global)
-            } else {
-                false
-            };
-            let pending_function_for_this_stmt = if is_first_stmt {
-                std::mem::take(&mut current_pending_function_kw)
-            } else {
-                false
-            };
-            let pending_for_or_select_for_this_stmt = if is_first_stmt {
-                current_pending_for_or_select_kw.take()
-            } else {
-                None
-            };
-            let pending_read_for_this_stmt = if is_first_stmt {
-                std::mem::take(&mut current_pending_read_kw)
-            } else {
-                false
-            };
-            let pending_alias_for_this_stmt = if is_first_stmt {
-                std::mem::take(&mut current_pending_alias_kw)
-            } else {
-                false
-            };
-
-            let trimmed = stmt.text.trim_start();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                if is_last_stmt && has_line_continuation {
-                    if next_pending_decl_kw.is_none() {
-                        next_pending_decl_kw = pending_decl_for_this_stmt;
-                    }
-                    if !next_pending_function_kw {
-                        next_pending_function_kw = pending_function_for_this_stmt;
-                    }
-                    if next_pending_for_or_select_kw.is_none() {
-                        next_pending_for_or_select_kw = pending_for_or_select_for_this_stmt;
-                    }
-                    if !next_pending_read_kw {
-                        next_pending_read_kw = pending_read_for_this_stmt;
-                    }
-                    if !next_pending_alias_kw {
-                        next_pending_alias_kw = pending_alias_for_this_stmt;
-                    }
-                }
-                continue;
-            }
-
-            let stmt_indent = stmt.text.len() - trimmed.len();
-            let stmt_offset = stmt.start_byte + stmt_indent;
-
-            // 1. Shell Functions
-            // 1.1 Keyword style: `function func ...`
-            if trimmed.starts_with("function ")
-                || trimmed.starts_with("function\t")
-                || trimmed == "function"
-                || pending_function_for_this_stmt
-            {
-                let (after_kw, kw_prefix_len) = if pending_function_for_this_stmt {
-                    (trimmed, 0)
-                } else if trimmed.len() > 8 {
-                    (&trimmed[8..], 8)
-                } else {
-                    ("", trimmed.len())
-                };
-                let after_kw_trimmed = after_kw.trim_start();
-                let kw_spaces = after_kw.len() - after_kw_trimmed.len();
-                let rest = skip_flags(after_kw_trimmed);
-                let flag_len = after_kw_trimmed.len() - rest.len();
-
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| is_func_ident_char(*c) && *c != '(' && *c != '{')
-                    .collect();
-
-                if name.is_empty()
-                    && is_last_stmt
-                    && has_line_continuation
-                    && !pending_function_for_this_stmt
-                {
-                    next_pending_function_kw = true;
-                    continue;
-                }
-
-                if !name.is_empty() && !is_reserved_keyword(&name) {
-                    let after_name = &rest[name.len()..].trim_start();
-                    let after_parens = if let Some(stripped) = after_name.strip_prefix("()") {
-                        stripped.trim_start()
-                    } else if after_name.starts_with('(')
-                        && let Some(close) = after_name.find(')')
-                    {
-                        after_name[close + 1..].trim_start()
-                    } else {
-                        after_name
-                    };
-
-                    if after_parens.is_empty()
-                        || after_parens.starts_with('{')
-                        || after_parens.starts_with(';')
-                        || after_parens.starts_with('#')
-                        || after_parens.starts_with('\\')
-                    {
-                        let name_start_byte = stmt_offset + kw_prefix_len + kw_spaces + flag_len;
-                        let name_end_byte = name_start_byte + name.len();
-                        if is_before_cursor(name_end_byte) {
-                            add_symbol(&name, LocalSymbolKind::Function);
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            // 1.2 POSIX style: `func() { ... }` or `func () { ... }`
-            if let Some(open_paren_idx) = trimmed.find('(') {
-                let name_part = trimmed[..open_paren_idx].trim_end();
-                if !name_part.is_empty()
-                    && !name_part.starts_with('#')
-                    && !name_part.chars().next().unwrap().is_ascii_digit()
-                    && name_part.chars().all(is_func_ident_char)
-                    && !is_reserved_keyword(name_part)
-                {
-                    let after_open = trimmed[open_paren_idx + 1..].trim_start();
-                    if let Some(stripped_close) = after_open.strip_prefix(')') {
-                        let after_parens = stripped_close.trim_start();
-                        if after_parens.is_empty()
-                            || after_parens.starts_with('{')
-                            || after_parens.starts_with(';')
-                            || after_parens.starts_with('#')
-                            || after_parens.starts_with('\\')
-                        {
-                            let name_start_byte =
-                                stmt_offset + trimmed.find(name_part).unwrap_or(0);
-                            let name_end_byte = name_start_byte + name_part.len();
-                            if is_before_cursor(name_end_byte) {
-                                add_symbol(name_part, LocalSymbolKind::Function);
-                            }
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // 1.3 Alias Declarations: `alias ll='ls -la'`, `alias -g G='| grep'`
-            if trimmed.starts_with("alias ")
-                || trimmed.starts_with("alias\t")
-                || trimmed == "alias"
-                || pending_alias_for_this_stmt
-            {
-                if is_last_stmt && has_line_continuation {
-                    next_pending_alias_kw = true;
-                }
-                let (after_alias, alias_offset) =
-                    if trimmed.starts_with("alias ") || trimmed.starts_with("alias\t") {
-                        (&trimmed[5..], stmt_offset + 5)
-                    } else if trimmed == "alias" {
-                        ("", stmt_offset + 5)
-                    } else {
-                        (trimmed, stmt_offset)
-                    };
-
-                for token in split_declaration_tokens(after_alias) {
-                    if token.text.starts_with('-')
-                        || token.text.starts_with('+')
-                        || token.text == "\\"
-                    {
-                        continue;
-                    }
-
-                    if let Some(eq) = token.text.find('=')
-                        && eq > 0
-                    {
-                        let alias_name = token.text[..eq].trim().trim_end_matches('\\').trim();
-                        if !alias_name.is_empty()
-                            && alias_name
-                                .chars()
-                                .all(|c| is_func_ident_char(c) || c == '-')
-                            && !is_reserved_keyword(alias_name)
-                        {
-                            let token_start_in_line = alias_offset + token.byte_offset;
-                            let name_start_byte =
-                                token_start_in_line + token.text.find(alias_name).unwrap_or(0);
-                            let name_end_byte = name_start_byte + alias_name.len();
-                            if is_before_cursor(name_end_byte) {
-                                add_symbol(alias_name, LocalSymbolKind::Alias);
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // 2. Keyword Variable Declarations: `local`, `export`, `typeset`, etc.
-            let mut matched_decl_kw = false;
-            let mut active_kw: Option<&'static str> = None;
-            let mut after_kw_slice = "";
-            let mut kw_offset = stmt_offset;
-
-            for &kw in &decl_keywords {
-                if trimmed.starts_with(kw)
-                    && (trimmed[kw.len()..].starts_with(' ')
-                        || trimmed[kw.len()..].starts_with('\t')
-                        || trimmed.len() == kw.len())
-                {
-                    matched_decl_kw = true;
-                    active_kw = Some(kw);
-                    after_kw_slice = &trimmed[kw.len()..];
-                    kw_offset = stmt_offset + kw.len();
-                    break;
-                }
-            }
-
-            if !matched_decl_kw && let Some(kw) = pending_decl_for_this_stmt {
-                active_kw = Some(kw);
-                after_kw_slice = trimmed;
-                kw_offset = stmt_offset;
-            }
-
-            if let Some(kw) = active_kw {
-                let mut has_global_flag = kw == "export" || pending_decl_global_for_this_stmt;
-                let tokens = split_declaration_tokens(after_kw_slice);
-                for token in &tokens {
-                    if token.text.starts_with('-') || token.text.starts_with('+') {
-                        if token.text.contains('g') {
-                            has_global_flag = true;
-                        }
-                        continue;
-                    }
-                    if token.text == "\\" {
-                        continue;
-                    }
-
-                    let token_str = token.text;
-                    let token_start_in_line = kw_offset + token.byte_offset;
-
-                    let var_name_raw = if let Some(eq) = token_str.find('=') {
-                        let before_eq = &token_str[..eq];
-                        if let Some(stripped) = before_eq.strip_suffix('+') {
-                            stripped
-                        } else if let Some(br) = before_eq.find('[') {
-                            &before_eq[..br]
-                        } else {
-                            before_eq
-                        }
-                    } else if let Some(br) = token_str.find('[') {
-                        &token_str[..br]
-                    } else {
-                        token_str
-                    };
-
-                    let var_name = var_name_raw.trim().trim_end_matches('\\').trim();
-                    if !var_name.is_empty()
-                        && !var_name.chars().next().unwrap().is_ascii_digit()
-                        && var_name.chars().all(is_var_ident_char)
-                        && !is_reserved_keyword(var_name)
-                    {
-                        let name_start_byte =
-                            token_start_in_line + token_str.find(var_name).unwrap_or(0);
-                        let name_end_byte = name_start_byte + var_name.len();
-                        if is_before_cursor(name_end_byte) {
-                            let decl_pos = Position::new(
-                                line_idx as u32,
-                                byte_to_utf16_col(line, name_start_byte),
-                            );
-                            let in_other_fn_local = !has_global_flag
-                                && find_innermost_enclosing_function(&fn_ranges, decl_pos)
-                                    .is_some_and(|enc_fn| {
-                                        let outside = !range_contains(&enc_fn, &cursor_pos_range);
-                                        if outside {
-                                            out_of_scope_locals
-                                                .push((enc_fn, var_name.to_string()));
-                                        }
-                                        outside
-                                    });
-                            if !in_other_fn_local {
-                                add_symbol(var_name, LocalSymbolKind::Variable);
-                            }
-                        }
-                    }
-                }
-                if is_last_stmt && has_line_continuation {
-                    next_pending_decl_kw = Some(kw);
-                    next_pending_decl_global = has_global_flag;
-                }
-                continue;
-            }
-
-            // 3. Loop Variables
-            // 3.1 C-style for loop: `for (( VAR = 0; ... ))`
-            if trimmed.starts_with("for ((") || trimmed.starts_with("for((") {
-                let after_for = if let Some(stripped) = trimmed.strip_prefix("for ((") {
-                    stripped
-                } else {
-                    trimmed.strip_prefix("for((").unwrap_or("")
-                };
-                let kw_offset = stmt.text.len() - after_for.len();
-                let init_part = if let Some(close_idx) = after_for.find("))") {
-                    &after_for[..close_idx]
-                } else {
-                    after_for
-                };
-                let first_semi = init_part.find(';').unwrap_or(init_part.len());
-                let clause = &init_part[..first_semi];
-                let mut comma_offset = 0;
-                for sub_clause in clause.split(',') {
-                    for token in split_declaration_tokens(sub_clause) {
-                        let token_text = token.text;
-                        if token_text == "\\" {
-                            continue;
-                        }
-                        let var_name_raw = if let Some(eq) = token_text.find('=') {
-                            &token_text[..eq]
-                        } else {
-                            token_text
-                        };
-                        let var_name = var_name_raw
-                            .strip_suffix('+')
-                            .unwrap_or(var_name_raw)
-                            .trim()
-                            .trim_end_matches('\\')
-                            .trim();
-                        if !var_name.is_empty()
-                            && !var_name.chars().next().unwrap().is_ascii_digit()
-                            && var_name.chars().all(is_var_ident_char)
-                            && !is_reserved_keyword(var_name)
-                        {
-                            let name_start_byte = stmt.start_byte
-                                + kw_offset
-                                + comma_offset
-                                + token.byte_offset
-                                + token_text.find(var_name).unwrap_or(0);
-                            let name_end_byte = name_start_byte + var_name.len();
-                            if is_before_cursor(name_end_byte) {
-                                let var_pos = Position::new(
-                                    line_idx as u32,
-                                    byte_to_utf16_col(line, name_start_byte),
-                                );
-                                let is_out_of_scope_local =
-                                    find_innermost_enclosing_function(&fn_ranges, var_pos)
-                                        .is_some_and(|enc_fn| {
-                                            out_of_scope_locals.iter().any(|(fn_r, name)| {
-                                                *fn_r == enc_fn && name == var_name
-                                            })
-                                        });
-                                if !is_out_of_scope_local {
-                                    add_symbol(var_name, LocalSymbolKind::Variable);
-                                }
-                            }
-                        }
-                    }
-                    comma_offset += sub_clause.len() + 1;
-                }
-                continue;
-            }
-
-            // 3.2 `for VAR in ...`, `for VAR ( ... )`, `for VAR ; do`, `select VAR in ...`
-            let for_or_select_kw = if trimmed.starts_with("for ") || trimmed.starts_with("for\t") {
-                Some(4)
-            } else if trimmed.starts_with("select ") || trimmed.starts_with("select\t") {
-                Some(7)
-            } else {
-                pending_for_or_select_for_this_stmt
-            };
-
-            if let Some(kw_len) = for_or_select_kw {
-                let after_kw = if pending_for_or_select_for_this_stmt.is_some() {
-                    trimmed
-                } else {
-                    &trimmed[kw_len..]
-                };
-                let kw_offset = if pending_for_or_select_for_this_stmt.is_some() {
-                    0
-                } else {
-                    kw_len
-                };
-
-                let mut extracted_any = false;
-                for (word_offset, word) in split_words_with_offsets(after_kw) {
-                    if word == "in"
-                        || word == "do"
-                        || word.starts_with(';')
-                        || word.starts_with('(')
-                    {
-                        break;
-                    }
-                    let clean_word = word.trim_end_matches(';').trim_end_matches('\\');
-                    if !clean_word.is_empty()
-                        && !clean_word.chars().next().unwrap().is_ascii_digit()
-                        && clean_word.chars().all(is_var_ident_char)
-                        && !is_reserved_keyword(clean_word)
-                    {
-                        let name_start_byte = stmt_offset
-                            + kw_offset
-                            + word_offset
-                            + word.find(clean_word).unwrap_or(0);
-                        let name_end_byte = name_start_byte + clean_word.len();
-                        if is_before_cursor(name_end_byte) {
-                            add_symbol(clean_word, LocalSymbolKind::Variable);
-                            extracted_any = true;
-                        }
-                    }
-                    if word.ends_with(';') {
-                        break;
-                    }
-                }
-                if is_last_stmt
-                    && has_line_continuation
-                    && (!extracted_any || pending_for_or_select_for_this_stmt.is_some())
-                {
-                    next_pending_for_or_select_kw = Some(kw_len);
-                }
-                continue;
-            }
-
-            // 4. `read` statements: `read VAR`, `read -r line`, `while read ...`
-            let matched_read = find_read_command(trimmed);
-            if matched_read.is_some() || pending_read_for_this_stmt {
-                if is_last_stmt && has_line_continuation {
-                    next_pending_read_kw = true;
-                }
-                let (read_kw_offset, after_read) = if let Some((read_start, after)) = matched_read {
-                    (stmt_offset + read_start + 5, after)
-                } else {
-                    (stmt_offset, trimmed)
-                };
-
-                for token in split_declaration_tokens(after_read) {
-                    if token.text.starts_with('-')
-                        || token.text.starts_with('+')
-                        || token.text == "\\"
-                    {
-                        continue;
-                    }
-                    let token_str = token.text;
-                    let var_name_raw = token_str
-                        .split(['=', '?'])
-                        .next()
-                        .unwrap_or(token_str)
-                        .trim()
-                        .trim_end_matches('\\')
-                        .trim();
-                    if !var_name_raw.is_empty()
-                        && !var_name_raw.chars().next().unwrap().is_ascii_digit()
-                        && var_name_raw.chars().all(is_var_ident_char)
-                        && !is_reserved_keyword(var_name_raw)
-                    {
-                        let name_start_byte = read_kw_offset
-                            + token.byte_offset
-                            + token_str.find(var_name_raw).unwrap_or(0);
-                        let name_end_byte = name_start_byte + var_name_raw.len();
-                        if is_before_cursor(name_end_byte) {
-                            add_symbol(var_name_raw, LocalSymbolKind::Variable);
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // 5. Direct Variable Assignments: `VAR=...`, `VAR+=...`, `VAR[k]=...`
-            for token in split_declaration_tokens(trimmed) {
-                let token_text = token.text;
-                if token_text == "\\" {
-                    continue;
-                }
-                if let Some(eq_idx) = token_text.find('=')
-                    && eq_idx > 0
-                    && !token_text.starts_with("==")
-                    && !token_text[eq_idx..].starts_with("==")
-                {
-                    let prev_char = token_text.as_bytes().get(eq_idx.saturating_sub(1)).copied();
-                    if !matches!(prev_char, Some(b'!' | b'<' | b'>' | b'=')) {
-                        let left_raw = &token_text[..eq_idx];
-                        let left_no_plus = if let Some(stripped) = left_raw.strip_suffix('+') {
-                            stripped
-                        } else {
-                            left_raw
-                        };
-                        let left_no_bracket = if let Some(br) = left_no_plus.find('[') {
-                            &left_no_plus[..br]
-                        } else {
-                            left_no_plus
-                        };
-
-                        let var_name = left_no_bracket.trim().trim_end_matches('\\').trim();
-                        if !var_name.is_empty()
-                            && !var_name.chars().next().unwrap().is_ascii_digit()
-                            && var_name.chars().all(is_var_ident_char)
-                            && !is_reserved_keyword(var_name)
-                        {
-                            let name_start_byte = stmt_offset
-                                + token.byte_offset
-                                + token_text.find(var_name).unwrap_or(0);
-                            let name_end_byte = name_start_byte + var_name.len();
-                            if is_before_cursor(name_end_byte) {
-                                let var_pos = Position::new(
-                                    line_idx as u32,
-                                    byte_to_utf16_col(line, name_start_byte),
-                                );
-                                let is_out_of_scope_local =
-                                    find_innermost_enclosing_function(&fn_ranges, var_pos)
-                                        .is_some_and(|enc_fn| {
-                                            out_of_scope_locals.iter().any(|(fn_r, name)| {
-                                                *fn_r == enc_fn && name == var_name
-                                            })
-                                        });
-                                if !is_out_of_scope_local {
-                                    add_symbol(var_name, LocalSymbolKind::Variable);
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                }
-                // Stop once a token is not a valid assignment (e.g. `cmd` in `VAR=1 cmd arg=2`)
-                break;
-            }
-        }
-
-        pending_decl_kw = next_pending_decl_kw;
-        pending_decl_has_global_flag = next_pending_decl_global;
-        pending_function_kw = next_pending_function_kw;
-        pending_for_or_select_kw = next_pending_for_or_select_kw;
-        pending_read_kw = next_pending_read_kw;
-        pending_alias_kw = next_pending_alias_kw;
-    }
-
-    symbols
+    let index = parse_document(text);
+    visible_symbols_at(&index, position)
+        .into_iter()
+        .map(|s| LocalSymbol::new(s.name, s.kind.into()))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2261,7 +809,10 @@ pub fn merge_local_completions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::syntax::detect_heredoc_delimiter;
+    use crate::analysis::workspace::{MAX_SOURCED_FILE_BYTES, MAX_SOURCED_FILES};
     use rstest::rstest;
+    use tokio::sync::{mpsc, oneshot};
 
     #[rstest]
     // 1. Only candidate without tab
@@ -3545,7 +2096,7 @@ mod tests {
                         async move {
                             cnt.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(Duration::from_millis(30)).await;
-                            crate::hover::ManPageResult::Found(
+                            ManPageResult::Found(
                                 "single_flight_cmd(1) - single flight documentation".to_string(),
                             )
                         }
@@ -3568,7 +2119,7 @@ mod tests {
         // Exactly one background fetch task must execute despite 20 concurrent requests
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
         assert!(cache.contains_key("single_flight_cmd"));
-        assert!(!is_in_flight("single_flight_cmd"));
+        assert!(!crate::runtime::man::is_in_flight("single_flight_cmd"));
     }
 
     #[tokio::test]
@@ -3603,7 +2154,7 @@ mod tests {
                         async move {
                             cnt.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(Duration::from_millis(20)).await;
-                            crate::hover::ManPageResult::NotFound
+                            ManPageResult::NotFound
                         }
                     },
                 )
@@ -3619,7 +2170,9 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
         assert!(cache.contains_key("nonexistent_single_flight_cmd"));
         assert_eq!(*cache.get("nonexistent_single_flight_cmd").unwrap(), None);
-        assert!(!is_in_flight("nonexistent_single_flight_cmd"));
+        assert!(!crate::runtime::man::is_in_flight(
+            "nonexistent_single_flight_cmd"
+        ));
     }
 
     #[tokio::test]
@@ -3654,7 +2207,7 @@ mod tests {
                         async move {
                             cnt.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(Duration::from_millis(20)).await;
-                            crate::hover::ManPageResult::Timeout
+                            ManPageResult::Timeout
                         }
                     },
                 )
@@ -3669,7 +2222,9 @@ mod tests {
 
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
         assert!(!cache.contains_key("timeout_single_flight_cmd"));
-        assert!(!is_in_flight("timeout_single_flight_cmd"));
+        assert!(!crate::runtime::man::is_in_flight(
+            "timeout_single_flight_cmd"
+        ));
     }
 
     #[tokio::test]
@@ -3688,7 +2243,9 @@ mod tests {
         // Zero timeout aborts immediately without caching transient timeouts, returns unmodified item
         assert_eq!(resolved.documentation, None);
         assert!(!cache.contains_key("timeout_protection_isolated_cmd"));
-        assert!(!is_in_flight("timeout_protection_isolated_cmd"));
+        assert!(!crate::runtime::man::is_in_flight(
+            "timeout_protection_isolated_cmd"
+        ));
     }
 
     #[test]

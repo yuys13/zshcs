@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::completion::{CAPTURE_ZSH, ZPTYRC_ZSH};
+use crate::runtime::daemon::{CAPTURE_ZSH, ZPTYRC_ZSH};
 
 /// Diagnostic status for an individual check item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -10,7 +10,7 @@ use tower_lsp::lsp_types::{
     notification::{DidChangeTextDocument, DidOpenTextDocument, LogMessage},
     request,
 };
-use zshcs::completion::{parse_candidate_line, resolve_completion_item};
+use zshcs::lsp::completion::{parse_candidate_line, resolve_completion_item};
 
 // =========================================================================
 // 1. Extreme Fuzzing of `parse_candidate_line`
@@ -906,7 +906,7 @@ async fn test_stress_did_change_malformed_ranges_and_split_surrogates() {
 #[test]
 fn test_fuzz_infer_completion_kind_arbitrary_inputs() {
     use tower_lsp::lsp_types::CompletionItemKind;
-    use zshcs::completion::infer_completion_kind;
+    use zshcs::lsp::completion::infer_completion_kind;
 
     let test_cases = [
         ("", None, CompletionItemKind::TEXT),
@@ -1252,7 +1252,8 @@ async fn test_stress_concurrent_50_clients_resolve() {
 #[tokio::test]
 async fn test_stress_concurrent_50_clients_resolve_external_command_man_cache() {
     use std::time::Duration;
-    use zshcs::completion::{ManCache, resolve_completion_item_async_with_timeout};
+    use zshcs::lsp::completion::resolve_completion_item_async_with_timeout;
+    use zshcs::runtime::man::ManCache;
 
     let count = 50;
     let barrier = Arc::new(Barrier::new(count));

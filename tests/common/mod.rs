@@ -260,8 +260,8 @@ pub fn setup_server() -> (DuplexStream, tokio::task::JoinHandle<()>) {
         let cache_path = temp_cache.keep();
         Backend::new_with_scripts_and_cache(
             client,
-            zshcs::CAPTURE_ZSH,
-            zshcs::ZPTYRC_ZSH,
+            zshcs::runtime::daemon::CAPTURE_ZSH,
+            zshcs::runtime::daemon::ZPTYRC_ZSH,
             Some(cache_path),
         )
         .expect("Failed to initialize test backend")

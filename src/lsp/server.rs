@@ -10,20 +10,21 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::completion::{
-    CAPTURE_ZSH, CompletionRequest, ManCache, ZPTYRC_ZSH, extract_local_symbols_with_manager,
-    merge_local_completions, resolve_completion_item_async, run_completion_daemon,
-};
 use crate::config::Config;
-use crate::definition::find_definition_with_manager;
-use crate::diagnostics::check_syntax;
 use crate::document::DocumentManager;
 use crate::error::{ZshcsError, ZshcsResult};
-use crate::hover::{
-    extract_word_at_position, get_builtin_or_reserved_doc, get_hover_info_cached,
-    get_local_symbol_hover_doc_at, is_variable_reference_at,
+use crate::lsp::completion::{
+    extract_local_symbols_with_manager, merge_local_completions, resolve_completion_item_async,
 };
-use crate::symbols::extract_document_symbols;
+use crate::lsp::definition::find_definition_with_manager;
+use crate::lsp::diagnostics::check_syntax;
+use crate::lsp::hover::{
+    extract_word_at_position, get_builtin_or_reserved_doc, get_hover_info_cached,
+    get_local_symbol_hover_doc_at_with_manager, is_variable_reference_at,
+};
+use crate::lsp::symbols::extract_document_symbols;
+use crate::runtime::daemon::{CAPTURE_ZSH, CompletionRequest, ZPTYRC_ZSH, run_completion_daemon};
+use crate::runtime::man::ManCache;
 
 #[derive(Debug)]
 pub struct Backend {
@@ -588,18 +589,6 @@ impl LanguageServer for Backend {
         );
 
         let is_var_ref = is_variable_reference_at(&doc_text, range);
-        if is_var_ref
-            && let Some(value) = get_local_symbol_hover_doc_at(&doc_text, word, position, true)
-        {
-            return Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value,
-                }),
-                range: Some(range),
-            }));
-        }
-
         let basename = word
             .rfind('/')
             .map(|idx| &word[idx + 1..])
@@ -607,16 +596,33 @@ impl LanguageServer for Backend {
         let is_builtin_or_reserved = get_builtin_or_reserved_doc(word).is_some()
             || basename.and_then(get_builtin_or_reserved_doc).is_some();
 
-        if !is_builtin_or_reserved
-            && let Some(value) = get_local_symbol_hover_doc_at(&doc_text, word, position, false)
-        {
-            return Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value,
-                }),
-                range: Some(range),
-            }));
+        if is_var_ref || !is_builtin_or_reserved {
+            let doc_text_owned = doc_text.clone();
+            let word_owned = word.to_string();
+            let uri_owned = uri.clone();
+            let doc_manager = self.document_manager.clone();
+            let local_doc = tokio::task::spawn_blocking(move || {
+                get_local_symbol_hover_doc_at_with_manager(
+                    &doc_text_owned,
+                    &uri_owned,
+                    &word_owned,
+                    position,
+                    is_var_ref,
+                    Some(&doc_manager),
+                )
+            })
+            .await
+            .unwrap_or(None);
+
+            if let Some(value) = local_doc {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    }),
+                    range: Some(range),
+                }));
+            }
         }
 
         match get_hover_info_cached(word, &self.man_cache).await {
