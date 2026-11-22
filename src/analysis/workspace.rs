@@ -8,7 +8,7 @@ use crate::document::DocumentManager;
 
 pub const MAX_SOURCE_DEPTH: usize = 4;
 pub const MAX_SOURCED_FILES: usize = 64;
-const MAX_SOURCED_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
+pub const MAX_SOURCED_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
 
 /// A resolved and parsed sourced script document.
 #[derive(Debug, Clone)]
@@ -198,7 +198,7 @@ pub fn resolve_sourced_script(
     Some((primary_uri, raw_uri, content))
 }
 
-fn prioritized_source_paths(
+pub(crate) fn prioritized_source_paths(
     index: &DocumentIndex,
     cursor_pos: Position,
     include_after_cursor: bool,

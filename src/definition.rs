@@ -8,8 +8,7 @@ use crate::analysis::scope::{
 };
 pub use crate::analysis::syntax::{
     DeclarationToken, StatementSpan, byte_to_utf16_col, is_func_ident_char, is_ident_char,
-    is_var_ident_char, range_contains, split_declaration_tokens, split_line_statements,
-    utf16_col_to_byte,
+    is_var_ident_char, split_declaration_tokens, split_line_statements, utf16_col_to_byte,
 };
 use crate::analysis::workspace::collect_sourced_documents;
 pub use crate::analysis::workspace::{resolve_open_sourced_uri, resolve_source_path};
@@ -86,35 +85,6 @@ pub fn scan_alias_definitions(text: &str, uri: &Url, alias_name: &str) -> Vec<Lo
             range: a.name_range,
         })
         .collect()
-}
-
-/// Temporary helper for `hover.rs` and `completion.rs` until their migration commits.
-pub(crate) fn scan_function_body_ranges(text: &str) -> Vec<Range> {
-    parse_document(text)
-        .functions
-        .into_iter()
-        .map(|f| f.full_range)
-        .collect()
-}
-
-/// Temporary helper for `hover.rs` and `completion.rs` until their migration commits.
-pub(crate) fn find_innermost_enclosing_function(
-    fn_ranges: &[Range],
-    pos: Position,
-) -> Option<Range> {
-    let target = Range::new(pos, pos);
-    fn_ranges
-        .iter()
-        .filter(|r| range_contains(r, &target))
-        .max_by(|a, b| {
-            a.start
-                .line
-                .cmp(&b.start.line)
-                .then(a.start.character.cmp(&b.start.character))
-                .then(b.end.line.cmp(&a.end.line))
-                .then(b.end.character.cmp(&a.end.character))
-        })
-        .copied()
 }
 
 fn locations_to_response(locs: Vec<Location>) -> Option<GotoDefinitionResponse> {
@@ -235,7 +205,7 @@ pub fn find_definition_with_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::completion::extract_sourced_paths_prioritized;
+    use crate::analysis::workspace::prioritized_source_paths;
     use rstest::rstest;
     use tempfile::tempdir;
 
@@ -1122,7 +1092,8 @@ done
             "source ./after.zsh\n",
             "source ./first.zsh\n",
         );
-        let paths = extract_sourced_paths_prioritized(text, Position::new(2, 5));
+        let index = parse_document(text);
+        let paths = prioritized_source_paths(&index, Position::new(2, 5), true);
         assert_eq!(
             paths,
             vec![
