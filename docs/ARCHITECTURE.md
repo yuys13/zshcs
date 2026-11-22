@@ -418,7 +418,7 @@ flowchart TD
     }
     ```
   - Also accepts flat `{ "experimental": { "definition": true } }` payloads.
-- **Three-Tier Definition Resolution**:
+- **Four-Tier Definition Resolution**:
   1. **Source / `.` Script Reference Navigation**:
      - Detects when the cursor rests on `source <path>` or `. <path>` commands.
      - Strips single and double quotes, handles tilde paths (`~`, `~/...`), and resolves relative paths against the active document's parent directory (`Url::to_file_path()`).
@@ -428,10 +428,13 @@ flowchart TD
        - POSIX / Korn style: `func_name() { ... }` or `func_name () {`
        - Zsh / Bash keyword style: `function func_name { ... }` or `function func_name() { ... }`
      - Skips commented lines (`# ...`) and heredoc bodies (`<<EOF`, `<<-EOF`), returning precise 0-indexed UTF-16 line and character ranges pointing to the function identifier.
-  3. **Shell Variable Declaration & Assignment Scanning (`scan_variable_definitions`)**:
+  3. **Alias Definition Scanning (`scan_alias_definitions`)**:
+     - Scans for `alias name=...`, `alias -g name=...`, `alias -s name=...`, and multi-alias declarations while skipping heredoc bodies (`<<EOF`, `<<-EOF`).
+  4. **Shell Variable Declaration & Assignment Scanning (`scan_variable_definitions` & Function-Local Scoping)**:
      - Resolves variable references (`$VAR`, `${VAR}`, or `VAR`), skipping heredoc bodies (`<<EOF`, `<<-EOF`).
      - Scans for direct assignments (`VAR=...`, `VAR+=...`) and keyword declarations (`export`, `typeset`, `local`, `declare`, `readonly`, `integer`, `float`).
      - Employs quote- and paren-aware token splitting (`split_declaration_tokens`) to accurately locate variable names even in multi-variable declarations (`local -r A="hello" B=20`) and array declarations (`typeset -a ARR=(1 2 3)`).
+     - Applies function-local variable scoping (`resolve_scoped_variable_definitions`): when jumping from inside a function body, prioritizes function-local declarations (`local`, `typeset`, `declare`, `integer`, `float`, `readonly` without `-g`) in the enclosing function over global declarations, and hides `local` declarations scoped to other functions.
 
 ---
 

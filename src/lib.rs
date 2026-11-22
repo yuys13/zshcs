@@ -25,8 +25,8 @@ pub use definition::{
     DeclarationToken, DefinitionTarget, StatementSpan, byte_to_utf16_col,
     extract_source_path_at_position, extract_word_and_target_at_position, find_definition,
     is_func_ident_char, is_ident_char, is_var_ident_char, resolve_source_path,
-    scan_function_definitions, scan_variable_definitions, split_declaration_tokens,
-    split_line_statements, utf16_col_to_byte,
+    scan_alias_definitions, scan_function_definitions, scan_variable_definitions,
+    split_declaration_tokens, split_line_statements, utf16_col_to_byte,
 };
 pub use diagnostics::{
     DEFAULT_SYNTAX_CHECK_TIMEOUT, check_syntax, check_syntax_with_timeout, parse_diagnostic_line,

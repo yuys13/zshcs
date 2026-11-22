@@ -1,6 +1,11 @@
 use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::{GotoDefinitionResponse, Location, Position, Range, Url};
 
+use crate::symbols::{
+    find_matching_closing_brace, find_opening_brace, is_reserved_keyword, range_contains,
+    skip_flags,
+};
+
 /// Target identified under the cursor for definition search.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefinitionTarget {
@@ -981,6 +986,264 @@ pub fn scan_variable_definitions(text: &str, uri: &Url, var_name: &str) -> Vec<L
     locations
 }
 
+/// Scans the document for `alias` definitions matching `alias_name`.
+pub fn scan_alias_definitions(text: &str, uri: &Url, alias_name: &str) -> Vec<Location> {
+    let mut locations = Vec::new();
+    let mut heredoc_delimiter: Option<String> = None;
+
+    for (line_idx, line) in text.lines().enumerate() {
+        if let Some(ref delim) = heredoc_delimiter {
+            if line.trim_start_matches('\t').trim_end() == delim {
+                heredoc_delimiter = None;
+            }
+            continue;
+        }
+        if let Some(delim) = detect_heredoc_delimiter(line) {
+            heredoc_delimiter = Some(delim);
+        }
+
+        for stmt in split_line_statements(line) {
+            let trimmed = stmt.text.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if !(trimmed.starts_with("alias ") || trimmed.starts_with("alias\t")) {
+                continue;
+            }
+
+            let stmt_indent = stmt.text.len() - trimmed.len();
+            let alias_kw_offset = stmt.start_byte + stmt_indent + 5;
+
+            for token in split_declaration_tokens(&trimmed[5..]) {
+                if token.text.starts_with('-') || token.text.starts_with('+') {
+                    continue;
+                }
+                if let Some(eq_idx) = token.text.find('=')
+                    && eq_idx > 0
+                    && token.text[..eq_idx].trim() == alias_name
+                {
+                    let name_offset_in_token = token.text.find(alias_name).unwrap_or(0);
+                    let start_byte = alias_kw_offset + token.byte_offset + name_offset_in_token;
+                    let end_byte = start_byte + alias_name.len();
+                    let start_u16 = byte_to_utf16_col(line, start_byte);
+                    let end_u16 = byte_to_utf16_col(line, end_byte);
+                    locations.push(Location {
+                        uri: uri.clone(),
+                        range: Range::new(
+                            Position::new(line_idx as u32, start_u16),
+                            Position::new(line_idx as u32, end_u16),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    locations
+}
+
+/// Scans the document for function body ranges (`{ ... }`), skipping heredoc bodies.
+fn scan_function_body_ranges(text: &str) -> Vec<Range> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut ranges = Vec::new();
+    let mut heredoc_delimiter: Option<String> = None;
+
+    for (line_idx, &line) in lines.iter().enumerate() {
+        if let Some(ref delim) = heredoc_delimiter {
+            if line.trim_start_matches('\t').trim_end() == delim {
+                heredoc_delimiter = None;
+            }
+            continue;
+        }
+        if let Some(delim) = detect_heredoc_delimiter(line) {
+            heredoc_delimiter = Some(delim);
+        }
+
+        for stmt in split_line_statements(line) {
+            let trimmed = stmt.text.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let stmt_indent = stmt.text.len() - trimmed.len();
+            let stmt_offset = stmt.start_byte + stmt_indent;
+
+            let mut header_end_col: Option<usize> = None;
+
+            if trimmed.starts_with("function ") || trimmed.starts_with("function\t") {
+                let after_kw = trimmed[8..].trim_start();
+                let rest = skip_flags(after_kw);
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| is_func_ident_char(*c) && *c != '(' && *c != '{')
+                    .collect();
+                if !name.is_empty() && !is_reserved_keyword(&name) {
+                    let after_name = &rest[name.len()..];
+                    let after_parens =
+                        if let Some(stripped) = after_name.trim_start().strip_prefix("()") {
+                            stripped
+                        } else {
+                            after_name
+                        };
+                    let after_trimmed = after_parens.trim_start();
+                    if after_trimmed.is_empty()
+                        || after_trimmed.starts_with('{')
+                        || after_trimmed.starts_with(';')
+                        || after_trimmed.starts_with('#')
+                    {
+                        header_end_col = Some(stmt.start_byte + stmt.text.len());
+                    }
+                }
+            } else if let Some(open_paren_idx) = trimmed.find('(') {
+                let name_part = trimmed[..open_paren_idx].trim_end();
+                if !name_part.is_empty()
+                    && !name_part.starts_with('#')
+                    && !name_part.chars().next().unwrap().is_ascii_digit()
+                    && name_part.chars().all(is_func_ident_char)
+                    && !is_reserved_keyword(name_part)
+                {
+                    let after_open = trimmed[open_paren_idx + 1..].trim_start();
+                    if let Some(after_close) = after_open.strip_prefix(')') {
+                        let after_parens = after_close.trim_start();
+                        if after_parens.is_empty()
+                            || after_parens.starts_with('{')
+                            || after_parens.starts_with(';')
+                            || after_parens.starts_with('#')
+                        {
+                            header_end_col = Some(stmt.start_byte + stmt.text.len());
+                        }
+                    }
+                }
+            }
+
+            if let Some(search_col) = header_end_col
+                && let Some((open_line, open_col)) =
+                    find_opening_brace(&lines, line_idx, search_col)
+            {
+                let (end_line, end_u16) = find_matching_closing_brace(&lines, open_line, open_col);
+                let start_u16 = byte_to_utf16_col(line, stmt_offset);
+                ranges.push(Range::new(
+                    Position::new(line_idx as u32, start_u16),
+                    Position::new(end_line as u32, end_u16),
+                ));
+            }
+        }
+    }
+
+    ranges
+}
+
+fn find_innermost_enclosing_function(fn_ranges: &[Range], pos: Position) -> Option<Range> {
+    let target = Range::new(pos, pos);
+    fn_ranges
+        .iter()
+        .filter(|r| range_contains(r, &target))
+        .max_by(|a, b| {
+            a.start
+                .line
+                .cmp(&b.start.line)
+                .then(a.start.character.cmp(&b.start.character))
+                .then(b.end.line.cmp(&a.end.line))
+                .then(b.end.character.cmp(&a.end.character))
+        })
+        .copied()
+}
+
+fn is_local_var_declaration_at(lines: &[&str], loc: &Location) -> bool {
+    let Some(&line) = lines.get(loc.range.start.line as usize) else {
+        return false;
+    };
+    let target_byte = utf16_col_to_byte(line, loc.range.start.character);
+    let local_keywords = [
+        "local", "typeset", "declare", "integer", "float", "readonly",
+    ];
+
+    for stmt in split_line_statements(line) {
+        let stmt_end = stmt.start_byte + stmt.text.len();
+        if target_byte < stmt.start_byte || target_byte > stmt_end {
+            continue;
+        }
+        let trimmed = stmt.text.trim_start();
+        for kw in local_keywords {
+            if trimmed.starts_with(kw)
+                && (trimmed[kw.len()..].starts_with(' ') || trimmed[kw.len()..].starts_with('\t'))
+            {
+                let has_global_flag = split_declaration_tokens(&trimmed[kw.len()..])
+                    .into_iter()
+                    .take_while(|t| t.text.starts_with('-') || t.text.starts_with('+'))
+                    .any(|t| t.text.contains('g'));
+                return !has_global_flag;
+            }
+        }
+    }
+
+    false
+}
+
+fn resolve_scoped_variable_definitions(
+    text: &str,
+    uri: &Url,
+    var_name: &str,
+    cursor_pos: Position,
+) -> Vec<Location> {
+    let var_locs = scan_variable_definitions(text, uri, var_name);
+    if var_locs.len() <= 1 {
+        return var_locs;
+    }
+
+    let fn_ranges = scan_function_body_ranges(text);
+    let cursor_fn = find_innermost_enclosing_function(&fn_ranges, cursor_pos);
+    let lines: Vec<&str> = text.lines().collect();
+
+    let classified: Vec<(Location, Option<Range>, bool)> = var_locs
+        .iter()
+        .map(|loc| {
+            let enc = find_innermost_enclosing_function(&fn_ranges, loc.range.start);
+            let is_local = enc.is_some() && is_local_var_declaration_at(&lines, loc);
+            (loc.clone(), enc, is_local)
+        })
+        .collect();
+
+    if let Some(cur_fn) = cursor_fn {
+        let has_local_in_cur = classified
+            .iter()
+            .any(|(_, enc, is_local)| *is_local && *enc == Some(cur_fn));
+        if has_local_in_cur {
+            let scoped: Vec<Location> = classified
+                .iter()
+                .filter(|(_, enc, _)| *enc == Some(cur_fn))
+                .map(|(loc, _, _)| loc.clone())
+                .collect();
+            if !scoped.is_empty() {
+                return scoped;
+            }
+        }
+    }
+
+    let visible: Vec<Location> = classified
+        .into_iter()
+        .filter(|(_, enc, is_local)| !(*is_local && *enc != cursor_fn))
+        .map(|(loc, _, _)| loc)
+        .collect();
+
+    if visible.is_empty() {
+        var_locs
+    } else {
+        visible
+    }
+}
+
+fn locations_to_response(locs: Vec<Location>) -> Option<GotoDefinitionResponse> {
+    if locs.is_empty() {
+        None
+    } else if locs.len() == 1 {
+        Some(GotoDefinitionResponse::Scalar(
+            locs.into_iter().next().unwrap(),
+        ))
+    } else {
+        Some(GotoDefinitionResponse::Array(locs))
+    }
+}
+
 /// Resolves the definition location(s) for the token at `position` within `text`.
 pub fn find_definition(
     text: &str,
@@ -1001,44 +1264,26 @@ pub fn find_definition(
     let (target, _) = extract_word_and_target_at_position(text, position)?;
 
     match target {
-        DefinitionTarget::Variable(var_name) => {
-            let var_locs = scan_variable_definitions(text, uri, &var_name);
-            if var_locs.is_empty() {
-                None
-            } else if var_locs.len() == 1 {
-                Some(GotoDefinitionResponse::Scalar(
-                    var_locs.into_iter().next().unwrap(),
-                ))
-            } else {
-                Some(GotoDefinitionResponse::Array(var_locs))
-            }
-        }
+        DefinitionTarget::Variable(var_name) => locations_to_response(
+            resolve_scoped_variable_definitions(text, uri, &var_name, position),
+        ),
         DefinitionTarget::FunctionOrVariable(ident) => {
-            // First search for function definitions
+            // 1. Search for function definitions
             let fn_locs = scan_function_definitions(text, uri, &ident);
             if !fn_locs.is_empty() {
-                if fn_locs.len() == 1 {
-                    return Some(GotoDefinitionResponse::Scalar(
-                        fn_locs.into_iter().next().unwrap(),
-                    ));
-                } else {
-                    return Some(GotoDefinitionResponse::Array(fn_locs));
-                }
+                return locations_to_response(fn_locs);
             }
 
-            // Fallback to variable definitions
-            let var_locs = scan_variable_definitions(text, uri, &ident);
-            if !var_locs.is_empty() {
-                if var_locs.len() == 1 {
-                    return Some(GotoDefinitionResponse::Scalar(
-                        var_locs.into_iter().next().unwrap(),
-                    ));
-                } else {
-                    return Some(GotoDefinitionResponse::Array(var_locs));
-                }
+            // 2. Search for alias definitions
+            let alias_locs = scan_alias_definitions(text, uri, &ident);
+            if !alias_locs.is_empty() {
+                return locations_to_response(alias_locs);
             }
 
-            None
+            // 3. Fallback to scoped variable definitions
+            locations_to_response(resolve_scoped_variable_definitions(
+                text, uri, &ident, position,
+            ))
         }
     }
 }
@@ -1741,5 +1986,97 @@ done
         let real_fn_locs = scan_function_definitions(text, &uri, "real_func");
         assert_eq!(real_fn_locs.len(), 1);
         assert_eq!(real_fn_locs[0].range.start, Position::new(11, 0));
+    }
+
+    #[test]
+    fn test_find_definition_alias() {
+        let uri = Url::parse("file:///alias_def.zsh").unwrap();
+        let text = concat!(
+            "alias ll='ls -la'\n",
+            "alias -g G='| grep'\n",
+            "alias a1='foo' a2='bar'\n",
+            "cat <<'EOF'\n",
+            "alias fake_alias='nope'\n",
+            "EOF\n",
+            "ll\n",
+            "echo hi G foo\n",
+            "a2\n",
+        );
+
+        let ll_def = find_definition(text, &uri, Position::new(6, 1));
+        assert_eq!(
+            ll_def,
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: Range::new(Position::new(0, 6), Position::new(0, 8)),
+            }))
+        );
+
+        let g_def = find_definition(text, &uri, Position::new(7, 8));
+        assert_eq!(
+            g_def,
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: Range::new(Position::new(1, 9), Position::new(1, 10)),
+            }))
+        );
+
+        let a2_def = find_definition(text, &uri, Position::new(8, 1));
+        assert_eq!(
+            a2_def,
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: Range::new(Position::new(2, 15), Position::new(2, 17)),
+            }))
+        );
+
+        assert!(scan_alias_definitions(text, &uri, "fake_alias").is_empty());
+    }
+
+    #[test]
+    fn test_find_definition_function_local_variable_scoping() {
+        let uri = Url::parse("file:///scoping.zsh").unwrap();
+        let text = concat!(
+            "TARGET=\"global\"\n",
+            "fn_a() {\n",
+            "  local TARGET=\"local_a\"\n",
+            "  echo \"$TARGET\"\n",
+            "}\n",
+            "fn_b() {\n",
+            "  typeset TARGET=\"local_b\"\n",
+            "  echo \"$TARGET\"\n",
+            "}\n",
+            "echo \"$TARGET\"\n",
+        );
+
+        // Inside fn_a: jumps only to fn_a's `local TARGET` on line 2
+        let def_in_a = find_definition(text, &uri, Position::new(3, 10));
+        assert_eq!(
+            def_in_a,
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: Range::new(Position::new(2, 8), Position::new(2, 14)),
+            }))
+        );
+
+        // Inside fn_b: jumps only to fn_b's `typeset TARGET` on line 6
+        let def_in_b = find_definition(text, &uri, Position::new(7, 10));
+        assert_eq!(
+            def_in_b,
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: Range::new(Position::new(6, 10), Position::new(6, 16)),
+            }))
+        );
+
+        // At top-level: jumps only to global `TARGET` on line 0
+        let def_global = find_definition(text, &uri, Position::new(9, 8));
+        assert_eq!(
+            def_global,
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri,
+                range: Range::new(Position::new(0, 0), Position::new(0, 6)),
+            }))
+        );
     }
 }

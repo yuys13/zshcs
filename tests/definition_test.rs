@@ -5,7 +5,7 @@ use serde_json::json;
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
     ClientCapabilities, DidChangeConfigurationParams, DidOpenTextDocumentParams,
-    GotoDefinitionParams, GotoDefinitionResponse, InitializeParams, InitializedParams,
+    GotoDefinitionParams, GotoDefinitionResponse, InitializeParams, InitializedParams, Location,
     LogMessageParams, OneOf, Position, Range, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Url,
     notification::{DidChangeConfiguration, DidOpenTextDocument, Initialized, LogMessage},
@@ -1119,4 +1119,123 @@ done
     } else {
         panic!("Expected Scalar response for compound source statement");
     }
+}
+
+#[tokio::test]
+async fn test_definition_alias_and_local_variable_scoping() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let initialize_params = InitializeParams {
+        process_id: Some(123),
+        root_uri: None,
+        capabilities: ClientCapabilities::default(),
+        initialization_options: Some(json!({
+            "zshcs": {
+                "experimental": {
+                    "definition": true
+                }
+            }
+        })),
+        ..Default::default()
+    };
+
+    test_client
+        .send_request::<Initialize>(initialize_params)
+        .await
+        .unwrap();
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    let doc_uri = Url::parse("file:///alias_and_scope.zsh").unwrap();
+    let text = concat!(
+        "alias dlog='docker logs -f'\n",
+        "MODE=\"global\"\n",
+        "worker() {\n",
+        "  local MODE=\"local\"\n",
+        "  echo \"$MODE\"\n",
+        "}\n",
+        "dlog\n",
+        "echo \"$MODE\"\n",
+    );
+
+    test_client
+        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: doc_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: text.to_string(),
+            },
+        })
+        .await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    // 1. Jump to alias `dlog` (line 6, char 1) -> line 0, chars 6..10
+    let def_alias = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(6, 1),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        def_alias,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: doc_uri.clone(),
+            range: Range::new(Position::new(0, 6), Position::new(0, 10)),
+        }))
+    );
+
+    // 2. Jump to local `$MODE` inside `worker()` (line 4, char 10) -> line 3, chars 8..12
+    let def_local = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(4, 10),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        def_local,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: doc_uri.clone(),
+            range: Range::new(Position::new(3, 8), Position::new(3, 12)),
+        }))
+    );
+
+    // 3. Jump to global `$MODE` at top-level (line 7, char 9) -> line 1, chars 0..4
+    let def_global = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(7, 9),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        def_global,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: Url::parse("file:///alias_and_scope.zsh").unwrap(),
+            range: Range::new(Position::new(1, 0), Position::new(1, 4)),
+        }))
+    );
 }

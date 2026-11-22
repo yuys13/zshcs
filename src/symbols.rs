@@ -63,7 +63,7 @@ pub(crate) fn skip_flags(input: &str) -> &str {
 }
 
 /// Finds the closing `}` matching the opening `{` starting at `(open_line, open_byte_col)`.
-fn find_matching_closing_brace(
+pub(crate) fn find_matching_closing_brace(
     lines: &[&str],
     open_line: usize,
     open_byte_col: usize,
@@ -154,7 +154,7 @@ fn find_matching_closing_brace(
 }
 
 /// Searches forward for the first opening `{` starting from `start_line` and `start_byte_col`.
-fn find_opening_brace(
+pub(crate) fn find_opening_brace(
     lines: &[&str],
     start_line: usize,
     start_byte_col: usize,
@@ -216,7 +216,7 @@ fn find_opening_brace(
 }
 
 /// Checks if a parent range strictly contains a child range.
-fn range_contains(parent: &Range, child: &Range) -> bool {
+pub(crate) fn range_contains(parent: &Range, child: &Range) -> bool {
     let start_ok = (parent.start.line < child.start.line)
         || (parent.start.line == child.start.line
             && parent.start.character <= child.start.character);
