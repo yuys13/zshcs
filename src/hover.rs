@@ -1,14 +1,14 @@
 use std::time::Duration;
-use tower_lsp::lsp_types::{HoverContents, MarkupContent, MarkupKind, Position, Range};
+use tower_lsp::lsp_types::{HoverContents, MarkupContent, MarkupKind, Position, Range, Url};
 
 pub use crate::analysis::builtins::get_builtin_or_reserved_doc;
+use crate::analysis::model::DocumentIndex;
+use crate::analysis::parser::parse_document;
+use crate::analysis::scope::{resolve_alias_defs, resolve_function_defs, resolve_variable_defs};
 pub use crate::analysis::syntax::is_word_char;
-use crate::analysis::syntax::{
-    byte_to_utf16_col, detect_heredoc_delimiter, find_read_command, is_func_ident_char,
-    is_reserved_keyword, is_var_ident_char, skip_flags, split_declaration_tokens,
-    split_line_statements, utf16_col_to_byte,
-};
-use crate::definition::{find_innermost_enclosing_function, scan_function_body_ranges};
+use crate::analysis::syntax::utf16_col_to_byte;
+use crate::analysis::workspace::collect_sourced_documents;
+use crate::document::DocumentManager;
 pub use crate::runtime::man::{
     DEFAULT_HOVER_MAN_TIMEOUT, ManPageResult, clean_man_text, format_man_markdown, get_man_page,
     get_man_page_result,
@@ -232,382 +232,64 @@ pub fn is_variable_reference_at(text: &str, range: Range) -> bool {
     false
 }
 
-/// Extracts contiguous `#` comment lines immediately preceding `def_line_idx` as Markdown text.
-fn extract_preceding_comment_block(lines: &[&str], def_line_idx: usize) -> Option<String> {
-    let mut collected = Vec::new();
-    let mut idx = def_line_idx;
-    while idx > 0 {
-        let trimmed = lines[idx - 1].trim();
-        if !trimmed.starts_with('#') || trimmed.starts_with("#!") {
-            break;
-        }
-        let body = trimmed.trim_start_matches('#');
-        let body = body.strip_prefix(' ').unwrap_or(body);
-        collected.push(body);
-        idx -= 1;
-    }
-    if collected.is_empty() {
-        return None;
-    }
-    collected.reverse();
-    let doc = collected.join("\n").trim().to_string();
-    if doc.is_empty() { None } else { Some(doc) }
-}
-
-fn format_local_symbol_markdown(
-    lines: &[&str],
-    def_line_idx: usize,
+fn format_symbol_markdown(
     name: &str,
     kind_label: &str,
     signature: &str,
+    doc_comment: Option<&str>,
 ) -> String {
     let mut md = format!("### `{name}` ({kind_label})\n\n```zsh\n{signature}\n```");
-    if let Some(doc) = extract_preceding_comment_block(lines, def_line_idx) {
+    if let Some(doc) = doc_comment {
         md.push_str("\n\n");
-        md.push_str(&doc);
+        md.push_str(doc);
     }
     md
 }
 
-fn find_local_function_hover(lines: &[&str], word: &str) -> Option<String> {
-    if word.is_empty()
-        || word.chars().next()?.is_ascii_digit()
-        || is_reserved_keyword(word)
-        || !word.chars().all(is_func_ident_char)
-    {
-        return None;
-    }
-
-    let mut heredoc_delimiter: Option<String> = None;
-    for (line_idx, &line) in lines.iter().enumerate() {
-        if let Some(ref delim) = heredoc_delimiter {
-            if line.trim_start_matches('\t').trim_end() == delim {
-                heredoc_delimiter = None;
-            }
-            continue;
-        }
-        if let Some(delim) = detect_heredoc_delimiter(line) {
-            heredoc_delimiter = Some(delim);
-        }
-
-        for stmt in split_line_statements(line) {
-            let trimmed = stmt.text.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-
-            // POSIX style: `word() ...` or `word () ...`
-            if let Some(rest) = trimmed.strip_prefix(word) {
-                let rest_t = rest.trim_start();
-                if let Some(after_open) = rest_t.strip_prefix('(')
-                    && let Some(after_close) = after_open.trim_start().strip_prefix(')')
-                {
-                    let after_parens = after_close.trim_start();
-                    if after_parens.is_empty()
-                        || after_parens.starts_with('{')
-                        || after_parens.starts_with('#')
-                        || after_parens.starts_with(';')
-                    {
-                        return Some(format_local_symbol_markdown(
-                            lines,
-                            line_idx,
-                            word,
-                            "Local Function",
-                            trimmed,
-                        ));
-                    }
-                }
-            }
-
-            // Keyword style: `function [flags...] word ...`
-            if trimmed.starts_with("function ") || trimmed.starts_with("function\t") {
-                let after_fn = skip_flags(trimmed[8..].trim_start());
-                if let Some(rest) = after_fn.strip_prefix(word) {
-                    let rest_t = rest.trim_start();
-                    let is_header_end = rest_t.is_empty()
-                        || rest_t.starts_with('{')
-                        || rest_t.starts_with('#')
-                        || rest_t.starts_with(';')
-                        || (rest_t.starts_with('(') && rest_t.contains(')'));
-                    if is_header_end {
-                        return Some(format_local_symbol_markdown(
-                            lines,
-                            line_idx,
-                            word,
-                            "Local Function",
-                            trimmed,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn find_local_alias_hover(lines: &[&str], word: &str) -> Option<String> {
-    if word.is_empty()
-        || is_reserved_keyword(word)
-        || !word.chars().all(|c| is_func_ident_char(c) || c == '-')
-    {
-        return None;
-    }
-
-    let mut heredoc_delimiter: Option<String> = None;
-    for (line_idx, &line) in lines.iter().enumerate() {
-        if let Some(ref delim) = heredoc_delimiter {
-            if line.trim_start_matches('\t').trim_end() == delim {
-                heredoc_delimiter = None;
-            }
-            continue;
-        }
-        if let Some(delim) = detect_heredoc_delimiter(line) {
-            heredoc_delimiter = Some(delim);
-        }
-
-        for stmt in split_line_statements(line) {
-            let trimmed = stmt.text.trim();
-            if !(trimmed.starts_with("alias ") || trimmed.starts_with("alias\t")) {
-                continue;
-            }
-            for token in split_declaration_tokens(&trimmed[5..]) {
-                if token.text.starts_with('-') || token.text.starts_with('+') {
-                    continue;
-                }
-                if let Some(eq) = token.text.find('=')
-                    && token.text[..eq].trim() == word
-                {
-                    let sig = format!("alias {}", token.text.trim());
-                    return Some(format_local_symbol_markdown(
-                        lines,
-                        line_idx,
-                        word,
-                        "Local Alias",
-                        &sig,
-                    ));
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn token_defines_variable(token_text: &str, var_name: &str) -> bool {
-    let Some(rest) = token_text.strip_prefix(var_name) else {
-        return false;
-    };
-    rest.is_empty()
-        || rest.starts_with('=')
-        || rest.starts_with("+=")
-        || (rest.starts_with('[')
-            && (rest.find(']').is_some_and(|close| {
-                let after = &rest[close + 1..];
-                after.is_empty() || after.starts_with('=') || after.starts_with("+=")
-            }) || rest.ends_with(']')))
-}
-
-fn find_local_variable_hover(
-    text: &str,
-    lines: &[&str],
+fn resolve_local_hover_in_index(
+    index: &DocumentIndex,
     word: &str,
     cursor_pos: Option<Position>,
+    is_variable_ref: bool,
 ) -> Option<String> {
-    if word.is_empty()
-        || word.chars().next()?.is_ascii_digit()
-        || is_reserved_keyword(word)
-        || !word.chars().all(is_var_ident_char)
-    {
-        return None;
-    }
-
-    let decl_keywords = [
-        "export", "typeset", "local", "declare", "readonly", "integer", "float",
-    ];
-    let mut heredoc_delimiter: Option<String> = None;
-    let mut candidates: Vec<(usize, Position, &str, bool)> = Vec::new();
-
-    for (line_idx, &line) in lines.iter().enumerate() {
-        if let Some(ref delim) = heredoc_delimiter {
-            if line.trim_start_matches('\t').trim_end() == delim {
-                heredoc_delimiter = None;
-            }
-            continue;
+    if !is_variable_ref {
+        if let Some(func) = resolve_function_defs(index, word).into_iter().next() {
+            return Some(format_symbol_markdown(
+                &func.name,
+                "Local Function",
+                &func.signature,
+                func.doc_comment.as_deref(),
+            ));
         }
-        if let Some(delim) = detect_heredoc_delimiter(line) {
-            heredoc_delimiter = Some(delim);
-        }
-
-        for stmt in split_line_statements(line) {
-            let trimmed_start = stmt.text.trim_start();
-            let trimmed = trimmed_start.trim_end();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            let stmt_offset = stmt.start_byte + (stmt.text.len() - trimmed_start.len());
-            let stmt_pos = Position::new(line_idx as u32, byte_to_utf16_col(line, stmt_offset));
-
-            // 1. Keyword variable declarations (`export`, `typeset`, `local`, etc.)
-            if let Some(kw) = decl_keywords.iter().find(|&&kw| {
-                trimmed.starts_with(kw)
-                    && (trimmed[kw.len()..].starts_with(' ')
-                        || trimmed[kw.len()..].starts_with('\t'))
-            }) {
-                let tokens = split_declaration_tokens(&trimmed[kw.len()..]);
-                let has_global_flag = *kw == "export"
-                    || tokens
-                        .iter()
-                        .take_while(|t| t.text.starts_with('-') || t.text.starts_with('+'))
-                        .any(|t| t.text.contains('g'));
-                let matched = tokens.iter().any(|t| {
-                    !t.text.starts_with('-')
-                        && !t.text.starts_with('+')
-                        && token_defines_variable(t.text, word)
-                });
-                if matched {
-                    candidates.push((line_idx, stmt_pos, trimmed, !has_global_flag));
-                    continue;
-                }
-            }
-
-            // 2. Direct assignments (`VAR=...`, `VAR+=...`, `VAR[k]=...`)
-            let mut matched_direct = false;
-            for token in split_declaration_tokens(trimmed) {
-                if let Some(rest) = token.text.strip_prefix(word) {
-                    let is_direct = rest.starts_with('=')
-                        || rest.starts_with("+=")
-                        || (rest.starts_with('[')
-                            && rest.find(']').is_some_and(|close| {
-                                let after = &rest[close + 1..];
-                                after.starts_with('=') || after.starts_with("+=")
-                            }));
-                    if is_direct {
-                        candidates.push((line_idx, stmt_pos, trimmed, false));
-                        matched_direct = true;
-                        break;
-                    }
-                }
-                if !token.text.contains('=') {
-                    break;
-                }
-            }
-            if matched_direct {
-                continue;
-            }
-
-            // 3. Loop variables (`for VAR ...`, `select VAR ...`) and `for (( VAR = ... ))`
-            let for_kw_len = if trimmed.starts_with("for ") || trimmed.starts_with("for\t") {
-                Some(4)
-            } else if trimmed.starts_with("select ") || trimmed.starts_with("select\t") {
-                Some(7)
-            } else {
-                None
-            };
-            if let Some(kw_len) = for_kw_len {
-                let after_kw = trimmed[kw_len..].trim_start();
-                if let Some(rest) = after_kw.strip_prefix(word)
-                    && (rest.is_empty()
-                        || rest.starts_with(' ')
-                        || rest.starts_with('\t')
-                        || rest.starts_with(';')
-                        || rest.starts_with('('))
-                {
-                    candidates.push((line_idx, stmt_pos, trimmed, false));
-                    continue;
-                }
-            }
-            if trimmed.starts_with("for ((") || trimmed.starts_with("for((") {
-                let after_for = trimmed
-                    .strip_prefix("for ((")
-                    .or_else(|| trimmed.strip_prefix("for(("))
-                    .unwrap_or("");
-                if let Some(close_idx) = after_for.find("))") {
-                    let clause = after_for[..close_idx].split(';').next().unwrap_or("");
-                    let matched = split_declaration_tokens(clause).into_iter().any(|t| {
-                        t.text.strip_prefix(word).is_some_and(|r| {
-                            r.is_empty()
-                                || r.starts_with('=')
-                                || r.starts_with("+=")
-                                || r.starts_with("++")
-                                || r.starts_with("--")
-                        })
-                    });
-                    if matched {
-                        candidates.push((line_idx, stmt_pos, trimmed, false));
-                        continue;
-                    }
-                }
-            }
-
-            // 4. `read` statements (`read VAR`, `read -r VAR`, `while read -r line`)
-            if let Some((_, after_read)) = find_read_command(trimmed) {
-                let matched = split_declaration_tokens(after_read).into_iter().any(|t| {
-                    !t.text.starts_with('-')
-                        && !t.text.starts_with('+')
-                        && t.text
-                            .strip_prefix(word)
-                            .is_some_and(|r| r.is_empty() || r.starts_with('='))
-                });
-                if matched {
-                    candidates.push((line_idx, stmt_pos, trimmed, false));
-                }
-            }
+        if let Some(alias) = resolve_alias_defs(index, word).into_iter().next() {
+            return Some(format_symbol_markdown(
+                &alias.name,
+                "Local Alias",
+                &alias.signature,
+                alias.doc_comment.as_deref(),
+            ));
         }
     }
 
-    if candidates.is_empty() {
-        return None;
-    }
+    let var_defs = resolve_variable_defs(index, word, cursor_pos);
+    let chosen = var_defs
+        .iter()
+        .copied()
+        .find(|v| v.is_function_local)
+        .or_else(|| var_defs.into_iter().next())?;
 
-    let fn_ranges = scan_function_body_ranges(text);
-    let cursor_fn = cursor_pos.and_then(|pos| find_innermost_enclosing_function(&fn_ranges, pos));
-
-    if let Some(cur_fn) = cursor_fn
-        && let Some(&(line_idx, _, sig, _)) = candidates.iter().find(|&&(_, pos, _, is_local)| {
-            is_local && find_innermost_enclosing_function(&fn_ranges, pos) == Some(cur_fn)
-        })
-    {
-        return Some(format_local_symbol_markdown(
-            lines,
-            line_idx,
-            word,
-            "Local Variable",
-            sig,
-        ));
-    }
-
-    let chosen = candidates.iter().find(|&&(_, pos, _, is_local)| {
-        let enc = find_innermost_enclosing_function(&fn_ranges, pos);
-        let scoped_local = enc.is_some() && is_local;
-        !(scoped_local && enc != cursor_fn)
-    });
-
-    let &(line_idx, _, sig, _) = match chosen {
-        Some(c) => c,
-        None if cursor_pos.is_none() => &candidates[0],
-        None => return None,
-    };
-
-    Some(format_local_symbol_markdown(
-        lines,
-        line_idx,
-        word,
+    Some(format_symbol_markdown(
+        &chosen.name,
         "Local Variable",
-        sig,
+        &chosen.signature,
+        chosen.doc_comment.as_deref(),
     ))
 }
 
 /// Resolves Markdown hover documentation for script-local functions, aliases, and variables.
 pub fn get_local_symbol_hover_doc(text: &str, word: &str, is_variable_ref: bool) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    if is_variable_ref {
-        find_local_variable_hover(text, &lines, word, None)
-    } else {
-        find_local_function_hover(&lines, word)
-            .or_else(|| find_local_alias_hover(&lines, word))
-            .or_else(|| find_local_variable_hover(text, &lines, word, None))
-    }
+    let index = parse_document(text);
+    resolve_local_hover_in_index(&index, word, None, is_variable_ref)
 }
 
 /// Resolves Markdown hover documentation for script-local functions, aliases, and variables
@@ -618,14 +300,34 @@ pub fn get_local_symbol_hover_doc_at(
     position: Position,
     is_variable_ref: bool,
 ) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    if is_variable_ref {
-        find_local_variable_hover(text, &lines, word, Some(position))
-    } else {
-        find_local_function_hover(&lines, word)
-            .or_else(|| find_local_alias_hover(&lines, word))
-            .or_else(|| find_local_variable_hover(text, &lines, word, Some(position)))
+    let index = parse_document(text);
+    resolve_local_hover_in_index(&index, word, Some(position), is_variable_ref)
+}
+
+/// Resolves Markdown hover documentation for script-local symbols across the active document
+/// and any scripts sourced via `source` or `.` (preferring open buffers in `doc_manager`
+/// and falling back to bounded disk reads).
+pub fn get_local_symbol_hover_doc_at_with_manager(
+    text: &str,
+    uri: &Url,
+    word: &str,
+    position: Position,
+    is_variable_ref: bool,
+    doc_manager: Option<&DocumentManager>,
+) -> Option<String> {
+    let index = parse_document(text);
+    if let Some(doc) = resolve_local_hover_in_index(&index, word, Some(position), is_variable_ref) {
+        return Some(doc);
     }
+
+    for sourced in collect_sourced_documents(&index, uri, position, doc_manager, true) {
+        if let Some(doc) = resolve_local_hover_in_index(&sourced.index, word, None, is_variable_ref)
+        {
+            return Some(doc);
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -1247,6 +949,78 @@ mod tests {
         );
         assert!(
             get_local_symbol_hover_doc_at(text, "ONLY_A", Position::new(14, 8), true).is_none()
+        );
+    }
+
+    #[test]
+    fn test_local_symbol_hover_cross_file_sourced_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.zsh");
+        let lib_path = dir.path().join("lib.zsh");
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+
+        std::fs::write(
+            &lib_path,
+            r#"# Shared helper
+helper_fn() {
+    local HIDDEN_IN_LIB="secret"
+    echo "$HIDDEN_IN_LIB"
+}
+# Shared var
+export SHARED_VAR="ok"
+alias ll='ls -la'
+"#,
+        )
+        .unwrap();
+
+        let main_text = "source ./lib.zsh\nhelper_fn\necho $SHARED_VAR\nll\necho $HIDDEN_IN_LIB\n";
+
+        let fn_doc = get_local_symbol_hover_doc_at_with_manager(
+            main_text,
+            &main_uri,
+            "helper_fn",
+            Position::new(1, 2),
+            false,
+            None,
+        )
+        .expect("Expected hover for sourced function");
+        assert!(fn_doc.contains("Shared helper"));
+        assert!(fn_doc.contains("Local Function"));
+
+        let var_doc = get_local_symbol_hover_doc_at_with_manager(
+            main_text,
+            &main_uri,
+            "SHARED_VAR",
+            Position::new(2, 8),
+            true,
+            None,
+        )
+        .expect("Expected hover for sourced variable");
+        assert!(var_doc.contains("Shared var"));
+        assert!(var_doc.contains("export SHARED_VAR=\"ok\""));
+
+        let alias_doc = get_local_symbol_hover_doc_at_with_manager(
+            main_text,
+            &main_uri,
+            "ll",
+            Position::new(3, 1),
+            false,
+            None,
+        )
+        .expect("Expected hover for sourced alias");
+        assert!(alias_doc.contains("alias ll='ls -la'"));
+
+        // Function-local variable inside sourced script must remain hidden
+        assert!(
+            get_local_symbol_hover_doc_at_with_manager(
+                main_text,
+                &main_uri,
+                "HIDDEN_IN_LIB",
+                Position::new(4, 8),
+                true,
+                None,
+            )
+            .is_none()
         );
     }
 }
