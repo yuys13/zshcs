@@ -11,7 +11,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::completion::{
-    CAPTURE_ZSH, CompletionRequest, ManCache, ZPTYRC_ZSH, extract_local_symbols,
+    CAPTURE_ZSH, CompletionRequest, ManCache, ZPTYRC_ZSH, extract_local_symbols_with_manager,
     merge_local_completions, resolve_completion_item_async, run_completion_daemon,
 };
 use crate::config::Config;
@@ -495,8 +495,10 @@ impl LanguageServer for Backend {
                     count = items.len(),
                     "Completion items retrieved successfully"
                 );
-                let local_symbols = if let Some(doc) = self.document_manager.get(&uri) {
-                    extract_local_symbols(&doc, position)
+                let local_symbols = if let Some(doc) =
+                    self.document_manager.get(&uri).map(|d| d.clone())
+                {
+                    extract_local_symbols_with_manager(&doc, position, Some(&self.document_manager))
                 } else {
                     Vec::new()
                 };

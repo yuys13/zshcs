@@ -7,14 +7,14 @@ use tokio::time::timeout;
 use tower_lsp::Client;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind, MessageType,
-    Position,
+    Position, Url,
 };
 
 use crate::definition::{
     byte_to_utf16_col, detect_heredoc_delimiter, find_read_command, is_func_ident_char,
-    is_var_ident_char, split_declaration_tokens, split_line_statements,
+    is_var_ident_char, resolve_source_path, split_declaration_tokens, split_line_statements,
 };
-use crate::document::DocumentState;
+use crate::document::{DocumentManager, DocumentState};
 use crate::error::{ZshcsError, ZshcsResult};
 use crate::symbols::{is_reserved_keyword, skip_flags};
 
@@ -843,10 +843,290 @@ fn split_words_with_offsets(input: &str) -> Vec<(usize, &str)> {
     words
 }
 
-/// Extracts locally defined variables and functions from an open document state
-/// that were defined at or before the given `position`.
+const MAX_SOURCE_DEPTH: usize = 4;
+
+/// Extracts sourced script path arguments (`source <path>` or `. <path>`) from `text`
+/// that appear at or before the given `position`, ignoring heredoc bodies and comments.
+pub fn extract_sourced_paths_from_text(text: &str, position: Position) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut heredoc_delimiter: Option<String> = None;
+    let mut pending_source_kw = false;
+
+    for (line_idx, line) in text.lines().enumerate() {
+        if line_idx > position.line as usize {
+            break;
+        }
+
+        if let Some(ref delim) = heredoc_delimiter {
+            let trimmed = line.trim_start_matches('\t').trim_end();
+            if trimmed == delim {
+                heredoc_delimiter = None;
+            }
+            pending_source_kw = false;
+            continue;
+        }
+
+        if let Some(delim) = detect_heredoc_delimiter(line) {
+            heredoc_delimiter = Some(delim);
+            pending_source_kw = false;
+        }
+
+        let is_target_line = line_idx == position.line as usize;
+        let has_line_continuation = ends_with_line_continuation(line);
+        let mut current_pending_source_kw = std::mem::take(&mut pending_source_kw);
+        let mut next_pending_source_kw = false;
+
+        let stmts = split_line_statements(line);
+        if stmts.is_empty() {
+            pending_source_kw = if has_line_continuation {
+                current_pending_source_kw
+            } else {
+                false
+            };
+            continue;
+        }
+
+        let num_stmts = stmts.len();
+        for (stmt_idx, stmt) in stmts.into_iter().enumerate() {
+            let is_first_stmt = stmt_idx == 0;
+            let is_last_stmt = stmt_idx + 1 == num_stmts;
+            let pending_source_for_this_stmt = if is_first_stmt {
+                std::mem::take(&mut current_pending_source_kw)
+            } else {
+                false
+            };
+
+            let trimmed = stmt.text.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                if is_last_stmt && has_line_continuation && !next_pending_source_kw {
+                    next_pending_source_kw = pending_source_for_this_stmt;
+                }
+                continue;
+            }
+
+            let stmt_indent = stmt.text.len() - trimmed.len();
+            let stmt_offset = stmt.start_byte + stmt_indent;
+
+            let (after_cmd, cmd_end_byte) = if pending_source_for_this_stmt {
+                (trimmed, stmt_offset)
+            } else if trimmed == "source" || trimmed == "source\\" {
+                if is_last_stmt && has_line_continuation {
+                    next_pending_source_kw = true;
+                }
+                continue;
+            } else if trimmed.starts_with("source ") || trimmed.starts_with("source\t") {
+                (&trimmed[6..], stmt_offset + 6)
+            } else if trimmed == "." || trimmed == ".\\" {
+                if is_last_stmt && has_line_continuation {
+                    next_pending_source_kw = true;
+                }
+                continue;
+            } else if trimmed.starts_with(". ") || trimmed.starts_with(".\t") {
+                (&trimmed[1..], stmt_offset + 1)
+            } else {
+                continue;
+            };
+
+            let after_trimmed = after_cmd.trim_start();
+            if after_trimmed.is_empty() || after_trimmed == "\\" {
+                if is_last_stmt && has_line_continuation {
+                    next_pending_source_kw = true;
+                }
+                continue;
+            }
+
+            let arg_trim_len = after_cmd.len() - after_trimmed.len();
+            let arg_start_byte = cmd_end_byte + arg_trim_len;
+
+            let (unquoted, arg_end_byte) = if let Some(stripped) = after_trimmed.strip_prefix('"') {
+                if let Some(close_idx) = stripped.find('"') {
+                    (&stripped[..close_idx], arg_start_byte + 1 + close_idx + 1)
+                } else {
+                    (stripped, arg_start_byte + after_trimmed.len())
+                }
+            } else if let Some(stripped) = after_trimmed.strip_prefix('\'') {
+                if let Some(close_idx) = stripped.find('\'') {
+                    (&stripped[..close_idx], arg_start_byte + 1 + close_idx + 1)
+                } else {
+                    (stripped, arg_start_byte + after_trimmed.len())
+                }
+            } else {
+                let token_len = after_trimmed
+                    .find(|c: char| c.is_whitespace() || c == '#' || c == ';' || c == '\\')
+                    .unwrap_or(after_trimmed.len());
+                (&after_trimmed[..token_len], arg_start_byte + token_len)
+            };
+
+            let is_before_cursor =
+                !is_target_line || byte_to_utf16_col(line, arg_end_byte) <= position.character;
+            if !unquoted.is_empty() && is_before_cursor {
+                paths.push(unquoted.to_string());
+            }
+        }
+
+        pending_source_kw = next_pending_source_kw;
+    }
+
+    paths
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut stack: Vec<Component<'_>> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(stack.last(), Some(Component::Normal(_))) {
+                    stack.pop();
+                } else if !matches!(
+                    stack.last(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    stack.push(comp);
+                }
+            }
+            _ => stack.push(comp),
+        }
+    }
+    stack.iter().collect()
+}
+
+fn resolve_sourced_script(
+    path_str: &str,
+    base_uri: &Url,
+    doc_manager: Option<&DocumentManager>,
+) -> Option<(Url, Option<Url>, String)> {
+    if path_str.is_empty() {
+        return None;
+    }
+
+    let mut expanded_str = path_str.to_string();
+    if let Ok(home) = std::env::var("HOME") {
+        expanded_str = expanded_str
+            .replace("$HOME", &home)
+            .replace("${HOME}", &home);
+        if expanded_str == "~" {
+            expanded_str = home;
+        } else if let Some(sub) = expanded_str.strip_prefix("~/") {
+            expanded_str = PathBuf::from(home).join(sub).to_string_lossy().into_owned();
+        }
+    }
+
+    let raw_path = {
+        let p = Path::new(&expanded_str);
+        if p.is_absolute() {
+            normalize_lexical_path(p)
+        } else {
+            let base_path = base_uri.to_file_path().ok()?;
+            let parent = base_path.parent()?;
+            normalize_lexical_path(&parent.join(p))
+        }
+    };
+    let raw_uri = Url::from_file_path(&raw_path).ok();
+    let canon_uri = resolve_source_path(path_str, base_uri);
+
+    let content = doc_manager
+        .and_then(|mgr| {
+            canon_uri
+                .as_ref()
+                .and_then(|u| mgr.get_content(u))
+                .or_else(|| raw_uri.as_ref().and_then(|u| mgr.get_content(u)))
+        })
+        .or_else(|| {
+            if let Some(ref u) = canon_uri
+                && let Ok(p) = u.to_file_path()
+            {
+                return std::fs::read_to_string(p).ok();
+            }
+            std::fs::read_to_string(&raw_path).ok()
+        })?;
+
+    let primary_uri = canon_uri.or_else(|| raw_uri.clone())?;
+    Some((primary_uri, raw_uri, content))
+}
+
+struct SourcedSymbolCollector<'a> {
+    doc_manager: Option<&'a DocumentManager>,
+    visited_uris: HashSet<Url>,
+    seen: HashSet<(String, LocalSymbolKind)>,
+    symbols: Vec<LocalSymbol>,
+}
+
+impl<'a> SourcedSymbolCollector<'a> {
+    fn collect(&mut self, source_text: &str, base_uri: &Url, position: Position, depth: usize) {
+        if depth >= MAX_SOURCE_DEPTH {
+            return;
+        }
+
+        for path_str in extract_sourced_paths_from_text(source_text, position) {
+            let Some((target_uri, alt_uri, content)) =
+                resolve_sourced_script(&path_str, base_uri, self.doc_manager)
+            else {
+                continue;
+            };
+
+            let already_visited = self.visited_uris.contains(&target_uri)
+                || alt_uri
+                    .as_ref()
+                    .is_some_and(|u| self.visited_uris.contains(u));
+            if already_visited {
+                continue;
+            }
+
+            self.visited_uris.insert(target_uri.clone());
+            if let Some(alt) = alt_uri {
+                self.visited_uris.insert(alt);
+            }
+
+            let end_pos = Position::new(u32::MAX, u32::MAX);
+            for sym in extract_local_symbols_from_text(&content, end_pos) {
+                if self.seen.insert((sym.name.clone(), sym.kind)) {
+                    self.symbols.push(sym);
+                }
+            }
+
+            self.collect(&content, &target_uri, end_pos, depth + 1);
+        }
+    }
+}
+
+/// Extracts locally defined variables, functions, and aliases from an open document state
+/// (and any scripts sourced at or before `position`) up to the given `position`.
 pub fn extract_local_symbols(doc: &DocumentState, position: Position) -> Vec<LocalSymbol> {
-    extract_local_symbols_from_text(doc.text(), position)
+    extract_local_symbols_with_manager(doc, position, None)
+}
+
+/// Extracts locally defined variables, functions, and aliases from an open document state
+/// and any scripts sourced at or before `position`, preferring open buffers in `doc_manager`
+/// and falling back to disk reads.
+pub fn extract_local_symbols_with_manager(
+    doc: &DocumentState,
+    position: Position,
+    doc_manager: Option<&DocumentManager>,
+) -> Vec<LocalSymbol> {
+    let symbols = extract_local_symbols_from_text(doc.text(), position);
+    let seen: HashSet<(String, LocalSymbolKind)> =
+        symbols.iter().map(|s| (s.name.clone(), s.kind)).collect();
+
+    let mut visited_uris = HashSet::new();
+    visited_uris.insert(doc.uri().clone());
+    if let Ok(path) = doc.uri().to_file_path()
+        && let Ok(canon) = path.canonicalize()
+        && let Ok(canon_uri) = Url::from_file_path(canon)
+    {
+        visited_uris.insert(canon_uri);
+    }
+
+    let mut collector = SourcedSymbolCollector {
+        doc_manager,
+        visited_uris,
+        seen,
+        symbols,
+    };
+    collector.collect(doc.text(), doc.uri(), position, 0);
+
+    collector.symbols
 }
 
 /// Checks whether a line ends with an unescaped line continuation backslash.
@@ -4579,5 +4859,61 @@ local \
         let labels: Vec<&str> = merged.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["ll", "ls"]);
         assert_eq!(merged[0].detail.as_deref(), Some("(local alias)"));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_includes_sourced_files_and_handles_cycles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a_path = dir.path().join("helper_a.zsh");
+        let b_path = dir.path().join("helper_b.zsh");
+        let after_path = dir.path().join("after.zsh");
+
+        std::fs::write(
+            &a_path,
+            concat!(
+                "source ./helper_b.zsh\n",
+                "a_func() { : }\n",
+                "A_VAR=1\n",
+                "alias a_alias='echo a'\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &b_path,
+            concat!(
+                ". \"./helper_a.zsh\"\n",
+                "function b_func { : }\n",
+                "export B_VAR=2\n",
+                "alias b_alias='echo b'\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(&after_path, "after_func() { : }\n").unwrap();
+
+        let main_path = dir.path().join("main.zsh");
+        let main_uri = tower_lsp::lsp_types::Url::from_file_path(&main_path).unwrap();
+        let main_text = concat!(
+            "source ./helper_a.zsh\n",
+            "local_func() { : }\n",
+            "echo $A_VAR\n",
+            "source ./after.zsh\n",
+        );
+        let doc = DocumentState::new(main_uri, 1, main_text.to_string());
+
+        let syms = extract_local_symbols(&doc, Position::new(2, 11));
+        let names: Vec<(&str, LocalSymbolKind)> =
+            syms.iter().map(|s| (s.name.as_str(), s.kind)).collect();
+
+        assert!(names.contains(&("local_func", LocalSymbolKind::Function)));
+        assert!(names.contains(&("a_func", LocalSymbolKind::Function)));
+        assert!(names.contains(&("A_VAR", LocalSymbolKind::Variable)));
+        assert!(names.contains(&("a_alias", LocalSymbolKind::Alias)));
+        assert!(names.contains(&("b_func", LocalSymbolKind::Function)));
+        assert!(names.contains(&("B_VAR", LocalSymbolKind::Variable)));
+        assert!(names.contains(&("b_alias", LocalSymbolKind::Alias)));
+        assert!(
+            !names.iter().any(|(n, _)| *n == "after_func"),
+            "Symbols from files sourced after cursor must not be included: {names:?}"
+        );
     }
 }
