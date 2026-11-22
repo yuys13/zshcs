@@ -40,7 +40,7 @@ flowchart TB
         end
 
         ConfigMgr["Config Subsystem (`src/config.rs`)<br/>• Opt-In Schema Parsing<br/>• Experimental Flags"]
-        DocMgr["DocumentManager (`src/document.rs`)<br/>• In-Memory Arc&lt;DashMap&lt;Url, DocumentState&gt;&gt;<br/>• Incremental Sync & UTF-16/UTF-8 Mapping"]
+        DocMgr["DocumentManager (`src/document.rs`)<br/>• In-Memory Arc&lt;DashMap&lt;Url, DocumentState&gt;&gt;<br/>• Incremental Sync & UTF-16/UTF-8 Mapping<br/>• Lazy Version-Invalidated DocumentIndex Cache"]
         Logging["Logging Subsystem (`src/logging.rs`)<br/>• tracing & tracing-subscriber"]
         ErrHandling["Error Hierarchy (`src/error.rs`)<br/>• ZshcsError / ZshcsResult"]
     end
@@ -113,6 +113,10 @@ The `DocumentManager` subsystem maintains accurate in-memory representations of 
   - Safely normalizes LF (`\n`), CRLF (`\r\n`), and mixed line endings without out-of-bounds panics.
 - **Multiline Line-Continuation Prefix Extraction (`get_line_prefix`)**:
   - Joins preceding backslash-continued lines (`\`) up to the cursor position so multiline commands preserve their command context, while ignoring trailing backslashes inside comments (`#`), single-quoted strings (`'...'`), or escaped double backslashes (`\\`).
+- **Lazy, Version-Invalidated `DocumentIndex` Cache (`DocumentState::index`, `DocumentManager::get_index`)**:
+  - Each `DocumentState` holds an `Arc<OnceLock<Arc<DocumentIndex>>>` initialized lazily on first access via `parse_document`.
+  - Successful `apply_changes` resets the cache slot atomically for the new document version, while failed/rolled-back edits preserve the existing cached `DocumentIndex`.
+  - Reused across `documentSymbol`, `goto_definition`, `hover`, `completion` local symbol extraction, and open sourced buffers in `analysis::workspace` to avoid redundant full-document re-parsing on consecutive requests.
 
 ---
 
