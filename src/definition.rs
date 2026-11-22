@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::{GotoDefinitionResponse, Location, Position, Range, Url};
 
 use crate::completion::{
-    MAX_SOURCE_DEPTH, MAX_SOURCED_FILES, extract_sourced_paths_prioritized, resolve_sourced_script,
+    MAX_SOURCE_DEPTH, MAX_SOURCED_FILES, extract_sourced_paths_prioritized,
+    resolve_open_sourced_uri, resolve_sourced_script,
 };
 use crate::document::DocumentManager;
 use crate::symbols::{
@@ -1406,7 +1407,7 @@ pub fn find_definition_with_manager(
     // 1. Check if on `source` or `.` statement line
     if let Some(source_path) = extract_source_path_at_position(text, position)
         && let Some(target_url) = resolve_source_path(&source_path, uri)
-            .or_else(|| resolve_sourced_script(&source_path, uri, doc_manager).map(|(u, _, _)| u))
+            .or_else(|| resolve_open_sourced_uri(&source_path, uri, doc_manager))
     {
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: target_url,
@@ -2351,6 +2352,32 @@ done
                 "./dup.zsh".to_string(),
                 "./after.zsh".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_find_definition_source_line_resolves_unsaved_open_buffer_without_disk_file() {
+        let dir = tempdir().unwrap();
+        let main_path = dir.path().join("main.zsh");
+        let unsaved_path = dir.path().join("unsaved_only.zsh");
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let unsaved_uri = Url::from_file_path(&unsaved_path).unwrap();
+
+        let mgr = DocumentManager::new();
+        mgr.open(unsaved_uri.clone(), 1, "echo 'unsaved'\n".to_string());
+
+        let def = find_definition_with_manager(
+            "source ./unsaved_only.zsh\n",
+            &main_uri,
+            Position::new(0, 10),
+            Some(&mgr),
+        );
+        assert_eq!(
+            def,
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: unsaved_uri,
+                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            }))
         );
     }
 }

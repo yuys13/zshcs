@@ -1053,11 +1053,7 @@ fn read_sourced_file_bounded(path: &Path) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-pub(crate) fn resolve_sourced_script(
-    path_str: &str,
-    base_uri: &Url,
-    doc_manager: Option<&DocumentManager>,
-) -> Option<(Url, Option<Url>, String)> {
+fn expand_and_normalize_source_path(path_str: &str, base_uri: &Url) -> Option<PathBuf> {
     if path_str.is_empty() {
         return None;
     }
@@ -1074,16 +1070,36 @@ pub(crate) fn resolve_sourced_script(
         }
     }
 
-    let raw_path = {
-        let p = Path::new(&expanded_str);
-        if p.is_absolute() {
-            normalize_lexical_path(p)
-        } else {
-            let base_path = base_uri.to_file_path().ok()?;
-            let parent = base_path.parent()?;
-            normalize_lexical_path(&parent.join(p))
-        }
-    };
+    let p = Path::new(&expanded_str);
+    if p.is_absolute() {
+        Some(normalize_lexical_path(p))
+    } else {
+        let base_path = base_uri.to_file_path().ok()?;
+        let parent = base_path.parent()?;
+        Some(normalize_lexical_path(&parent.join(p)))
+    }
+}
+
+pub(crate) fn resolve_open_sourced_uri(
+    path_str: &str,
+    base_uri: &Url,
+    doc_manager: Option<&DocumentManager>,
+) -> Option<Url> {
+    let raw_path = expand_and_normalize_source_path(path_str, base_uri)?;
+    let raw_uri = Url::from_file_path(&raw_path).ok()?;
+    if doc_manager?.get(&raw_uri).is_some() {
+        Some(raw_uri)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn resolve_sourced_script(
+    path_str: &str,
+    base_uri: &Url,
+    doc_manager: Option<&DocumentManager>,
+) -> Option<(Url, Option<Url>, String)> {
+    let raw_path = expand_and_normalize_source_path(path_str, base_uri)?;
     let raw_uri = Url::from_file_path(&raw_path).ok();
     let canon_uri = resolve_source_path(path_str, base_uri);
 
