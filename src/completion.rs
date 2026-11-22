@@ -782,6 +782,8 @@ pub enum LocalSymbolKind {
     Variable,
     /// Shell function (e.g. `my_func() { ... }`, `function my_func { ... }`).
     Function,
+    /// Shell alias (e.g. `alias ll='ls -la'`).
+    Alias,
 }
 
 /// A locally defined symbol extracted from document text up to a given position.
@@ -799,6 +801,7 @@ impl LocalSymbol {
         let detail = match kind {
             LocalSymbolKind::Variable => Some("(local variable)".to_string()),
             LocalSymbolKind::Function => Some("(local function)".to_string()),
+            LocalSymbolKind::Alias => Some("(local alias)".to_string()),
         };
         Self { name, kind, detail }
     }
@@ -875,6 +878,7 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
     let mut pending_function_kw = false;
     let mut pending_for_or_select_kw: Option<usize> = None;
     let mut pending_read_kw = false;
+    let mut pending_alias_kw = false;
 
     for (line_idx, line) in text.lines().enumerate() {
         if line_idx > position.line as usize {
@@ -890,6 +894,7 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
             pending_function_kw = false;
             pending_for_or_select_kw = None;
             pending_read_kw = false;
+            pending_alias_kw = false;
             continue;
         }
 
@@ -899,6 +904,7 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
             pending_function_kw = false;
             pending_for_or_select_kw = None;
             pending_read_kw = false;
+            pending_alias_kw = false;
         }
 
         let is_target_line = line_idx == position.line as usize;
@@ -917,11 +923,13 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
         let mut current_pending_function_kw = std::mem::take(&mut pending_function_kw);
         let mut current_pending_for_or_select_kw = pending_for_or_select_kw.take();
         let mut current_pending_read_kw = std::mem::take(&mut pending_read_kw);
+        let mut current_pending_alias_kw = std::mem::take(&mut pending_alias_kw);
 
         let mut next_pending_decl_kw: Option<&'static str> = None;
         let mut next_pending_function_kw = false;
         let mut next_pending_for_or_select_kw: Option<usize> = None;
         let mut next_pending_read_kw = false;
+        let mut next_pending_alias_kw = false;
 
         let stmts = split_line_statements(line);
         if stmts.is_empty() {
@@ -930,11 +938,13 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
                 pending_function_kw = current_pending_function_kw;
                 pending_for_or_select_kw = current_pending_for_or_select_kw;
                 pending_read_kw = current_pending_read_kw;
+                pending_alias_kw = current_pending_alias_kw;
             } else {
                 pending_decl_kw = None;
                 pending_function_kw = false;
                 pending_for_or_select_kw = None;
                 pending_read_kw = false;
+                pending_alias_kw = false;
             }
             continue;
         }
@@ -964,6 +974,11 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
             } else {
                 false
             };
+            let pending_alias_for_this_stmt = if is_first_stmt {
+                std::mem::take(&mut current_pending_alias_kw)
+            } else {
+                false
+            };
 
             let trimmed = stmt.text.trim_start();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -979,6 +994,9 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
                     }
                     if !next_pending_read_kw {
                         next_pending_read_kw = pending_read_for_this_stmt;
+                    }
+                    if !next_pending_alias_kw {
+                        next_pending_alias_kw = pending_alias_for_this_stmt;
                     }
                 }
                 continue;
@@ -1076,6 +1094,55 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
                         }
                     }
                 }
+            }
+
+            // 1.3 Alias Declarations: `alias ll='ls -la'`, `alias -g G='| grep'`
+            if trimmed.starts_with("alias ")
+                || trimmed.starts_with("alias\t")
+                || trimmed == "alias"
+                || pending_alias_for_this_stmt
+            {
+                if is_last_stmt && has_line_continuation {
+                    next_pending_alias_kw = true;
+                }
+                let (after_alias, alias_offset) =
+                    if trimmed.starts_with("alias ") || trimmed.starts_with("alias\t") {
+                        (&trimmed[5..], stmt_offset + 5)
+                    } else if trimmed == "alias" {
+                        ("", stmt_offset + 5)
+                    } else {
+                        (trimmed, stmt_offset)
+                    };
+
+                for token in split_declaration_tokens(after_alias) {
+                    if token.text.starts_with('-')
+                        || token.text.starts_with('+')
+                        || token.text == "\\"
+                    {
+                        continue;
+                    }
+
+                    if let Some(eq) = token.text.find('=')
+                        && eq > 0
+                    {
+                        let alias_name = token.text[..eq].trim().trim_end_matches('\\').trim();
+                        if !alias_name.is_empty()
+                            && alias_name
+                                .chars()
+                                .all(|c| is_func_ident_char(c) || c == '-')
+                            && !is_reserved_keyword(alias_name)
+                        {
+                            let token_start_in_line = alias_offset + token.byte_offset;
+                            let name_start_byte =
+                                token_start_in_line + token.text.find(alias_name).unwrap_or(0);
+                            let name_end_byte = name_start_byte + alias_name.len();
+                            if is_before_cursor(name_end_byte) {
+                                add_symbol(alias_name, LocalSymbolKind::Alias);
+                            }
+                        }
+                    }
+                }
+                continue;
             }
 
             // 2. Keyword Variable Declarations: `local`, `export`, `typeset`, etc.
@@ -1361,6 +1428,7 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
         pending_function_kw = next_pending_function_kw;
         pending_for_or_select_kw = next_pending_for_or_select_kw;
         pending_read_kw = next_pending_read_kw;
+        pending_alias_kw = next_pending_alias_kw;
     }
 
     symbols
@@ -1670,14 +1738,20 @@ pub fn filter_local_symbols(
             let eligible = !func_prefix.is_empty() || is_command_position(line_prefix);
             if eligible {
                 for sym in local_symbols {
-                    if sym.kind == LocalSymbolKind::Function && sym.name.starts_with(func_prefix) {
+                    if matches!(sym.kind, LocalSymbolKind::Function | LocalSymbolKind::Alias)
+                        && sym.name.starts_with(func_prefix)
+                    {
+                        let default_detail = match sym.kind {
+                            LocalSymbolKind::Alias => "(local alias)",
+                            _ => "(local function)",
+                        };
                         items.push(CompletionItem {
                             label: sym.name.clone(),
                             kind: Some(CompletionItemKind::FUNCTION),
                             detail: sym
                                 .detail
                                 .clone()
-                                .or_else(|| Some("(local function)".to_string())),
+                                .or_else(|| Some(default_detail.to_string())),
                             sort_text: Some(format!("00_{}", sym.name)),
                             ..Default::default()
                         });
@@ -4434,5 +4508,76 @@ local \
         assert_eq!(res_subshell.len(), 1);
         assert_eq!(res_subshell[0].label, "my_calc_func");
         assert_eq!(res_subshell[0].kind, Some(CompletionItemKind::FUNCTION));
+    }
+
+    #[test]
+    fn test_extract_local_symbols_aliases() {
+        let text = concat!(
+            "alias ll='ls -la'\n",
+            "alias -g G='| grep'\n",
+            "alias -s log=less\n",
+            "alias a1='echo 1' a2=\"echo 2\"\n",
+            "alias \\\n",
+            "  cont_alias='pwd'\n",
+            "alias query_only\n",
+            "alias future_alias='true'\n",
+        );
+
+        let syms = extract_local_symbols_from_text(text, Position::new(6, 16));
+        let alias_names: Vec<&str> = syms
+            .iter()
+            .filter(|s| s.kind == LocalSymbolKind::Alias)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            alias_names,
+            vec!["ll", "G", "log", "a1", "a2", "cont_alias"]
+        );
+
+        // Cursor before alias name end on line 0 ("alias ll='ls -la'")
+        let syms_early = extract_local_symbols_from_text(text, Position::new(0, 7));
+        assert!(
+            !syms_early.iter().any(|s| s.name == "ll"),
+            "Alias should not be extracted before cursor passes its name"
+        );
+    }
+
+    #[test]
+    fn test_filter_and_merge_local_aliases() {
+        let syms = vec![
+            LocalSymbol::new("ll", LocalSymbolKind::Alias),
+            LocalSymbol::new("my_func", LocalSymbolKind::Function),
+            LocalSymbol::new("MY_VAR", LocalSymbolKind::Variable),
+        ];
+
+        // 1. CommandOrWord suggests Alias and Function
+        let cmd_items = filter_local_symbols(&syms, "l");
+        assert_eq!(cmd_items.len(), 1);
+        assert_eq!(cmd_items[0].label, "ll");
+        assert_eq!(cmd_items[0].kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(cmd_items[0].detail.as_deref(), Some("(local alias)"));
+
+        // 2. Variable / Arithmetic contexts do NOT suggest Alias
+        assert!(filter_local_symbols(&syms, "echo $l").is_empty());
+        assert!(filter_local_symbols(&syms, "echo $((l").is_empty());
+
+        // 3. merge_local_completions deduplicates against daemon candidates
+        let daemon_items = vec![
+            CompletionItem {
+                label: "ll".to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some("alias for ls -la".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "ls".to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                ..Default::default()
+            },
+        ];
+        let merged = merge_local_completions(daemon_items, &syms, "l");
+        let labels: Vec<&str> = merged.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["ll", "ls"]);
+        assert_eq!(merged[0].detail.as_deref(), Some("(local alias)"));
     }
 }
