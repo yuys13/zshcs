@@ -15,7 +15,7 @@ use crate::completion::{
     merge_local_completions, resolve_completion_item_async, run_completion_daemon,
 };
 use crate::config::Config;
-use crate::definition::find_definition;
+use crate::definition::find_definition_with_manager;
 use crate::diagnostics::check_syntax;
 use crate::document::DocumentManager;
 use crate::error::{ZshcsError, ZshcsResult};
@@ -661,7 +661,13 @@ impl LanguageServer for Backend {
             }
         };
 
-        let response = find_definition(&doc_text, &uri, position);
+        let doc_manager = self.document_manager.clone();
+        let uri_for_task = uri.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            find_definition_with_manager(&doc_text, &uri_for_task, position, Some(&doc_manager))
+        })
+        .await
+        .unwrap_or(None);
         tracing::debug!(
             uri = %uri,
             found = response.is_some(),

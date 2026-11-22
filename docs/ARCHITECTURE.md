@@ -436,6 +436,8 @@ flowchart TD
      - Scans for direct assignments (`VAR=...`, `VAR+=...`) and keyword declarations (`export`, `typeset`, `local`, `declare`, `readonly`, `integer`, `float`).
      - Employs quote- and paren-aware token splitting (`split_declaration_tokens`) to accurately locate variable names even in multi-variable declarations (`local -r A="hello" B=20`) and array declarations (`typeset -a ARR=(1 2 3)`).
      - Applies function-local variable scoping (`resolve_scoped_variable_definitions`): when jumping from inside a function body, prioritizes function-local declarations (`local`, `typeset`, `declare`, `integer`, `float`, `readonly` without `-g`) in the enclosing function over global declarations, and hides `local` declarations scoped to other functions.
+  5. **Cross-File Definition Resolution Across Sourced Scripts (`find_definition_with_manager`)**:
+     - When no definition is found in the active document, recursively scans scripts referenced via `source` or `.` (preferring open buffers in `DocumentManager` and falling back to bounded disk reads of regular files up to 1 MiB, with bounded recursion depth, total file count cap, cycle detection, and exclusion of function-local variables inside sourced files).
 
 ---
 

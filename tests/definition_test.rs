@@ -1239,3 +1239,168 @@ async fn test_definition_alias_and_local_variable_scoping() {
         }))
     );
 }
+
+#[tokio::test]
+async fn test_definition_across_sourced_scripts_and_open_buffers() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let dir = tempdir().unwrap();
+    let helper_path = dir.path().join("helper.zsh");
+    let main_path = dir.path().join("main.zsh");
+    std::fs::write(
+        &helper_path,
+        concat!(
+            "helper_fn() { : }\n",
+            "HELPER_VAR=\"hello\"\n",
+            "alias helper_alias='echo hi'\n",
+        ),
+    )
+    .unwrap();
+
+    let helper_canon_uri = Url::from_file_path(helper_path.canonicalize().unwrap()).unwrap();
+    let helper_uri = Url::from_file_path(&helper_path).unwrap();
+    let main_uri = Url::from_file_path(&main_path).unwrap();
+
+    let initialize_params = InitializeParams {
+        process_id: Some(123),
+        root_uri: None,
+        capabilities: ClientCapabilities::default(),
+        initialization_options: Some(json!({
+            "zshcs": {
+                "experimental": {
+                    "definition": true
+                }
+            }
+        })),
+        ..Default::default()
+    };
+
+    test_client
+        .send_request::<Initialize>(initialize_params)
+        .await
+        .unwrap();
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    let main_text = concat!(
+        "source ./helper.zsh\n",
+        "helper_fn\n",
+        "echo \"$HELPER_VAR\"\n",
+        "helper_alias\n",
+        "unsaved_helper_fn\n",
+    );
+    test_client
+        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: main_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: main_text.to_string(),
+            },
+        })
+        .await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    // 1. Jump to function in sourced helper.zsh on disk
+    let def_fn = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: main_uri.clone(),
+                },
+                position: Position::new(1, 2),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        def_fn,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: helper_canon_uri.clone(),
+            range: Range::new(Position::new(0, 0), Position::new(0, 9)),
+        }))
+    );
+
+    // 2. Jump to variable in sourced helper.zsh on disk
+    let def_var = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: main_uri.clone(),
+                },
+                position: Position::new(2, 10),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        def_var,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: helper_canon_uri.clone(),
+            range: Range::new(Position::new(1, 0), Position::new(1, 10)),
+        }))
+    );
+
+    // 3. Jump to alias in sourced helper.zsh on disk
+    let def_alias = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: main_uri.clone(),
+                },
+                position: Position::new(3, 2),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        def_alias,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: helper_canon_uri.clone(),
+            range: Range::new(Position::new(2, 6), Position::new(2, 18)),
+        }))
+    );
+
+    // 4. Open helper.zsh with an unsaved function and verify DocumentManager buffer is used
+    test_client
+        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: helper_uri,
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: "unsaved_helper_fn() { : }\n".to_string(),
+            },
+        })
+        .await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    let def_unsaved = test_client
+        .send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: main_uri },
+                position: Position::new(4, 2),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        def_unsaved,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: helper_canon_uri,
+            range: Range::new(Position::new(0, 0), Position::new(0, 17)),
+        }))
+    );
+}

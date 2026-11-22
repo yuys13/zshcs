@@ -1,6 +1,12 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::{GotoDefinitionResponse, Location, Position, Range, Url};
 
+use crate::completion::{
+    MAX_SOURCE_DEPTH, MAX_SOURCED_FILES, extract_sourced_paths_prioritized,
+    resolve_open_sourced_uri, resolve_sourced_script,
+};
+use crate::document::DocumentManager;
 use crate::symbols::{
     find_matching_closing_brace, find_opening_brace, is_reserved_keyword, range_contains,
     skip_flags,
@@ -1184,27 +1190,39 @@ fn is_local_var_declaration_at(lines: &[&str], loc: &Location) -> bool {
     false
 }
 
-fn resolve_scoped_variable_definitions(
+fn locations_to_response(locs: Vec<Location>) -> Option<GotoDefinitionResponse> {
+    if locs.is_empty() {
+        None
+    } else if locs.len() == 1 {
+        Some(GotoDefinitionResponse::Scalar(
+            locs.into_iter().next().unwrap(),
+        ))
+    } else {
+        Some(GotoDefinitionResponse::Array(locs))
+    }
+}
+
+fn resolve_visible_variable_definitions(
     text: &str,
     uri: &Url,
     var_name: &str,
-    cursor_pos: Position,
+    cursor_pos: Option<Position>,
 ) -> Vec<Location> {
     let var_locs = scan_variable_definitions(text, uri, var_name);
-    if var_locs.len() <= 1 {
+    if var_locs.is_empty() {
         return var_locs;
     }
 
     let fn_ranges = scan_function_body_ranges(text);
-    let cursor_fn = find_innermost_enclosing_function(&fn_ranges, cursor_pos);
+    let cursor_fn = cursor_pos.and_then(|p| find_innermost_enclosing_function(&fn_ranges, p));
     let lines: Vec<&str> = text.lines().collect();
 
     let classified: Vec<(Location, Option<Range>, bool)> = var_locs
-        .iter()
+        .into_iter()
         .map(|loc| {
             let enc = find_innermost_enclosing_function(&fn_ranges, loc.range.start);
-            let is_local = enc.is_some() && is_local_var_declaration_at(&lines, loc);
-            (loc.clone(), enc, is_local)
+            let is_local = enc.is_some() && is_local_var_declaration_at(&lines, &loc);
+            (loc, enc, is_local)
         })
         .collect();
 
@@ -1224,28 +1242,94 @@ fn resolve_scoped_variable_definitions(
         }
     }
 
-    let visible: Vec<Location> = classified
+    classified
         .into_iter()
         .filter(|(_, enc, is_local)| !(*is_local && *enc != cursor_fn))
         .map(|(loc, _, _)| loc)
-        .collect();
-
-    if visible.is_empty() {
-        var_locs
-    } else {
-        visible
-    }
+        .collect()
 }
 
-fn locations_to_response(locs: Vec<Location>) -> Option<GotoDefinitionResponse> {
-    if locs.is_empty() {
-        None
-    } else if locs.len() == 1 {
-        Some(GotoDefinitionResponse::Scalar(
-            locs.into_iter().next().unwrap(),
-        ))
-    } else {
-        Some(GotoDefinitionResponse::Array(locs))
+struct SourcedDefinitionFinder<'a> {
+    doc_manager: Option<&'a DocumentManager>,
+    visited_uris: HashSet<Url>,
+    files_loaded: usize,
+}
+
+impl<'a> SourcedDefinitionFinder<'a> {
+    fn find_in_sourced(
+        &mut self,
+        source_text: &str,
+        base_uri: &Url,
+        position: Position,
+        target: &DefinitionTarget,
+        depth: usize,
+    ) -> Vec<Location> {
+        if depth >= MAX_SOURCE_DEPTH || self.files_loaded >= MAX_SOURCED_FILES {
+            return Vec::new();
+        }
+
+        let candidate_paths = extract_sourced_paths_prioritized(source_text, position);
+
+        for path_str in candidate_paths {
+            if self.files_loaded >= MAX_SOURCED_FILES {
+                break;
+            }
+
+            let Some((target_uri, alt_uri, content)) =
+                resolve_sourced_script(&path_str, base_uri, self.doc_manager)
+            else {
+                continue;
+            };
+
+            let already_visited = self.visited_uris.contains(&target_uri)
+                || alt_uri
+                    .as_ref()
+                    .is_some_and(|u| self.visited_uris.contains(u));
+            if already_visited {
+                continue;
+            }
+
+            self.visited_uris.insert(target_uri.clone());
+            if let Some(alt) = alt_uri {
+                self.visited_uris.insert(alt);
+            }
+            self.files_loaded += 1;
+
+            let direct_locs = match target {
+                DefinitionTarget::Variable(var_name) => {
+                    resolve_visible_variable_definitions(&content, &target_uri, var_name, None)
+                }
+                DefinitionTarget::FunctionOrVariable(ident) => {
+                    let fn_locs = scan_function_definitions(&content, &target_uri, ident);
+                    if !fn_locs.is_empty() {
+                        fn_locs
+                    } else {
+                        let alias_locs = scan_alias_definitions(&content, &target_uri, ident);
+                        if !alias_locs.is_empty() {
+                            alias_locs
+                        } else {
+                            resolve_visible_variable_definitions(&content, &target_uri, ident, None)
+                        }
+                    }
+                }
+            };
+            if !direct_locs.is_empty() {
+                return direct_locs;
+            }
+
+            let nested_locs = self.find_in_sourced(
+                &content,
+                &target_uri,
+                Position::new(u32::MAX, u32::MAX),
+                target,
+                depth + 1,
+            );
+            if !nested_locs.is_empty() {
+                return nested_locs;
+            }
+        }
+
+        Vec::new()
     }
 }
 
@@ -1255,9 +1339,22 @@ pub fn find_definition(
     uri: &Url,
     position: Position,
 ) -> Option<GotoDefinitionResponse> {
+    find_definition_with_manager(text, uri, position, None)
+}
+
+/// Resolves the definition location(s) for the token at `position` within `text`,
+/// searching sourced scripts (`source` / `.`) using open buffers in `doc_manager`
+/// or bounded disk reads when no definition is found in the current document.
+pub fn find_definition_with_manager(
+    text: &str,
+    uri: &Url,
+    position: Position,
+    doc_manager: Option<&DocumentManager>,
+) -> Option<GotoDefinitionResponse> {
     // 1. Check if on `source` or `.` statement line
     if let Some(source_path) = extract_source_path_at_position(text, position)
         && let Some(target_url) = resolve_source_path(&source_path, uri)
+            .or_else(|| resolve_open_sourced_uri(&source_path, uri, doc_manager))
     {
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: target_url,
@@ -1268,29 +1365,50 @@ pub fn find_definition(
     // 2. Extract word and target under cursor
     let (target, _) = extract_word_and_target_at_position(text, position)?;
 
-    match target {
-        DefinitionTarget::Variable(var_name) => locations_to_response(
-            resolve_scoped_variable_definitions(text, uri, &var_name, position),
-        ),
-        DefinitionTarget::FunctionOrVariable(ident) => {
-            // 1. Search for function definitions
-            let fn_locs = scan_function_definitions(text, uri, &ident);
-            if !fn_locs.is_empty() {
-                return locations_to_response(fn_locs);
-            }
-
-            // 2. Search for alias definitions
-            let alias_locs = scan_alias_definitions(text, uri, &ident);
-            if !alias_locs.is_empty() {
-                return locations_to_response(alias_locs);
-            }
-
-            // 3. Fallback to scoped variable definitions
-            locations_to_response(resolve_scoped_variable_definitions(
-                text, uri, &ident, position,
-            ))
+    // 3. Search within the current document first
+    let current_locs = match &target {
+        DefinitionTarget::Variable(var_name) => {
+            resolve_visible_variable_definitions(text, uri, var_name, Some(position))
         }
+        DefinitionTarget::FunctionOrVariable(ident) => {
+            let fn_locs = scan_function_definitions(text, uri, ident);
+            if !fn_locs.is_empty() {
+                fn_locs
+            } else {
+                let alias_locs = scan_alias_definitions(text, uri, ident);
+                if !alias_locs.is_empty() {
+                    alias_locs
+                } else {
+                    resolve_visible_variable_definitions(text, uri, ident, Some(position))
+                }
+            }
+        }
+    };
+    if !current_locs.is_empty() {
+        return locations_to_response(current_locs);
     }
+
+    // 4. Search across sourced scripts
+    let mut visited_uris = HashSet::new();
+    visited_uris.insert(uri.clone());
+    if let Ok(path) = uri.to_file_path()
+        && let Ok(canon) = path.canonicalize()
+        && let Ok(canon_uri) = Url::from_file_path(canon)
+    {
+        visited_uris.insert(canon_uri);
+    }
+
+    let mut finder = SourcedDefinitionFinder {
+        doc_manager,
+        visited_uris,
+        files_loaded: 0,
+    };
+    let sourced_locs = finder.find_in_sourced(text, uri, position, &target, 0);
+    if !sourced_locs.is_empty() {
+        return locations_to_response(sourced_locs);
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -2045,17 +2163,18 @@ done
             "TARGET=\"global\"\n",
             "fn_a() {\n",
             "  local TARGET=\"local_a\"\n",
-            "  echo \"$TARGET\"\n",
+            "  local ONLY_IN_A=\"secret\"\n",
+            "  echo \"$TARGET\" \"$ONLY_IN_A\"\n",
             "}\n",
             "fn_b() {\n",
             "  typeset TARGET=\"local_b\"\n",
-            "  echo \"$TARGET\"\n",
+            "  echo \"$TARGET\" \"$ONLY_IN_A\"\n",
             "}\n",
-            "echo \"$TARGET\"\n",
+            "echo \"$TARGET\" \"$ONLY_IN_A\"\n",
         );
 
         // Inside fn_a: jumps only to fn_a's `local TARGET` on line 2
-        let def_in_a = find_definition(text, &uri, Position::new(3, 10));
+        let def_in_a = find_definition(text, &uri, Position::new(4, 10));
         assert_eq!(
             def_in_a,
             Some(GotoDefinitionResponse::Scalar(Location {
@@ -2064,23 +2183,156 @@ done
             }))
         );
 
-        // Inside fn_b: jumps only to fn_b's `typeset TARGET` on line 6
-        let def_in_b = find_definition(text, &uri, Position::new(7, 10));
+        // Inside fn_a: jumps to fn_a's `local ONLY_IN_A` on line 3
+        let def_only_a = find_definition(text, &uri, Position::new(4, 20));
+        assert_eq!(
+            def_only_a,
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: Range::new(Position::new(3, 8), Position::new(3, 17)),
+            }))
+        );
+
+        // Inside fn_b: jumps only to fn_b's `typeset TARGET` on line 7
+        let def_in_b = find_definition(text, &uri, Position::new(8, 10));
         assert_eq!(
             def_in_b,
             Some(GotoDefinitionResponse::Scalar(Location {
                 uri: uri.clone(),
-                range: Range::new(Position::new(6, 10), Position::new(6, 16)),
+                range: Range::new(Position::new(7, 10), Position::new(7, 16)),
             }))
         );
 
+        // Inside fn_b and at top-level: ONLY_IN_A is not visible
+        assert_eq!(find_definition(text, &uri, Position::new(8, 20)), None);
+        assert_eq!(find_definition(text, &uri, Position::new(10, 18)), None);
+
         // At top-level: jumps only to global `TARGET` on line 0
-        let def_global = find_definition(text, &uri, Position::new(9, 8));
+        let def_global = find_definition(text, &uri, Position::new(10, 8));
         assert_eq!(
             def_global,
             Some(GotoDefinitionResponse::Scalar(Location {
                 uri,
                 range: Range::new(Position::new(0, 0), Position::new(0, 6)),
+            }))
+        );
+    }
+
+    #[test]
+    fn test_find_definition_across_sourced_files_with_cycles_and_scoping() {
+        let dir = tempdir().unwrap();
+        let a_path = dir.path().join("helper_a.zsh");
+        let b_path = dir.path().join("helper_b.zsh");
+        let main_path = dir.path().join("main.zsh");
+
+        std::fs::write(
+            &a_path,
+            concat!(
+                "source ./helper_b.zsh\n",
+                "a_func() {\n",
+                "  local PRIVATE_IN_A=\"secret\"\n",
+                "}\n",
+                "export A_VAR=\"val\"\n",
+                "alias a_alias='echo a'\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &b_path,
+            concat!(". \"./helper_a.zsh\"\n", "function b_func { : }\n"),
+        )
+        .unwrap();
+
+        let a_uri = Url::from_file_path(a_path.canonicalize().unwrap()).unwrap();
+        let b_uri = Url::from_file_path(b_path.canonicalize().unwrap()).unwrap();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let main_text = concat!(
+            "source ./helper_a.zsh\n",
+            "a_func\n",
+            "echo \"$A_VAR\"\n",
+            "a_alias\n",
+            "b_func\n",
+            "echo \"$PRIVATE_IN_A\"\n",
+        );
+
+        assert_eq!(
+            find_definition(main_text, &main_uri, Position::new(1, 2)),
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: a_uri.clone(),
+                range: Range::new(Position::new(1, 0), Position::new(1, 6)),
+            }))
+        );
+        assert_eq!(
+            find_definition(main_text, &main_uri, Position::new(2, 9)),
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: a_uri.clone(),
+                range: Range::new(Position::new(4, 7), Position::new(4, 12)),
+            }))
+        );
+        assert_eq!(
+            find_definition(main_text, &main_uri, Position::new(3, 2)),
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: a_uri,
+                range: Range::new(Position::new(5, 6), Position::new(5, 13)),
+            }))
+        );
+        assert_eq!(
+            find_definition(main_text, &main_uri, Position::new(4, 2)),
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: b_uri,
+                range: Range::new(Position::new(1, 9), Position::new(1, 15)),
+            }))
+        );
+        assert_eq!(
+            find_definition(main_text, &main_uri, Position::new(5, 10)),
+            None,
+            "Function-local variable inside sourced script must not be resolved cross-file"
+        );
+    }
+
+    #[test]
+    fn test_extract_sourced_paths_prioritized_single_pass_dedup() {
+        let text = concat!(
+            "source ./first.zsh\n",
+            "source ./dup.zsh\n",
+            "echo $FOO\n",
+            "source ./dup.zsh\n",
+            "source ./after.zsh\n",
+            "source ./first.zsh\n",
+        );
+        let paths = extract_sourced_paths_prioritized(text, Position::new(2, 5));
+        assert_eq!(
+            paths,
+            vec![
+                "./first.zsh".to_string(),
+                "./dup.zsh".to_string(),
+                "./after.zsh".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_definition_source_line_resolves_unsaved_open_buffer_without_disk_file() {
+        let dir = tempdir().unwrap();
+        let main_path = dir.path().join("main.zsh");
+        let unsaved_path = dir.path().join("unsaved_only.zsh");
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let unsaved_uri = Url::from_file_path(&unsaved_path).unwrap();
+
+        let mgr = DocumentManager::new();
+        mgr.open(unsaved_uri.clone(), 1, "echo 'unsaved'\n".to_string());
+
+        let def = find_definition_with_manager(
+            "source ./unsaved_only.zsh\n",
+            &main_uri,
+            Position::new(0, 10),
+            Some(&mgr),
+        );
+        assert_eq!(
+            def,
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: unsaved_uri,
+                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
             }))
         );
     }
