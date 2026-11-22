@@ -16,13 +16,13 @@ use crate::error::{ZshcsError, ZshcsResult};
 use crate::lsp::completion::{
     extract_local_symbols_with_manager, merge_local_completions, resolve_completion_item_async,
 };
-use crate::lsp::definition::find_definition_with_manager;
+use crate::lsp::definition::find_definition_with_index;
 use crate::lsp::diagnostics::check_syntax;
 use crate::lsp::hover::{
     extract_word_at_position, get_builtin_or_reserved_doc, get_hover_info_cached,
-    get_local_symbol_hover_doc_at_with_manager, is_variable_reference_at,
+    get_local_symbol_hover_doc_with_index, is_variable_reference_at,
 };
-use crate::lsp::symbols::extract_document_symbols;
+use crate::lsp::symbols::extract_document_symbols_from_index;
 use crate::runtime::daemon::{CAPTURE_ZSH, CompletionRequest, ZPTYRC_ZSH, run_completion_daemon};
 use crate::runtime::man::ManCache;
 
@@ -561,15 +561,16 @@ impl LanguageServer for Backend {
             "Hover request received"
         );
 
-        let doc_text = match self.document_manager.get_content(&uri) {
-            Some(t) => t,
+        let doc = match self.document_manager.get(&uri) {
+            Some(d) => d.clone(),
             None => {
                 tracing::debug!(uri = %uri, "Document not found in document_manager for hover");
                 return Ok(None);
             }
         };
+        let doc_text = doc.text();
 
-        let (word, range) = match extract_word_at_position(&doc_text, position) {
+        let (word, range) = match extract_word_at_position(doc_text, position) {
             Some((w, r)) => (w, r),
             None => {
                 tracing::debug!(
@@ -588,7 +589,7 @@ impl LanguageServer for Backend {
             "Extracted word for hover; querying hover info"
         );
 
-        let is_var_ref = is_variable_reference_at(&doc_text, range);
+        let is_var_ref = is_variable_reference_at(doc_text, range);
         let basename = word
             .rfind('/')
             .map(|idx| &word[idx + 1..])
@@ -597,13 +598,14 @@ impl LanguageServer for Backend {
             || basename.and_then(get_builtin_or_reserved_doc).is_some();
 
         if is_var_ref || !is_builtin_or_reserved {
-            let doc_text_owned = doc_text.clone();
             let word_owned = word.to_string();
             let uri_owned = uri.clone();
             let doc_manager = self.document_manager.clone();
+            let doc_for_task = doc.clone();
             let local_doc = tokio::task::spawn_blocking(move || {
-                get_local_symbol_hover_doc_at_with_manager(
-                    &doc_text_owned,
+                let index = doc_for_task.index();
+                get_local_symbol_hover_doc_with_index(
+                    &index,
                     &uri_owned,
                     &word_owned,
                     position,
@@ -656,8 +658,8 @@ impl LanguageServer for Backend {
             "Goto definition request received"
         );
 
-        let doc_text = match self.document_manager.get_content(&uri) {
-            Some(t) => t,
+        let doc = match self.document_manager.get(&uri) {
+            Some(d) => d.clone(),
             None => {
                 tracing::debug!(
                     uri = %uri,
@@ -670,7 +672,14 @@ impl LanguageServer for Backend {
         let doc_manager = self.document_manager.clone();
         let uri_for_task = uri.clone();
         let response = tokio::task::spawn_blocking(move || {
-            find_definition_with_manager(&doc_text, &uri_for_task, position, Some(&doc_manager))
+            let index = doc.index();
+            find_definition_with_index(
+                doc.text(),
+                &index,
+                &uri_for_task,
+                position,
+                Some(&doc_manager),
+            )
         })
         .await
         .unwrap_or(None);
@@ -694,8 +703,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         tracing::debug!(uri = %uri, "Document symbol request received");
 
-        let doc_text = match self.document_manager.get_content(&uri) {
-            Some(t) => t,
+        let index = match self.document_manager.get_index(&uri) {
+            Some(idx) => idx,
             None => {
                 tracing::debug!(
                     uri = %uri,
@@ -705,7 +714,7 @@ impl LanguageServer for Backend {
             }
         };
 
-        let symbols = extract_document_symbols(&doc_text, &uri);
+        let symbols = extract_document_symbols_from_index(&index);
         tracing::debug!(
             uri = %uri,
             count = symbols.len(),

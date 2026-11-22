@@ -166,9 +166,19 @@ pub fn find_definition_with_manager(
     doc_manager: Option<&DocumentManager>,
 ) -> Option<GotoDefinitionResponse> {
     let index = parse_document(text);
+    find_definition_with_index(text, &index, uri, position, doc_manager)
+}
 
+/// Resolves the definition location(s) for the token at `position` using a pre-parsed `DocumentIndex`.
+pub fn find_definition_with_index(
+    text: &str,
+    index: &DocumentIndex,
+    uri: &Url,
+    position: Position,
+    doc_manager: Option<&DocumentManager>,
+) -> Option<GotoDefinitionResponse> {
     // 1. Check if on `source` or `.` statement line
-    let cursor_target = extract_cursor_target(text, &index, position)?;
+    let cursor_target = extract_cursor_target(text, index, position)?;
     let target = match cursor_target {
         CursorTarget::SourcePath { path, .. } => {
             if let Some(target_url) = resolve_source_path(&path, uri)
@@ -186,13 +196,13 @@ pub fn find_definition_with_manager(
     };
 
     // 2. Search within the current document first
-    let current_locs = resolve_target_in_index(&index, uri, &target, Some(position));
+    let current_locs = resolve_target_in_index(index, uri, &target, Some(position));
     if !current_locs.is_empty() {
         return locations_to_response(current_locs);
     }
 
     // 3. Search across sourced scripts
-    for sourced in collect_sourced_documents(&index, uri, position, doc_manager, true) {
+    for sourced in collect_sourced_documents(index, uri, position, doc_manager, true) {
         let sourced_locs = resolve_target_in_index(&sourced.index, &sourced.uri, &target, None);
         if !sourced_locs.is_empty() {
             return locations_to_response(sourced_locs);

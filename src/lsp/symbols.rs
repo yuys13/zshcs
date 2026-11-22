@@ -1,5 +1,6 @@
 use tower_lsp::lsp_types::{DocumentSymbol, SymbolKind, Url};
 
+use crate::analysis::model::DocumentIndex;
 use crate::analysis::parser::parse_document;
 use crate::analysis::syntax::range_contains;
 
@@ -55,15 +56,14 @@ fn build_symbol_tree(mut symbols: Vec<DocumentSymbol>) -> Vec<DocumentSymbol> {
     root
 }
 
-/// Extracts document symbols (functions, variables, aliases) in a hierarchical tree.
-pub fn extract_document_symbols(text: &str, _uri: &Url) -> Vec<DocumentSymbol> {
-    let index = parse_document(text);
+/// Extracts document symbols (functions, variables, aliases) from a pre-parsed `DocumentIndex`.
+pub fn extract_document_symbols_from_index(index: &DocumentIndex) -> Vec<DocumentSymbol> {
     let mut raw_symbols =
         Vec::with_capacity(index.functions.len() + index.aliases.len() + index.variables.len());
 
-    for func in index.functions {
+    for func in &index.functions {
         raw_symbols.push(DocumentSymbol {
-            name: func.name,
+            name: func.name.clone(),
             detail: Some("()".to_string()),
             kind: SymbolKind::FUNCTION,
             tags: None,
@@ -75,10 +75,13 @@ pub fn extract_document_symbols(text: &str, _uri: &Url) -> Vec<DocumentSymbol> {
         });
     }
 
-    for alias in index.aliases {
+    for alias in &index.aliases {
         raw_symbols.push(DocumentSymbol {
-            name: alias.name,
-            detail: alias.expansion.or_else(|| Some("alias".to_string())),
+            name: alias.name.clone(),
+            detail: alias
+                .expansion
+                .clone()
+                .or_else(|| Some("alias".to_string())),
             kind: SymbolKind::OPERATOR,
             tags: None,
             #[allow(deprecated)]
@@ -89,9 +92,9 @@ pub fn extract_document_symbols(text: &str, _uri: &Url) -> Vec<DocumentSymbol> {
         });
     }
 
-    for var in index.variables {
+    for var in &index.variables {
         raw_symbols.push(DocumentSymbol {
-            name: var.name,
+            name: var.name.clone(),
             detail: var.kind.symbol_detail(),
             kind: SymbolKind::VARIABLE,
             tags: None,
@@ -104,6 +107,12 @@ pub fn extract_document_symbols(text: &str, _uri: &Url) -> Vec<DocumentSymbol> {
     }
 
     build_symbol_tree(raw_symbols)
+}
+
+/// Extracts document symbols (functions, variables, aliases) in a hierarchical tree.
+pub fn extract_document_symbols(text: &str, _uri: &Url) -> Vec<DocumentSymbol> {
+    let index = parse_document(text);
+    extract_document_symbols_from_index(&index)
 }
 
 #[cfg(test)]

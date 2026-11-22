@@ -376,7 +376,7 @@ pub fn extract_local_symbols_with_manager(
     position: Position,
     doc_manager: Option<&DocumentManager>,
 ) -> Vec<LocalSymbol> {
-    let index = parse_document(doc.text());
+    let index = doc.index();
     let mut symbols: Vec<LocalSymbol> = visible_symbols_at(&index, position)
         .into_iter()
         .map(|s| LocalSymbol::new(s.name, s.kind.into()))
