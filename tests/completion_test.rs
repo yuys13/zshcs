@@ -9,7 +9,7 @@ use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, Documentation, MarkupKind, Position,
     Range, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
-    notification::{DidChangeTextDocument, LogMessage},
+    notification::{DidChangeTextDocument, DidOpenTextDocument, LogMessage},
     request,
 };
 use zshcs::Backend;
@@ -3050,4 +3050,128 @@ done
         .expect("Expected 'my_custom_alias' in completion items");
     assert_eq!(alias_item.kind, Some(CompletionItemKind::FUNCTION));
     assert_eq!(alias_item.detail.as_deref(), Some("(local alias)"));
+}
+
+#[tokio::test]
+async fn test_completion_includes_symbols_from_sourced_script() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    if [[ $line == input:* ]]; then
+        printf "other_external\texternal command\n\x01EOC\x01\n"
+    fi
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let helper_path = dir.path().join("helper.zsh");
+    std::fs::write(
+        &helper_path,
+        concat!(
+            "sourced_helper_func() { : }\n",
+            "SOURCED_HELPER_VAR=42\n",
+            "alias sourced_helper_alias='echo hi'\n",
+        ),
+    )
+    .unwrap();
+
+    let main_path = dir.path().join("main.zsh");
+    let main_uri = Url::from_file_path(&main_path).unwrap();
+    let helper_uri = Url::from_file_path(&helper_path).unwrap();
+    let main_text = "source ./helper.zsh\nsourced_\necho $SOURCED_";
+    test_client.init_and_open(&main_uri, main_text).await;
+
+    // 1. Function & alias from sourced helper.zsh on disk
+    let res_cmd = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: main_uri.clone(),
+                },
+                position: Position::new(1, 8),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .expect("Expected completion response");
+
+    let cmd_items = get_completion_items(res_cmd);
+    assert!(
+        cmd_items
+            .iter()
+            .any(|i| i.label == "sourced_helper_func"
+                && i.detail.as_deref() == Some("(local function)")),
+        "Expected sourced_helper_func in {cmd_items:?}"
+    );
+    assert!(
+        cmd_items
+            .iter()
+            .any(|i| i.label == "sourced_helper_alias"
+                && i.detail.as_deref() == Some("(local alias)")),
+        "Expected sourced_helper_alias in {cmd_items:?}"
+    );
+
+    // 2. Variable from sourced helper.zsh on disk
+    let res_var = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: main_uri.clone(),
+                },
+                position: Position::new(2, 14),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .expect("Expected completion response");
+
+    let var_items = get_completion_items(res_var);
+    assert!(
+        var_items
+            .iter()
+            .any(|i| i.label == "SOURCED_HELPER_VAR"
+                && i.detail.as_deref() == Some("(local variable)")),
+        "Expected SOURCED_HELPER_VAR in {var_items:?}"
+    );
+
+    // 3. Open helper.zsh with an unsaved function and verify DocumentManager buffer is used
+    test_client
+        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: helper_uri,
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: "sourced_unsaved_func() { : }\n".to_string(),
+            },
+        })
+        .await;
+
+    let res_unsaved = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: main_uri },
+                position: Position::new(1, 8),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .expect("Expected completion response");
+
+    let unsaved_items = get_completion_items(res_unsaved);
+    assert!(
+        unsaved_items
+            .iter()
+            .any(|i| i.label == "sourced_unsaved_func"),
+        "Expected sourced_unsaved_func from open DocumentManager buffer in {unsaved_items:?}"
+    );
 }
