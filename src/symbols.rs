@@ -1,10 +1,7 @@
-use tower_lsp::lsp_types::{DocumentSymbol, Position, Range, SymbolKind, Url};
+use tower_lsp::lsp_types::{DocumentSymbol, SymbolKind, Url};
 
-use crate::analysis::syntax::{
-    byte_to_utf16_col, detect_heredoc_delimiter, find_matching_closing_brace, find_opening_brace,
-    is_func_ident_char, is_reserved_keyword, is_var_ident_char, range_contains, skip_flags,
-    split_declaration_tokens, split_line_statements,
-};
+use crate::analysis::parser::parse_document;
+use crate::analysis::syntax::range_contains;
 
 /// Builds a hierarchical `DocumentSymbol` tree from a flat list of extracted symbols.
 fn build_symbol_tree(mut symbols: Vec<DocumentSymbol>) -> Vec<DocumentSymbol> {
@@ -60,374 +57,50 @@ fn build_symbol_tree(mut symbols: Vec<DocumentSymbol>) -> Vec<DocumentSymbol> {
 
 /// Extracts document symbols (functions, variables, aliases) in a hierarchical tree.
 pub fn extract_document_symbols(text: &str, _uri: &Url) -> Vec<DocumentSymbol> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut raw_symbols = Vec::new();
+    let index = parse_document(text);
+    let mut raw_symbols =
+        Vec::with_capacity(index.functions.len() + index.aliases.len() + index.variables.len());
 
-    let decl_keywords = [
-        "export", "typeset", "local", "declare", "readonly", "integer", "float",
-    ];
-    let mut heredoc_delimiter: Option<String> = None;
+    for func in index.functions {
+        raw_symbols.push(DocumentSymbol {
+            name: func.name,
+            detail: Some("()".to_string()),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            #[allow(deprecated)]
+            deprecated: None,
+            range: func.full_range,
+            selection_range: func.name_range,
+            children: None,
+        });
+    }
 
-    for (line_idx, line) in lines.iter().enumerate() {
-        if let Some(ref delim) = heredoc_delimiter {
-            if line.trim_start_matches('\t').trim_end() == delim {
-                heredoc_delimiter = None;
-            }
-            continue;
-        }
-        if let Some(delim) = detect_heredoc_delimiter(line) {
-            heredoc_delimiter = Some(delim);
-        }
+    for alias in index.aliases {
+        raw_symbols.push(DocumentSymbol {
+            name: alias.name,
+            detail: alias.expansion.or_else(|| Some("alias".to_string())),
+            kind: SymbolKind::OPERATOR,
+            tags: None,
+            #[allow(deprecated)]
+            deprecated: None,
+            range: alias.full_range,
+            selection_range: alias.name_range,
+            children: None,
+        });
+    }
 
-        for stmt in split_line_statements(line) {
-            let trimmed = stmt.text.trim_start();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-
-            let stmt_indent = stmt.text.len() - trimmed.len();
-            let stmt_offset = stmt.start_byte + stmt_indent;
-
-            // 1. Check for Shell Functions
-            let mut detected_function: Option<(String, Range, Range)> = None;
-
-            // 1.1 Keyword style: `function func ...` or `function func() ...`
-            if trimmed.starts_with("function ")
-                || trimmed.starts_with("function\t")
-                || trimmed == "function"
-            {
-                let after_kw = if trimmed.len() > 8 { &trimmed[8..] } else { "" };
-                let after_kw_trimmed = after_kw.trim_start();
-                let kw_spaces = after_kw.len() - after_kw_trimmed.len();
-                let rest = skip_flags(after_kw_trimmed);
-                let flag_len = after_kw_trimmed.len() - rest.len();
-
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| is_func_ident_char(*c) && *c != '(' && *c != '{')
-                    .collect();
-
-                if !name.is_empty() && !is_reserved_keyword(&name) {
-                    let after_name = &rest[name.len()..].trim_start();
-                    let after_parens = if let Some(stripped) = after_name.strip_prefix("()") {
-                        stripped.trim_start()
-                    } else if after_name.starts_with('(')
-                        && let Some(close) = after_name.find(')')
-                    {
-                        after_name[close + 1..].trim_start()
-                    } else {
-                        after_name
-                    };
-
-                    if after_parens.is_empty()
-                        || after_parens.starts_with('{')
-                        || after_parens.starts_with(';')
-                        || after_parens.starts_with('#')
-                    {
-                        let name_start_byte = stmt_offset + 8 + kw_spaces + flag_len;
-                        let name_end_byte = name_start_byte + name.len();
-                        let sel_start_u16 = byte_to_utf16_col(line, name_start_byte);
-                        let sel_end_u16 = byte_to_utf16_col(line, name_end_byte);
-                        let sel_range = Range::new(
-                            Position::new(line_idx as u32, sel_start_u16),
-                            Position::new(line_idx as u32, sel_end_u16),
-                        );
-
-                        // Find opening brace and matching closing brace
-                        let func_start_u16 = byte_to_utf16_col(line, stmt_offset);
-                        let search_start_byte = name_end_byte;
-                        let (end_line, end_u16) = if let Some((open_line, open_byte)) =
-                            find_opening_brace(&lines, line_idx, search_start_byte)
-                        {
-                            find_matching_closing_brace(&lines, open_line, open_byte)
-                        } else {
-                            (
-                                line_idx,
-                                byte_to_utf16_col(line, stmt.start_byte + stmt.text.len()),
-                            )
-                        };
-
-                        let full_range = Range::new(
-                            Position::new(line_idx as u32, func_start_u16),
-                            Position::new(end_line as u32, end_u16),
-                        );
-
-                        detected_function = Some((name, full_range, sel_range));
-                    }
-                }
-            }
-
-            // 1.2 POSIX style: `func() { ... }` or `func () { ... }`
-            if detected_function.is_none()
-                && let Some(open_paren_idx) = trimmed.find('(')
-            {
-                let name_part = trimmed[..open_paren_idx].trim_end();
-                if !name_part.is_empty()
-                    && !name_part.starts_with('#')
-                    && !name_part.chars().next().unwrap().is_ascii_digit()
-                    && name_part.chars().all(is_func_ident_char)
-                    && !is_reserved_keyword(name_part)
-                {
-                    let after_open = trimmed[open_paren_idx + 1..].trim_start();
-                    if let Some(stripped_close) = after_open.strip_prefix(')') {
-                        let after_parens = stripped_close.trim_start();
-                        if after_parens.is_empty()
-                            || after_parens.starts_with('{')
-                            || after_parens.starts_with(';')
-                            || after_parens.starts_with('#')
-                        {
-                            let name_start_byte =
-                                stmt_offset + trimmed.find(name_part).unwrap_or(0);
-                            let name_end_byte = name_start_byte + name_part.len();
-                            let sel_start_u16 = byte_to_utf16_col(line, name_start_byte);
-                            let sel_end_u16 = byte_to_utf16_col(line, name_end_byte);
-                            let sel_range = Range::new(
-                                Position::new(line_idx as u32, sel_start_u16),
-                                Position::new(line_idx as u32, sel_end_u16),
-                            );
-
-                            let func_start_u16 = byte_to_utf16_col(line, stmt_offset);
-                            let search_start_byte = name_end_byte;
-                            let (end_line, end_u16) = if let Some((open_line, open_byte)) =
-                                find_opening_brace(&lines, line_idx, search_start_byte)
-                            {
-                                find_matching_closing_brace(&lines, open_line, open_byte)
-                            } else {
-                                (
-                                    line_idx,
-                                    byte_to_utf16_col(line, stmt.start_byte + stmt.text.len()),
-                                )
-                            };
-
-                            let full_range = Range::new(
-                                Position::new(line_idx as u32, func_start_u16),
-                                Position::new(end_line as u32, end_u16),
-                            );
-
-                            detected_function =
-                                Some((name_part.to_string(), full_range, sel_range));
-                        }
-                    }
-                }
-            }
-
-            if let Some((name, range, selection_range)) = detected_function {
-                raw_symbols.push(DocumentSymbol {
-                    name,
-                    detail: Some("()".to_string()),
-                    kind: SymbolKind::FUNCTION,
-                    tags: None,
-                    #[allow(deprecated)]
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: None,
-                });
-                continue;
-            }
-
-            // 2. Check for Alias Declarations: `alias ...`
-            if trimmed.starts_with("alias ") || trimmed.starts_with("alias\t") || trimmed == "alias"
-            {
-                let after_alias = if trimmed.len() > 5 { &trimmed[5..] } else { "" };
-                let alias_offset = stmt_offset + 5;
-
-                for token in split_declaration_tokens(after_alias) {
-                    if token.text.starts_with('-') || token.text.starts_with('+') {
-                        continue;
-                    }
-
-                    let token_str = token.text;
-                    let token_start_in_line = alias_offset + token.byte_offset;
-                    let (name_raw, val_opt) = if let Some(eq) = token_str.find('=') {
-                        (&token_str[..eq], Some(&token_str[eq + 1..]))
-                    } else {
-                        (token_str, None)
-                    };
-
-                    let alias_name = name_raw.trim();
-                    if !alias_name.is_empty()
-                        && alias_name
-                            .chars()
-                            .all(|c| is_func_ident_char(c) || c == '-')
-                        && !is_reserved_keyword(alias_name)
-                    {
-                        let name_start_byte =
-                            token_start_in_line + token_str.find(alias_name).unwrap_or(0);
-                        let name_end_byte = name_start_byte + alias_name.len();
-                        let sel_start_u16 = byte_to_utf16_col(line, name_start_byte);
-                        let sel_end_u16 = byte_to_utf16_col(line, name_end_byte);
-                        let selection_range = Range::new(
-                            Position::new(line_idx as u32, sel_start_u16),
-                            Position::new(line_idx as u32, sel_end_u16),
-                        );
-
-                        let tok_start_u16 = byte_to_utf16_col(line, token_start_in_line);
-                        let tok_end_u16 =
-                            byte_to_utf16_col(line, token_start_in_line + token_str.len());
-                        let range = Range::new(
-                            Position::new(line_idx as u32, tok_start_u16),
-                            Position::new(line_idx as u32, tok_end_u16),
-                        );
-
-                        let detail = val_opt
-                            .map(|v| v.trim_matches('\'').trim_matches('"').to_string())
-                            .or_else(|| Some("alias".to_string()));
-
-                        raw_symbols.push(DocumentSymbol {
-                            name: alias_name.to_string(),
-                            detail,
-                            kind: SymbolKind::OPERATOR,
-                            tags: None,
-                            #[allow(deprecated)]
-                            deprecated: None,
-                            range,
-                            selection_range,
-                            children: None,
-                        });
-                    }
-                }
-                continue;
-            }
-
-            // 3. Check for Keyword Variable Declarations: `local`, `export`, `typeset`, etc.
-            let mut matched_decl_kw = false;
-            for kw in decl_keywords {
-                if trimmed.starts_with(kw)
-                    && (trimmed[kw.len()..].starts_with(' ')
-                        || trimmed[kw.len()..].starts_with('\t')
-                        || trimmed.len() == kw.len())
-                {
-                    matched_decl_kw = true;
-                    let after_kw = &trimmed[kw.len()..];
-                    let kw_offset = stmt_offset + kw.len();
-
-                    for token in split_declaration_tokens(after_kw) {
-                        if token.text.starts_with('-') || token.text.starts_with('+') {
-                            continue;
-                        }
-
-                        let token_str = token.text;
-                        let token_start_in_line = kw_offset + token.byte_offset;
-
-                        let var_name_raw = if let Some(eq) = token_str.find('=') {
-                            let before_eq = &token_str[..eq];
-                            if let Some(stripped) = before_eq.strip_suffix('+') {
-                                stripped
-                            } else if let Some(br) = before_eq.find('[') {
-                                &before_eq[..br]
-                            } else {
-                                before_eq
-                            }
-                        } else if let Some(br) = token_str.find('[') {
-                            &token_str[..br]
-                        } else {
-                            token_str
-                        };
-
-                        let var_name = var_name_raw.trim();
-                        if !var_name.is_empty()
-                            && !var_name.chars().next().unwrap().is_ascii_digit()
-                            && var_name.chars().all(is_var_ident_char)
-                            && !is_reserved_keyword(var_name)
-                        {
-                            let name_start_byte =
-                                token_start_in_line + token_str.find(var_name).unwrap_or(0);
-                            let name_end_byte = name_start_byte + var_name.len();
-                            let sel_start_u16 = byte_to_utf16_col(line, name_start_byte);
-                            let sel_end_u16 = byte_to_utf16_col(line, name_end_byte);
-                            let selection_range = Range::new(
-                                Position::new(line_idx as u32, sel_start_u16),
-                                Position::new(line_idx as u32, sel_end_u16),
-                            );
-
-                            let tok_start_u16 = byte_to_utf16_col(line, token_start_in_line);
-                            let tok_end_u16 =
-                                byte_to_utf16_col(line, token_start_in_line + token_str.len());
-                            let range = Range::new(
-                                Position::new(line_idx as u32, tok_start_u16),
-                                Position::new(line_idx as u32, tok_end_u16),
-                            );
-
-                            raw_symbols.push(DocumentSymbol {
-                                name: var_name.to_string(),
-                                detail: Some(kw.to_string()),
-                                kind: SymbolKind::VARIABLE,
-                                tags: None,
-                                #[allow(deprecated)]
-                                deprecated: None,
-                                range,
-                                selection_range,
-                                children: None,
-                            });
-                        }
-                    }
-                    break;
-                }
-            }
-
-            if matched_decl_kw {
-                continue;
-            }
-
-            // 4. Check for Direct Variable Assignments: `VAR=...`, `VAR+=...`, `VAR[k]=...`
-            if let Some(eq_idx) = trimmed.find('=')
-                && eq_idx > 0
-                && !trimmed.starts_with("==")
-                && !trimmed[eq_idx..].starts_with("==")
-            {
-                let prev_char = trimmed.as_bytes().get(eq_idx.saturating_sub(1)).copied();
-                if !matches!(prev_char, Some(b'!' | b'<' | b'>' | b'=')) {
-                    let left_raw = &trimmed[..eq_idx];
-                    let left_no_plus = if let Some(stripped) = left_raw.strip_suffix('+') {
-                        stripped
-                    } else {
-                        left_raw
-                    };
-                    let left_no_bracket = if let Some(br) = left_no_plus.find('[') {
-                        &left_no_plus[..br]
-                    } else {
-                        left_no_plus
-                    };
-
-                    let var_name = left_no_bracket.trim();
-                    if !var_name.is_empty()
-                        && !var_name.chars().next().unwrap().is_ascii_digit()
-                        && var_name.chars().all(is_var_ident_char)
-                        && !is_reserved_keyword(var_name)
-                    {
-                        let name_start_byte = stmt_offset + trimmed.find(var_name).unwrap_or(0);
-                        let name_end_byte = name_start_byte + var_name.len();
-                        let sel_start_u16 = byte_to_utf16_col(line, name_start_byte);
-                        let sel_end_u16 = byte_to_utf16_col(line, name_end_byte);
-                        let selection_range = Range::new(
-                            Position::new(line_idx as u32, sel_start_u16),
-                            Position::new(line_idx as u32, sel_end_u16),
-                        );
-
-                        let stmt_start_u16 = byte_to_utf16_col(line, stmt_offset);
-                        let stmt_end_u16 =
-                            byte_to_utf16_col(line, stmt.start_byte + stmt.text.trim_end().len());
-                        let range = Range::new(
-                            Position::new(line_idx as u32, stmt_start_u16),
-                            Position::new(line_idx as u32, stmt_end_u16),
-                        );
-
-                        raw_symbols.push(DocumentSymbol {
-                            name: var_name.to_string(),
-                            detail: None,
-                            kind: SymbolKind::VARIABLE,
-                            tags: None,
-                            #[allow(deprecated)]
-                            deprecated: None,
-                            range,
-                            selection_range,
-                            children: None,
-                        });
-                    }
-                }
-            }
-        }
+    for var in index.variables {
+        raw_symbols.push(DocumentSymbol {
+            name: var.name,
+            detail: var.kind.symbol_detail(),
+            kind: SymbolKind::VARIABLE,
+            tags: None,
+            #[allow(deprecated)]
+            deprecated: None,
+            range: var.full_range,
+            selection_range: var.name_range,
+            children: None,
+        });
     }
 
     build_symbol_tree(raw_symbols)
@@ -861,5 +534,30 @@ my.func() { :; }
 
         assert_eq!(symbols[1].name, "TOP_VAR");
         assert_eq!(symbols[1].kind, SymbolKind::VARIABLE);
+    }
+
+    #[test]
+    fn test_extract_loop_and_read_variables() {
+        let uri = dummy_uri();
+        let text = r#"
+for item in a b; do
+    echo "$item"
+done
+select choice in x y; do
+    break
+done
+for (( idx = 0; idx < 3; idx++ )); do
+    echo "$idx"
+done
+while read -r line; do
+    echo "$line"
+done
+"#;
+        let symbols = extract_document_symbols(text, &uri);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["item", "choice", "idx", "line"]);
+        for sym in &symbols {
+            assert_eq!(sym.kind, SymbolKind::VARIABLE);
+        }
     }
 }
