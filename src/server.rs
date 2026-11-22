@@ -21,7 +21,7 @@ use crate::document::DocumentManager;
 use crate::error::{ZshcsError, ZshcsResult};
 use crate::hover::{
     extract_word_at_position, get_builtin_or_reserved_doc, get_hover_info_cached,
-    get_local_symbol_hover_doc, is_variable_reference_at,
+    get_local_symbol_hover_doc_at, is_variable_reference_at,
 };
 use crate::symbols::extract_document_symbols;
 
@@ -588,7 +588,9 @@ impl LanguageServer for Backend {
         );
 
         let is_var_ref = is_variable_reference_at(&doc_text, range);
-        if is_var_ref && let Some(value) = get_local_symbol_hover_doc(&doc_text, word, true) {
+        if is_var_ref
+            && let Some(value) = get_local_symbol_hover_doc_at(&doc_text, word, position, true)
+        {
             return Ok(Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
@@ -606,7 +608,7 @@ impl LanguageServer for Backend {
             || basename.and_then(get_builtin_or_reserved_doc).is_some();
 
         if !is_builtin_or_reserved
-            && let Some(value) = get_local_symbol_hover_doc(&doc_text, word, false)
+            && let Some(value) = get_local_symbol_hover_doc_at(&doc_text, word, position, false)
         {
             return Ok(Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {

@@ -244,6 +244,7 @@ classDiagram
    - If an initial entry lacks a description but a subsequent duplicate provides one, the candidate's `detail` and `kind` are automatically enriched.
 6. **Local Symbol Extraction & Merging (`extract_local_symbols_with_manager`, `merge_local_completions`)**:
    - Extracts locally defined shell variables (`(local variable)`), functions (`(local function)`), and aliases (`(local alias)`) up to the cursor position, as well as symbols from scripts referenced via `source` or `.` at or before the cursor (preferring open buffers in `DocumentManager` and falling back to bounded disk reads of regular files up to 1 MiB, with bounded recursion depth, total file count cap, and cycle detection).
+   - Respects function-local variable scoping: excludes function-local variable declarations (`local`, `typeset`, `declare`, `integer`, `float`, `readonly` without `-g`) from closed or unrelated function scopes while keeping global/exported variables visible.
    - Filters candidates by active shell context (`Variable`, `Arithmetic`, `CommandOrWord`) and prioritizes local definitions ahead of daemon results while deduplicating matching labels.
 
 ---
@@ -391,8 +392,8 @@ flowchart TD
 - **Three-Tier Documentation Resolution**:
   1. **Zsh Builtins & Reserved Words Markdown Dictionary (`get_builtin_or_reserved_doc`)**:
      - Fast static lookup containing curated, formatted Markdown documentation for over 50 builtins (`cd`, `echo`, `export`, `set`, `setopt`, `unsetopt`, `autoload`, `compadd`, `typeset`, `print`, `printf`, `source`, `eval`, `alias`, `read`, `return`, `exit`, `shift`, `test`, `trap`, `unset`, `local`, `declare`, `which`, `where`, `whence`, `type`, `bindkey`, `zstyle`, `zmodload`, `zpty`, `zparseopts`, `pushd`, `popd`, `dirs`, `pwd`, `history`, `fc`, `bg`, `fg`, `jobs`, `kill`, `wait`, `disown`, `exec`, `hash`, `rehash`, `umask`, `true`, `false`, `:`) and 20 reserved words (`if`, `then`, `elif`, `else`, `fi`, `for`, `do`, `done`, `while`, `until`, `case`, `esac`, `select`, `function`, `repeat`, `time`, `coproc`, `nocorrect`, `foreach`, `end`).
-  2. **Script-Local Symbol Documentation (`get_local_symbol_hover_doc`)**:
-     - Resolves hover documentation for script-local functions (extracting contiguous preceding `#` comment lines as a docstring alongside the function signature), variable declarations/assignments (prioritized when hovering on `$VAR` / `${VAR}` references via `is_variable_reference_at`), and `alias` definitions while skipping heredoc bodies.
+  2. **Script-Local Symbol Documentation (`get_local_symbol_hover_doc_at`)**:
+     - Resolves hover documentation for script-local functions (extracting contiguous preceding `#` comment lines as a docstring alongside the function signature), variable declarations/assignments (prioritized when hovering on `$VAR` / `${VAR}` references via `is_variable_reference_at`, and respecting function-local variable scoping at the cursor position), and `alias` definitions while skipping heredoc bodies.
   3. **Asynchronous `man` Page Retrieval Engine (`get_hover_info_cached` / `get_man_page`)**:
      - For external commands not in the static dictionary, checks and populates the shared `Backend` `ManCache` (including negative caching) with Single-Flight request coalescing (`resolve_man_markdown_with_fetcher`) shared with `completionItem/resolve`.
      - On cache miss, spawns `man <word>` asynchronously with `MANPAGER=cat`, `PAGER=cat`, and `TERM=dumb`, guarded by `DEFAULT_HOVER_MAN_TIMEOUT` (5000ms) to prevent subprocess deadlocks.

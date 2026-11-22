@@ -1043,7 +1043,7 @@ pub fn scan_alias_definitions(text: &str, uri: &Url, alias_name: &str) -> Vec<Lo
 }
 
 /// Scans the document for function body ranges (`{ ... }`), skipping heredoc bodies.
-fn scan_function_body_ranges(text: &str) -> Vec<Range> {
+pub(crate) fn scan_function_body_ranges(text: &str) -> Vec<Range> {
     let lines: Vec<&str> = text.lines().collect();
     let mut ranges = Vec::new();
     let mut heredoc_delimiter: Option<String> = None;
@@ -1089,6 +1089,7 @@ fn scan_function_body_ranges(text: &str) -> Vec<Range> {
                         || after_trimmed.starts_with('{')
                         || after_trimmed.starts_with(';')
                         || after_trimmed.starts_with('#')
+                        || after_trimmed.starts_with('\\')
                     {
                         header_end_col = Some(stmt.start_byte + stmt.text.len());
                     }
@@ -1108,6 +1109,7 @@ fn scan_function_body_ranges(text: &str) -> Vec<Range> {
                             || after_parens.starts_with('{')
                             || after_parens.starts_with(';')
                             || after_parens.starts_with('#')
+                            || after_parens.starts_with('\\')
                         {
                             header_end_col = Some(stmt.start_byte + stmt.text.len());
                         }
@@ -1132,7 +1134,10 @@ fn scan_function_body_ranges(text: &str) -> Vec<Range> {
     ranges
 }
 
-fn find_innermost_enclosing_function(fn_ranges: &[Range], pos: Position) -> Option<Range> {
+pub(crate) fn find_innermost_enclosing_function(
+    fn_ranges: &[Range],
+    pos: Position,
+) -> Option<Range> {
     let target = Range::new(pos, pos);
     fn_ranges
         .iter()

@@ -43,7 +43,7 @@ pub use hover::{
     DEFAULT_HOVER_MAN_TIMEOUT, clean_man_text, extract_word_at_position, format_man_markdown,
     get_builtin_or_reserved_doc, get_hover_info, get_hover_info_cached,
     get_hover_info_cached_with_timeout, get_hover_info_with_timeout, get_local_symbol_hover_doc,
-    get_man_page, is_variable_reference_at, is_word_char,
+    get_local_symbol_hover_doc_at, get_man_page, is_variable_reference_at, is_word_char,
 };
 pub use logging::{create_env_filter, init_logging, try_init_logging};
 pub use server::Backend;
