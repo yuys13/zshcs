@@ -6,8 +6,8 @@ use tokio::time::timeout;
 use tower_lsp::Client;
 use tower_lsp::lsp_types::{CompletionItem, MessageType};
 
-use crate::completion::{deduplicate_completion_items, parse_candidate_line};
 use crate::error::{ZshcsError, ZshcsResult};
+use crate::lsp::completion::{deduplicate_completion_items, parse_candidate_line};
 
 pub const CAPTURE_ZSH: &str = include_str!("../../bin/capture.zsh");
 pub const ZPTYRC_ZSH: &str = include_str!("../../bin/zptyrc.zsh");

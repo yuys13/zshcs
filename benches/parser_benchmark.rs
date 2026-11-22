@@ -2,8 +2,8 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent, Url};
-use zshcs::completion::{infer_completion_kind, parse_candidate_line};
 use zshcs::document::{DocumentState, position_to_byte_offset};
+use zshcs::lsp::completion::{infer_completion_kind, parse_candidate_line};
 
 fn bench_parse_candidate_line(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse_candidate_line");

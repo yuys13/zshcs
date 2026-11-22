@@ -2096,7 +2096,7 @@ mod tests {
                         async move {
                             cnt.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(Duration::from_millis(30)).await;
-                            crate::hover::ManPageResult::Found(
+                            ManPageResult::Found(
                                 "single_flight_cmd(1) - single flight documentation".to_string(),
                             )
                         }
@@ -2154,7 +2154,7 @@ mod tests {
                         async move {
                             cnt.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(Duration::from_millis(20)).await;
-                            crate::hover::ManPageResult::NotFound
+                            ManPageResult::NotFound
                         }
                     },
                 )
@@ -2207,7 +2207,7 @@ mod tests {
                         async move {
                             cnt.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(Duration::from_millis(20)).await;
-                            crate::hover::ManPageResult::Timeout
+                            ManPageResult::Timeout
                         }
                     },
                 )

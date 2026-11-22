@@ -10,21 +10,21 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::completion::{
-    extract_local_symbols_with_manager, merge_local_completions, resolve_completion_item_async,
-};
 use crate::config::Config;
-use crate::definition::find_definition_with_manager;
-use crate::diagnostics::check_syntax;
 use crate::document::DocumentManager;
 use crate::error::{ZshcsError, ZshcsResult};
-use crate::hover::{
+use crate::lsp::completion::{
+    extract_local_symbols_with_manager, merge_local_completions, resolve_completion_item_async,
+};
+use crate::lsp::definition::find_definition_with_manager;
+use crate::lsp::diagnostics::check_syntax;
+use crate::lsp::hover::{
     extract_word_at_position, get_builtin_or_reserved_doc, get_hover_info_cached,
     get_local_symbol_hover_doc_at_with_manager, is_variable_reference_at,
 };
+use crate::lsp::symbols::extract_document_symbols;
 use crate::runtime::daemon::{CAPTURE_ZSH, CompletionRequest, ZPTYRC_ZSH, run_completion_daemon};
 use crate::runtime::man::ManCache;
-use crate::symbols::extract_document_symbols;
 
 #[derive(Debug)]
 pub struct Backend {

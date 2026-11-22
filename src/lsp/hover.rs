@@ -812,7 +812,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_hover_info_cached_populates_and_reuses_cache() {
-        let cache = crate::completion::ManCache::new();
+        let cache = ManCache::new();
         assert!(!cache.contains_key("git"));
 
         // First call should resolve man page and populate cache
@@ -837,7 +837,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_hover_info_cached_negative_cache() {
-        let cache = crate::completion::ManCache::new();
+        let cache = ManCache::new();
         let dummy = "nonexistent_hover_cmd_xyz123";
 
         let first = get_hover_info_cached(dummy, &cache).await;
