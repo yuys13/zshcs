@@ -2,7 +2,8 @@ use std::time::Duration;
 use tower_lsp::lsp_types::{HoverContents, MarkupContent, MarkupKind, Position, Range};
 
 use crate::definition::{
-    detect_heredoc_delimiter, find_read_command, is_func_ident_char, is_var_ident_char,
+    byte_to_utf16_col, detect_heredoc_delimiter, find_innermost_enclosing_function,
+    find_read_command, is_func_ident_char, is_var_ident_char, scan_function_body_ranges,
     split_declaration_tokens, split_line_statements, utf16_col_to_byte,
 };
 use crate::symbols::{is_reserved_keyword, skip_flags};
@@ -843,7 +844,12 @@ fn token_defines_variable(token_text: &str, var_name: &str) -> bool {
             }) || rest.ends_with(']')))
 }
 
-fn find_local_variable_hover(lines: &[&str], word: &str) -> Option<String> {
+fn find_local_variable_hover(
+    text: &str,
+    lines: &[&str],
+    word: &str,
+    cursor_pos: Option<Position>,
+) -> Option<String> {
     if word.is_empty()
         || word.chars().next()?.is_ascii_digit()
         || is_reserved_keyword(word)
@@ -856,6 +862,7 @@ fn find_local_variable_hover(lines: &[&str], word: &str) -> Option<String> {
         "export", "typeset", "local", "declare", "readonly", "integer", "float",
     ];
     let mut heredoc_delimiter: Option<String> = None;
+    let mut candidates: Vec<(usize, Position, &str, bool)> = Vec::new();
 
     for (line_idx, &line) in lines.iter().enumerate() {
         if let Some(ref delim) = heredoc_delimiter {
@@ -869,10 +876,13 @@ fn find_local_variable_hover(lines: &[&str], word: &str) -> Option<String> {
         }
 
         for stmt in split_line_statements(line) {
-            let trimmed = stmt.text.trim();
+            let trimmed_start = stmt.text.trim_start();
+            let trimmed = trimmed_start.trim_end();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
+            let stmt_offset = stmt.start_byte + (stmt.text.len() - trimmed_start.len());
+            let stmt_pos = Position::new(line_idx as u32, byte_to_utf16_col(line, stmt_offset));
 
             // 1. Keyword variable declarations (`export`, `typeset`, `local`, etc.)
             if let Some(kw) = decl_keywords.iter().find(|&&kw| {
@@ -880,25 +890,25 @@ fn find_local_variable_hover(lines: &[&str], word: &str) -> Option<String> {
                     && (trimmed[kw.len()..].starts_with(' ')
                         || trimmed[kw.len()..].starts_with('\t'))
             }) {
-                let matched = split_declaration_tokens(&trimmed[kw.len()..])
-                    .into_iter()
-                    .any(|t| {
-                        !t.text.starts_with('-')
-                            && !t.text.starts_with('+')
-                            && token_defines_variable(t.text, word)
-                    });
+                let tokens = split_declaration_tokens(&trimmed[kw.len()..]);
+                let has_global_flag = *kw == "export"
+                    || tokens
+                        .iter()
+                        .take_while(|t| t.text.starts_with('-') || t.text.starts_with('+'))
+                        .any(|t| t.text.contains('g'));
+                let matched = tokens.iter().any(|t| {
+                    !t.text.starts_with('-')
+                        && !t.text.starts_with('+')
+                        && token_defines_variable(t.text, word)
+                });
                 if matched {
-                    return Some(format_local_symbol_markdown(
-                        lines,
-                        line_idx,
-                        word,
-                        "Local Variable",
-                        trimmed,
-                    ));
+                    candidates.push((line_idx, stmt_pos, trimmed, !has_global_flag));
+                    continue;
                 }
             }
 
             // 2. Direct assignments (`VAR=...`, `VAR+=...`, `VAR[k]=...`)
+            let mut matched_direct = false;
             for token in split_declaration_tokens(trimmed) {
                 if let Some(rest) = token.text.strip_prefix(word) {
                     let is_direct = rest.starts_with('=')
@@ -909,18 +919,17 @@ fn find_local_variable_hover(lines: &[&str], word: &str) -> Option<String> {
                                 after.starts_with('=') || after.starts_with("+=")
                             }));
                     if is_direct {
-                        return Some(format_local_symbol_markdown(
-                            lines,
-                            line_idx,
-                            word,
-                            "Local Variable",
-                            trimmed,
-                        ));
+                        candidates.push((line_idx, stmt_pos, trimmed, false));
+                        matched_direct = true;
+                        break;
                     }
                 }
                 if !token.text.contains('=') {
                     break;
                 }
+            }
+            if matched_direct {
+                continue;
             }
 
             // 3. Loop variables (`for VAR ...`, `select VAR ...`) and `for (( VAR = ... ))`
@@ -940,13 +949,8 @@ fn find_local_variable_hover(lines: &[&str], word: &str) -> Option<String> {
                         || rest.starts_with(';')
                         || rest.starts_with('('))
                 {
-                    return Some(format_local_symbol_markdown(
-                        lines,
-                        line_idx,
-                        word,
-                        "Local Variable",
-                        trimmed,
-                    ));
+                    candidates.push((line_idx, stmt_pos, trimmed, false));
+                    continue;
                 }
             }
             if trimmed.starts_with("for ((") || trimmed.starts_with("for((") {
@@ -966,13 +970,8 @@ fn find_local_variable_hover(lines: &[&str], word: &str) -> Option<String> {
                         })
                     });
                     if matched {
-                        return Some(format_local_symbol_markdown(
-                            lines,
-                            line_idx,
-                            word,
-                            "Local Variable",
-                            trimmed,
-                        ));
+                        candidates.push((line_idx, stmt_pos, trimmed, false));
+                        continue;
                     }
                 }
             }
@@ -987,30 +986,81 @@ fn find_local_variable_hover(lines: &[&str], word: &str) -> Option<String> {
                             .is_some_and(|r| r.is_empty() || r.starts_with('='))
                 });
                 if matched {
-                    return Some(format_local_symbol_markdown(
-                        lines,
-                        line_idx,
-                        word,
-                        "Local Variable",
-                        trimmed,
-                    ));
+                    candidates.push((line_idx, stmt_pos, trimmed, false));
                 }
             }
         }
     }
 
-    None
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let fn_ranges = scan_function_body_ranges(text);
+    let cursor_fn = cursor_pos.and_then(|pos| find_innermost_enclosing_function(&fn_ranges, pos));
+
+    if let Some(cur_fn) = cursor_fn
+        && let Some(&(line_idx, _, sig, _)) = candidates.iter().find(|&&(_, pos, _, is_local)| {
+            is_local && find_innermost_enclosing_function(&fn_ranges, pos) == Some(cur_fn)
+        })
+    {
+        return Some(format_local_symbol_markdown(
+            lines,
+            line_idx,
+            word,
+            "Local Variable",
+            sig,
+        ));
+    }
+
+    let chosen = candidates.iter().find(|&&(_, pos, _, is_local)| {
+        let enc = find_innermost_enclosing_function(&fn_ranges, pos);
+        let scoped_local = enc.is_some() && is_local;
+        !(scoped_local && enc != cursor_fn)
+    });
+
+    let &(line_idx, _, sig, _) = match chosen {
+        Some(c) => c,
+        None if cursor_pos.is_none() => &candidates[0],
+        None => return None,
+    };
+
+    Some(format_local_symbol_markdown(
+        lines,
+        line_idx,
+        word,
+        "Local Variable",
+        sig,
+    ))
 }
 
 /// Resolves Markdown hover documentation for script-local functions, aliases, and variables.
 pub fn get_local_symbol_hover_doc(text: &str, word: &str, is_variable_ref: bool) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     if is_variable_ref {
-        find_local_variable_hover(&lines, word)
+        find_local_variable_hover(text, &lines, word, None)
     } else {
         find_local_function_hover(&lines, word)
             .or_else(|| find_local_alias_hover(&lines, word))
-            .or_else(|| find_local_variable_hover(&lines, word))
+            .or_else(|| find_local_variable_hover(text, &lines, word, None))
+    }
+}
+
+/// Resolves Markdown hover documentation for script-local functions, aliases, and variables
+/// taking into account function-local variable scoping at `position`.
+pub fn get_local_symbol_hover_doc_at(
+    text: &str,
+    word: &str,
+    position: Position,
+    is_variable_ref: bool,
+) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if is_variable_ref {
+        find_local_variable_hover(text, &lines, word, Some(position))
+    } else {
+        find_local_function_hover(&lines, word)
+            .or_else(|| find_local_alias_hover(&lines, word))
+            .or_else(|| find_local_variable_hover(text, &lines, word, Some(position)))
     }
 }
 
@@ -1587,6 +1637,52 @@ mod tests {
         assert!(
             get_local_symbol_hover_doc(text, "heredoc_func", false).is_none(),
             "Heredoc body must be ignored"
+        );
+    }
+
+    #[test]
+    fn test_get_local_symbol_hover_doc_at_respects_function_local_variable_scoping() {
+        let text = concat!(
+            "# Global mode\n",
+            "MODE=\"global\"\n",
+            "fn_a() {\n",
+            "  # Local mode A\n",
+            "  local MODE=\"local_a\"\n",
+            "  # Private to A\n",
+            "  local ONLY_A=\"secret\"\n",
+            "  echo \"$MODE\" \"$ONLY_A\"\n",
+            "}\n",
+            "fn_b() {\n",
+            "  # Local mode B\n",
+            "  typeset MODE=\"local_b\"\n",
+            "  echo \"$MODE\"\n",
+            "}\n",
+            "echo \"$MODE\"\n",
+        );
+
+        let doc_a = get_local_symbol_hover_doc_at(text, "MODE", Position::new(7, 10), true)
+            .expect("Expected MODE hover inside fn_a");
+        assert!(doc_a.contains("local MODE=\"local_a\""));
+        assert!(doc_a.contains("Local mode A"));
+
+        let doc_b = get_local_symbol_hover_doc_at(text, "MODE", Position::new(12, 10), true)
+            .expect("Expected MODE hover inside fn_b");
+        assert!(doc_b.contains("typeset MODE=\"local_b\""));
+        assert!(doc_b.contains("Local mode B"));
+
+        let doc_global = get_local_symbol_hover_doc_at(text, "MODE", Position::new(14, 8), true)
+            .expect("Expected MODE hover at top-level");
+        assert!(doc_global.contains("MODE=\"global\""));
+        assert!(doc_global.contains("Global mode"));
+
+        assert!(
+            get_local_symbol_hover_doc_at(text, "ONLY_A", Position::new(7, 18), true).is_some()
+        );
+        assert!(
+            get_local_symbol_hover_doc_at(text, "ONLY_A", Position::new(12, 10), true).is_none()
+        );
+        assert!(
+            get_local_symbol_hover_doc_at(text, "ONLY_A", Position::new(14, 8), true).is_none()
         );
     }
 }

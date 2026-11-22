@@ -3175,3 +3175,77 @@ done
         "Expected sourced_unsaved_func from open DocumentManager buffer in {unsaved_items:?}"
     );
 }
+
+#[tokio::test]
+async fn test_completion_function_local_variable_scoping() {
+    let mock_script = r#"#!/usr/bin/env zsh
+while IFS= read -r line; do
+    if [[ $line == input:* ]]; then
+        printf "\x01EOC\x01\n"
+    fi
+done
+"#;
+    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
+    let mut test_client = common::TestClient::new(&mut client_stream);
+
+    let doc_uri = Url::parse("file:///completion_scoping.zsh").unwrap();
+    let text = concat!(
+        "SCOPED_GLOBAL_VAR=1\n",
+        "helper_fn() {\n",
+        "  local SCOPED_LOCAL_ONLY=2\n",
+        "  echo $SCOPED_\n",
+        "}\n",
+        "echo $SCOPED_\n",
+    );
+    test_client.init_and_open(&doc_uri, text).await;
+
+    // 1. Inside `helper_fn()`: both `SCOPED_LOCAL_ONLY` and `SCOPED_GLOBAL_VAR` are suggested
+    let res_inside = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(3, 15),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .expect("Expected completion response inside helper_fn");
+    let items_inside = get_completion_items(res_inside);
+    assert!(
+        items_inside.iter().any(|i| i.label == "SCOPED_LOCAL_ONLY"),
+        "Expected SCOPED_LOCAL_ONLY inside helper_fn: {items_inside:?}"
+    );
+    assert!(
+        items_inside.iter().any(|i| i.label == "SCOPED_GLOBAL_VAR"),
+        "Expected SCOPED_GLOBAL_VAR inside helper_fn: {items_inside:?}"
+    );
+
+    // 2. Outside `helper_fn()`: `SCOPED_LOCAL_ONLY` must NOT be suggested
+    let res_outside = test_client
+        .send_request::<request::Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(5, 13),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+        .unwrap()
+        .expect("Expected completion response outside helper_fn");
+    let items_outside = get_completion_items(res_outside);
+    assert!(
+        items_outside.iter().any(|i| i.label == "SCOPED_GLOBAL_VAR"),
+        "Expected SCOPED_GLOBAL_VAR outside helper_fn: {items_outside:?}"
+    );
+    assert!(
+        !items_outside.iter().any(|i| i.label == "SCOPED_LOCAL_ONLY"),
+        "SCOPED_LOCAL_ONLY must not leak outside helper_fn: {items_outside:?}"
+    );
+}

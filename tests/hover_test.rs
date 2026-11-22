@@ -956,3 +956,97 @@ async fn test_hover_local_function_variable_and_alias() {
         panic!("Expected HoverContents::Markup");
     }
 }
+
+#[tokio::test]
+async fn test_hover_function_local_variable_scoping() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let initialize_params = InitializeParams {
+        process_id: Some(123),
+        root_uri: None,
+        capabilities: ClientCapabilities::default(),
+        initialization_options: Some(json!({
+            "zshcs": {
+                "experimental": {
+                    "hover": true
+                }
+            }
+        })),
+        ..Default::default()
+    };
+
+    test_client
+        .send_request::<Initialize>(initialize_params)
+        .await
+        .unwrap();
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    let doc_uri = Url::parse("file:///hover_scoping.zsh").unwrap();
+    let text = concat!(
+        "# Global mode\n",
+        "MODE=\"global\"\n",
+        "worker() {\n",
+        "  # Worker local mode\n",
+        "  local MODE=\"worker\"\n",
+        "  echo \"$MODE\"\n",
+        "}\n",
+        "echo \"$MODE\"\n",
+    );
+    test_client
+        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: doc_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: text.to_string(),
+            },
+        })
+        .await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    // 1. Inside `worker()`: shows `local MODE="worker"`
+    let hover_local = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(5, 10),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("Expected hover inside worker()");
+    if let HoverContents::Markup(markup) = hover_local.contents {
+        assert!(markup.value.contains("local MODE=\"worker\""));
+        assert!(markup.value.contains("Worker local mode"));
+    } else {
+        panic!("Expected HoverContents::Markup");
+    }
+
+    // 2. Top-level: shows `MODE="global"`
+    let hover_global = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(7, 9),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("Expected hover at top-level");
+    if let HoverContents::Markup(markup) = hover_global.contents {
+        assert!(markup.value.contains("MODE=\"global\""));
+        assert!(markup.value.contains("Global mode"));
+    } else {
+        panic!("Expected HoverContents::Markup");
+    }
+}

@@ -7,16 +7,17 @@ use tokio::time::timeout;
 use tower_lsp::Client;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind, MessageType,
-    Position, Url,
+    Position, Range, Url,
 };
 
 use crate::definition::{
-    byte_to_utf16_col, detect_heredoc_delimiter, find_read_command, is_func_ident_char,
-    is_var_ident_char, resolve_source_path, split_declaration_tokens, split_line_statements,
+    byte_to_utf16_col, detect_heredoc_delimiter, find_innermost_enclosing_function,
+    find_read_command, is_func_ident_char, is_var_ident_char, resolve_source_path,
+    scan_function_body_ranges, split_declaration_tokens, split_line_statements,
 };
 use crate::document::{DocumentManager, DocumentState};
 use crate::error::{ZshcsError, ZshcsResult};
-use crate::symbols::{is_reserved_keyword, skip_flags};
+use crate::symbols::{is_reserved_keyword, range_contains, skip_flags};
 
 pub const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
 pub const ZPTYRC_ZSH: &str = include_str!("../bin/zptyrc.zsh");
@@ -1175,6 +1176,9 @@ fn ends_with_line_continuation(line: &str) -> bool {
 pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<LocalSymbol> {
     let mut symbols = Vec::new();
     let mut seen = HashSet::new();
+    let fn_ranges = scan_function_body_ranges(text);
+    let cursor_pos_range = Range::new(position, position);
+    let mut out_of_scope_locals: Vec<(Range, String)> = Vec::new();
 
     let mut add_symbol = |name: &str, kind: LocalSymbolKind| {
         let key = (name.to_string(), kind);
@@ -1189,6 +1193,7 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
 
     let mut heredoc_delimiter: Option<String> = None;
     let mut pending_decl_kw: Option<&'static str> = None;
+    let mut pending_decl_has_global_flag = false;
     let mut pending_function_kw = false;
     let mut pending_for_or_select_kw: Option<usize> = None;
     let mut pending_read_kw = false;
@@ -1234,12 +1239,14 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
 
         let has_line_continuation = ends_with_line_continuation(line);
         let mut current_pending_decl_kw = pending_decl_kw.take();
+        let mut current_pending_decl_global = std::mem::take(&mut pending_decl_has_global_flag);
         let mut current_pending_function_kw = std::mem::take(&mut pending_function_kw);
         let mut current_pending_for_or_select_kw = pending_for_or_select_kw.take();
         let mut current_pending_read_kw = std::mem::take(&mut pending_read_kw);
         let mut current_pending_alias_kw = std::mem::take(&mut pending_alias_kw);
 
         let mut next_pending_decl_kw: Option<&'static str> = None;
+        let mut next_pending_decl_global = false;
         let mut next_pending_function_kw = false;
         let mut next_pending_for_or_select_kw: Option<usize> = None;
         let mut next_pending_read_kw = false;
@@ -1249,12 +1256,14 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
         if stmts.is_empty() {
             if has_line_continuation {
                 pending_decl_kw = current_pending_decl_kw;
+                pending_decl_has_global_flag = current_pending_decl_global;
                 pending_function_kw = current_pending_function_kw;
                 pending_for_or_select_kw = current_pending_for_or_select_kw;
                 pending_read_kw = current_pending_read_kw;
                 pending_alias_kw = current_pending_alias_kw;
             } else {
                 pending_decl_kw = None;
+                pending_decl_has_global_flag = false;
                 pending_function_kw = false;
                 pending_for_or_select_kw = None;
                 pending_read_kw = false;
@@ -1272,6 +1281,11 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
                 current_pending_decl_kw.take()
             } else {
                 None
+            };
+            let pending_decl_global_for_this_stmt = if is_first_stmt {
+                std::mem::take(&mut current_pending_decl_global)
+            } else {
+                false
             };
             let pending_function_for_this_stmt = if is_first_stmt {
                 std::mem::take(&mut current_pending_function_kw)
@@ -1486,15 +1500,16 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
             }
 
             if let Some(kw) = active_kw {
-                if is_last_stmt && has_line_continuation {
-                    next_pending_decl_kw = Some(kw);
-                }
-
-                for token in split_declaration_tokens(after_kw_slice) {
-                    if token.text.starts_with('-')
-                        || token.text.starts_with('+')
-                        || token.text == "\\"
-                    {
+                let mut has_global_flag = kw == "export" || pending_decl_global_for_this_stmt;
+                let tokens = split_declaration_tokens(after_kw_slice);
+                for token in &tokens {
+                    if token.text.starts_with('-') || token.text.starts_with('+') {
+                        if token.text.contains('g') {
+                            has_global_flag = true;
+                        }
+                        continue;
+                    }
+                    if token.text == "\\" {
                         continue;
                     }
 
@@ -1526,9 +1541,29 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
                             token_start_in_line + token_str.find(var_name).unwrap_or(0);
                         let name_end_byte = name_start_byte + var_name.len();
                         if is_before_cursor(name_end_byte) {
-                            add_symbol(var_name, LocalSymbolKind::Variable);
+                            let decl_pos = Position::new(
+                                line_idx as u32,
+                                byte_to_utf16_col(line, name_start_byte),
+                            );
+                            let in_other_fn_local = !has_global_flag
+                                && find_innermost_enclosing_function(&fn_ranges, decl_pos)
+                                    .is_some_and(|enc_fn| {
+                                        let outside = !range_contains(&enc_fn, &cursor_pos_range);
+                                        if outside {
+                                            out_of_scope_locals
+                                                .push((enc_fn, var_name.to_string()));
+                                        }
+                                        outside
+                                    });
+                            if !in_other_fn_local {
+                                add_symbol(var_name, LocalSymbolKind::Variable);
+                            }
                         }
                     }
+                }
+                if is_last_stmt && has_line_continuation {
+                    next_pending_decl_kw = Some(kw);
+                    next_pending_decl_global = has_global_flag;
                 }
                 continue;
             }
@@ -1579,7 +1614,20 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
                                 + token_text.find(var_name).unwrap_or(0);
                             let name_end_byte = name_start_byte + var_name.len();
                             if is_before_cursor(name_end_byte) {
-                                add_symbol(var_name, LocalSymbolKind::Variable);
+                                let var_pos = Position::new(
+                                    line_idx as u32,
+                                    byte_to_utf16_col(line, name_start_byte),
+                                );
+                                let is_out_of_scope_local =
+                                    find_innermost_enclosing_function(&fn_ranges, var_pos)
+                                        .is_some_and(|enc_fn| {
+                                            out_of_scope_locals.iter().any(|(fn_r, name)| {
+                                                *fn_r == enc_fn && name == var_name
+                                            })
+                                        });
+                                if !is_out_of_scope_local {
+                                    add_symbol(var_name, LocalSymbolKind::Variable);
+                                }
                             }
                         }
                     }
@@ -1727,7 +1775,20 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
                                 + token_text.find(var_name).unwrap_or(0);
                             let name_end_byte = name_start_byte + var_name.len();
                             if is_before_cursor(name_end_byte) {
-                                add_symbol(var_name, LocalSymbolKind::Variable);
+                                let var_pos = Position::new(
+                                    line_idx as u32,
+                                    byte_to_utf16_col(line, name_start_byte),
+                                );
+                                let is_out_of_scope_local =
+                                    find_innermost_enclosing_function(&fn_ranges, var_pos)
+                                        .is_some_and(|enc_fn| {
+                                            out_of_scope_locals.iter().any(|(fn_r, name)| {
+                                                *fn_r == enc_fn && name == var_name
+                                            })
+                                        });
+                                if !is_out_of_scope_local {
+                                    add_symbol(var_name, LocalSymbolKind::Variable);
+                                }
                             }
                             continue;
                         }
@@ -1739,6 +1800,7 @@ pub fn extract_local_symbols_from_text(text: &str, position: Position) -> Vec<Lo
         }
 
         pending_decl_kw = next_pending_decl_kw;
+        pending_decl_has_global_flag = next_pending_decl_global;
         pending_function_kw = next_pending_function_kw;
         pending_for_or_select_kw = next_pending_for_or_select_kw;
         pending_read_kw = next_pending_read_kw;
@@ -5014,5 +5076,56 @@ local \
         );
         assert!(!names.contains(&"sourced_fn_68"));
         assert_eq!(syms.len(), MAX_SOURCED_FILES);
+    }
+
+    #[test]
+    fn test_extract_local_symbols_respects_function_local_variable_scoping() {
+        let text = concat!(
+            "GLOBAL_VAR=1\n",
+            "fn_a() {\n",
+            "  local LOCAL_A=10\n",
+            "  LOCAL_A=20\n",
+            "  typeset -g GLOBAL_FROM_A=30\n",
+            "  export EXPORT_FROM_A=40\n",
+            "  echo $\n",
+            "}\n",
+            "fn_b() {\n",
+            "  local LOCAL_B=50\n",
+            "  echo $\n",
+            "}\n",
+            "echo $\n",
+        );
+
+        let syms_in_a = extract_local_symbols_from_text(text, Position::new(6, 8));
+        let names_in_a: Vec<&str> = syms_in_a.iter().map(|s| s.name.as_str()).collect();
+        assert!(names_in_a.contains(&"LOCAL_A"));
+        assert!(names_in_a.contains(&"GLOBAL_VAR"));
+        assert!(names_in_a.contains(&"GLOBAL_FROM_A"));
+        assert!(names_in_a.contains(&"EXPORT_FROM_A"));
+
+        let syms_in_b = extract_local_symbols_from_text(text, Position::new(10, 8));
+        let names_in_b: Vec<&str> = syms_in_b.iter().map(|s| s.name.as_str()).collect();
+        assert!(names_in_b.contains(&"LOCAL_B"));
+        assert!(names_in_b.contains(&"GLOBAL_VAR"));
+        assert!(names_in_b.contains(&"GLOBAL_FROM_A"));
+        assert!(names_in_b.contains(&"EXPORT_FROM_A"));
+        assert!(
+            !names_in_b.contains(&"LOCAL_A"),
+            "LOCAL_A from fn_a must not leak into fn_b: {names_in_b:?}"
+        );
+
+        let syms_top = extract_local_symbols_from_text(text, Position::new(12, 6));
+        let names_top: Vec<&str> = syms_top.iter().map(|s| s.name.as_str()).collect();
+        assert!(names_top.contains(&"GLOBAL_VAR"));
+        assert!(names_top.contains(&"GLOBAL_FROM_A"));
+        assert!(names_top.contains(&"EXPORT_FROM_A"));
+        assert!(
+            !names_top.contains(&"LOCAL_A"),
+            "LOCAL_A from fn_a must not leak to top-level: {names_top:?}"
+        );
+        assert!(
+            !names_top.contains(&"LOCAL_B"),
+            "LOCAL_B from fn_b must not leak to top-level: {names_top:?}"
+        );
     }
 }
