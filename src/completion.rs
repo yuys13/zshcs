@@ -848,15 +848,18 @@ pub(crate) const MAX_SOURCE_DEPTH: usize = 4;
 pub(crate) const MAX_SOURCED_FILES: usize = 64;
 const MAX_SOURCED_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
 
-/// Extracts sourced script path arguments (`source <path>` or `. <path>`) from `text`
-/// that appear at or before the given `position`, ignoring heredoc bodies and comments.
-pub fn extract_sourced_paths_from_text(text: &str, position: Position) -> Vec<String> {
-    let mut paths = Vec::new();
+fn scan_sourced_paths_with_split(
+    text: &str,
+    position: Position,
+    stop_after_position: bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut before_paths = Vec::new();
+    let mut after_paths = Vec::new();
     let mut heredoc_delimiter: Option<String> = None;
     let mut pending_source_kw = false;
 
     for (line_idx, line) in text.lines().enumerate() {
-        if line_idx > position.line as usize {
+        if stop_after_position && line_idx > position.line as usize {
             break;
         }
 
@@ -874,6 +877,7 @@ pub fn extract_sourced_paths_from_text(text: &str, position: Position) -> Vec<St
             pending_source_kw = false;
         }
 
+        let is_before_line = line_idx < position.line as usize;
         let is_target_line = line_idx == position.line as usize;
         let has_line_continuation = ends_with_line_continuation(line);
         let mut current_pending_source_kw = std::mem::take(&mut pending_source_kw);
@@ -960,17 +964,46 @@ pub fn extract_sourced_paths_from_text(text: &str, position: Position) -> Vec<St
                 (&after_trimmed[..token_len], arg_start_byte + token_len)
             };
 
-            let is_before_cursor =
-                !is_target_line || byte_to_utf16_col(line, arg_end_byte) <= position.character;
-            if !unquoted.is_empty() && is_before_cursor {
-                paths.push(unquoted.to_string());
+            if unquoted.is_empty() {
+                continue;
+            }
+
+            let is_before_cursor = is_before_line
+                || (is_target_line && byte_to_utf16_col(line, arg_end_byte) <= position.character);
+            if is_before_cursor {
+                before_paths.push(unquoted.to_string());
+            } else if !stop_after_position {
+                after_paths.push(unquoted.to_string());
             }
         }
 
         pending_source_kw = next_pending_source_kw;
     }
 
-    paths
+    (before_paths, after_paths)
+}
+
+/// Extracts sourced script path arguments (`source <path>` or `. <path>`) from `text`
+/// that appear at or before the given `position`, ignoring heredoc bodies and comments.
+pub fn extract_sourced_paths_from_text(text: &str, position: Position) -> Vec<String> {
+    scan_sourced_paths_with_split(text, position, true).0
+}
+
+/// Extracts all sourced script path arguments from `text` in a single pass,
+/// prioritizing paths at or before `position` ahead of those after `position`
+/// and deduplicating in O(N) time.
+pub(crate) fn extract_sourced_paths_prioritized(text: &str, position: Position) -> Vec<String> {
+    let (before_paths, after_paths) = scan_sourced_paths_with_split(text, position, false);
+    let mut seen: HashSet<String> = HashSet::with_capacity(before_paths.len() + after_paths.len());
+    let mut result = Vec::with_capacity(before_paths.len() + after_paths.len());
+
+    for path in before_paths.into_iter().chain(after_paths) {
+        if seen.insert(path.clone()) {
+            result.push(path);
+        }
+    }
+
+    result
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {

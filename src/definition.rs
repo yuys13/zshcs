@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::{GotoDefinitionResponse, Location, Position, Range, Url};
 
 use crate::completion::{
-    MAX_SOURCE_DEPTH, MAX_SOURCED_FILES, extract_sourced_paths_from_text, resolve_sourced_script,
+    MAX_SOURCE_DEPTH, MAX_SOURCED_FILES, extract_sourced_paths_prioritized, resolve_sourced_script,
 };
 use crate::document::DocumentManager;
 use crate::symbols::{
@@ -1320,16 +1320,7 @@ impl<'a> SourcedDefinitionFinder<'a> {
             return Vec::new();
         }
 
-        let mut candidate_paths = extract_sourced_paths_from_text(source_text, position);
-        if position.line != u32::MAX {
-            let all_paths =
-                extract_sourced_paths_from_text(source_text, Position::new(u32::MAX, u32::MAX));
-            for p in all_paths {
-                if !candidate_paths.contains(&p) {
-                    candidate_paths.push(p);
-                }
-            }
-        }
+        let candidate_paths = extract_sourced_paths_prioritized(source_text, position);
 
         for path_str in candidate_paths {
             if self.files_loaded >= MAX_SOURCED_FILES {
@@ -2339,6 +2330,27 @@ done
             find_definition(main_text, &main_uri, Position::new(5, 10)),
             None,
             "Function-local variable inside sourced script must not be resolved cross-file"
+        );
+    }
+
+    #[test]
+    fn test_extract_sourced_paths_prioritized_single_pass_dedup() {
+        let text = concat!(
+            "source ./first.zsh\n",
+            "source ./dup.zsh\n",
+            "echo $FOO\n",
+            "source ./dup.zsh\n",
+            "source ./after.zsh\n",
+            "source ./first.zsh\n",
+        );
+        let paths = extract_sourced_paths_prioritized(text, Position::new(2, 5));
+        assert_eq!(
+            paths,
+            vec![
+                "./first.zsh".to_string(),
+                "./dup.zsh".to_string(),
+                "./after.zsh".to_string(),
+            ]
         );
     }
 }
