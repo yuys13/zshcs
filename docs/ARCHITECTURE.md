@@ -388,10 +388,12 @@ flowchart TD
   - Respects shell syntax delimiters (whitespace, `;`, `|`, `&`, `(`, `)`, `<`, `>`, `"`, `'`, '`', `\`, `{`, `}`, `[`, `]`, `$`, `,`, `#`, `=`, `!`, `~`, `^`, `*`, `?`).
   - Safely handles multibyte UTF-8 characters (CJK ideographs) and UTF-16 surrogate pairs (SMP emoji, rare Kanji) without slicing mid-character.
   - Returns `None` immediately if the cursor rests on whitespace, delimiters, or out-of-bounds positions.
-- **Two-Tier Documentation Resolution**:
+- **Three-Tier Documentation Resolution**:
   1. **Zsh Builtins & Reserved Words Markdown Dictionary (`get_builtin_or_reserved_doc`)**:
      - Fast static lookup containing curated, formatted Markdown documentation for over 50 builtins (`cd`, `echo`, `export`, `set`, `setopt`, `unsetopt`, `autoload`, `compadd`, `typeset`, `print`, `printf`, `source`, `eval`, `alias`, `read`, `return`, `exit`, `shift`, `test`, `trap`, `unset`, `local`, `declare`, `which`, `where`, `whence`, `type`, `bindkey`, `zstyle`, `zmodload`, `zpty`, `zparseopts`, `pushd`, `popd`, `dirs`, `pwd`, `history`, `fc`, `bg`, `fg`, `jobs`, `kill`, `wait`, `disown`, `exec`, `hash`, `rehash`, `umask`, `true`, `false`, `:`) and 20 reserved words (`if`, `then`, `elif`, `else`, `fi`, `for`, `do`, `done`, `while`, `until`, `case`, `esac`, `select`, `function`, `repeat`, `time`, `coproc`, `nocorrect`, `foreach`, `end`).
-  2. **Asynchronous `man` Page Retrieval Engine (`get_hover_info_cached` / `get_man_page`)**:
+  2. **Script-Local Symbol Documentation (`get_local_symbol_hover_doc`)**:
+     - Resolves hover documentation for script-local functions (extracting contiguous preceding `#` comment lines as a docstring alongside the function signature), variable declarations/assignments (prioritized when hovering on `$VAR` / `${VAR}` references via `is_variable_reference_at`), and `alias` definitions while skipping heredoc bodies.
+  3. **Asynchronous `man` Page Retrieval Engine (`get_hover_info_cached` / `get_man_page`)**:
      - For external commands not in the static dictionary, checks and populates the shared `Backend` `ManCache` (including negative caching) with Single-Flight request coalescing (`resolve_man_markdown_with_fetcher`) shared with `completionItem/resolve`.
      - On cache miss, spawns `man <word>` asynchronously with `MANPAGER=cat`, `PAGER=cat`, and `TERM=dumb`, guarded by `DEFAULT_HOVER_MAN_TIMEOUT` (5000ms) to prevent subprocess deadlocks.
      - Strips backspace overstrikes (bold `c\bc`, underline `_\bc`) and ANSI escape sequences via `clean_man_text`.

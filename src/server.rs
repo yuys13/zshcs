@@ -19,7 +19,10 @@ use crate::definition::find_definition;
 use crate::diagnostics::check_syntax;
 use crate::document::DocumentManager;
 use crate::error::{ZshcsError, ZshcsResult};
-use crate::hover::{extract_word_at_position, get_hover_info_cached};
+use crate::hover::{
+    extract_word_at_position, get_builtin_or_reserved_doc, get_hover_info_cached,
+    get_local_symbol_hover_doc, is_variable_reference_at,
+};
 use crate::symbols::extract_document_symbols;
 
 #[derive(Debug)]
@@ -583,6 +586,36 @@ impl LanguageServer for Backend {
             ?range,
             "Extracted word for hover; querying hover info"
         );
+
+        let is_var_ref = is_variable_reference_at(&doc_text, range);
+        if is_var_ref && let Some(value) = get_local_symbol_hover_doc(&doc_text, word, true) {
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: Some(range),
+            }));
+        }
+
+        let basename = word
+            .rfind('/')
+            .map(|idx| &word[idx + 1..])
+            .filter(|b| !b.is_empty());
+        let is_builtin_or_reserved = get_builtin_or_reserved_doc(word).is_some()
+            || basename.and_then(get_builtin_or_reserved_doc).is_some();
+
+        if !is_builtin_or_reserved
+            && let Some(value) = get_local_symbol_hover_doc(&doc_text, word, false)
+        {
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: Some(range),
+            }));
+        }
 
         match get_hover_info_cached(word, &self.man_cache).await {
             Some(contents) => Ok(Some(Hover {

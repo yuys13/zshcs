@@ -839,3 +839,120 @@ async fn test_hover_unicode_and_multibyte_document() {
         panic!("Expected HoverContents::Markup");
     }
 }
+
+#[tokio::test]
+async fn test_hover_local_function_variable_and_alias() {
+    let (mut client_stream, _server_handle) = setup_server();
+    let mut test_client = TestClient::new(&mut client_stream);
+
+    let initialize_params = InitializeParams {
+        process_id: Some(123),
+        root_uri: None,
+        capabilities: ClientCapabilities::default(),
+        initialization_options: Some(json!({
+            "zshcs": {
+                "experimental": {
+                    "hover": true
+                }
+            }
+        })),
+        ..Default::default()
+    };
+
+    test_client
+        .send_request::<Initialize>(initialize_params)
+        .await
+        .unwrap();
+    test_client
+        .send_notification::<Initialized>(InitializedParams {})
+        .await;
+
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    let doc_uri = Url::parse("file:///local_symbols_hover.zsh").unwrap();
+    let text = concat!(
+        "# Deploys the app to target env.\n",
+        "deploy_app() {\n",
+        "  echo \"$1\"\n",
+        "}\n",
+        "# Target deployment environment\n",
+        "DEPLOY_ENV=\"prod\"\n",
+        "alias dlog='docker logs -f'\n",
+        "deploy_app \"$DEPLOY_ENV\"\n",
+        "dlog\n",
+    );
+    test_client
+        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: doc_uri.clone(),
+                language_id: "zsh".to_string(),
+                version: 1,
+                text: text.to_string(),
+            },
+        })
+        .await;
+    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+
+    // 1. Hover on local function call `deploy_app` (line 7, char 2)
+    let hover_fn = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(7, 2),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("Expected hover for local function deploy_app");
+    if let HoverContents::Markup(markup) = hover_fn.contents {
+        assert!(markup.value.contains("(Local Function)"));
+        assert!(markup.value.contains("Deploys the app to target env."));
+    } else {
+        panic!("Expected HoverContents::Markup");
+    }
+
+    // 2. Hover on local variable reference `$DEPLOY_ENV` (line 7, char 14)
+    let hover_var = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc_uri.clone(),
+                },
+                position: Position::new(7, 14),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("Expected hover for local variable DEPLOY_ENV");
+    if let HoverContents::Markup(markup) = hover_var.contents {
+        assert!(markup.value.contains("(Local Variable)"));
+        assert!(markup.value.contains("DEPLOY_ENV=\"prod\""));
+        assert!(markup.value.contains("Target deployment environment"));
+    } else {
+        panic!("Expected HoverContents::Markup");
+    }
+
+    // 3. Hover on local alias `dlog` (line 8, char 1)
+    let hover_alias = test_client
+        .send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: doc_uri },
+                position: Position::new(8, 1),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("Expected hover for local alias dlog");
+    if let HoverContents::Markup(markup) = hover_alias.contents {
+        assert!(markup.value.contains("(Local Alias)"));
+        assert!(markup.value.contains("alias dlog='docker logs -f'"));
+    } else {
+        panic!("Expected HoverContents::Markup");
+    }
+}
