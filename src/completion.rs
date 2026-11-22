@@ -506,6 +506,7 @@ pub fn extract_sourced_paths_from_text(text: &str, position: Position) -> Vec<St
 /// Extracts all sourced script path arguments from `text` in a single pass,
 /// prioritizing paths at or before `position` ahead of those after `position`
 /// and deduplicating in O(N) time.
+#[cfg(test)]
 pub(crate) fn extract_sourced_paths_prioritized(text: &str, position: Position) -> Vec<String> {
     let (before_paths, after_paths) = scan_sourced_paths_with_split(text, position, false);
     let mut seen: HashSet<String> = HashSet::with_capacity(before_paths.len() + after_paths.len());
@@ -591,20 +592,6 @@ fn expand_and_normalize_source_path(path_str: &str, base_uri: &Url) -> Option<Pa
         let base_path = base_uri.to_file_path().ok()?;
         let parent = base_path.parent()?;
         Some(normalize_lexical_path(&parent.join(p)))
-    }
-}
-
-pub(crate) fn resolve_open_sourced_uri(
-    path_str: &str,
-    base_uri: &Url,
-    doc_manager: Option<&DocumentManager>,
-) -> Option<Url> {
-    let raw_path = expand_and_normalize_source_path(path_str, base_uri)?;
-    let raw_uri = Url::from_file_path(&raw_path).ok()?;
-    if doc_manager?.get(&raw_uri).is_some() {
-        Some(raw_uri)
-    } else {
-        None
     }
 }
 
