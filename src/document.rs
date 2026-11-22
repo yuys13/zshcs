@@ -1,7 +1,10 @@
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent, Url};
+
+use crate::analysis::model::DocumentIndex;
+use crate::analysis::parser::parse_document;
 
 /// Errors related to document management and synchronization.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -18,17 +21,31 @@ pub enum DocumentError {
 }
 
 /// Represents the in-memory state of an open document.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct DocumentState {
     uri: Url,
     version: i32,
     text: String,
+    index_cache: Arc<OnceLock<Arc<DocumentIndex>>>,
 }
+
+impl PartialEq for DocumentState {
+    fn eq(&self, other: &Self) -> bool {
+        self.uri == other.uri && self.version == other.version && self.text == other.text
+    }
+}
+
+impl Eq for DocumentState {}
 
 impl DocumentState {
     /// Creates a new document state.
     pub fn new(uri: Url, version: i32, text: String) -> Self {
-        Self { uri, version, text }
+        Self {
+            uri,
+            version,
+            text,
+            index_cache: Arc::new(OnceLock::new()),
+        }
     }
 
     /// Returns the URI of the document.
@@ -44,6 +61,14 @@ impl DocumentState {
     /// Returns the current text content of the document.
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Returns the lazily parsed and cached `DocumentIndex` for the current document version.
+    pub fn index(&self) -> Arc<DocumentIndex> {
+        Arc::clone(
+            self.index_cache
+                .get_or_init(|| Arc::new(parse_document(&self.text))),
+        )
     }
 
     /// Safely applies incremental or full synchronization changes to the document text.
@@ -81,6 +106,7 @@ impl DocumentState {
 
         self.text = new_text;
         self.version = version;
+        self.index_cache = Arc::new(OnceLock::new());
         Ok(())
     }
 
@@ -237,6 +263,11 @@ impl DocumentManager {
     /// Returns the text content of a document if it is open.
     pub fn get_content(&self, uri: &Url) -> Option<String> {
         self.documents.get(uri).map(|doc| doc.text().to_string())
+    }
+
+    /// Returns the cached `DocumentIndex` of a document if it is open.
+    pub fn get_index(&self, uri: &Url) -> Option<Arc<DocumentIndex>> {
+        self.documents.get(uri).map(|doc| doc.index())
     }
 
     /// Retrieves the line prefix at a given position for a document.
@@ -1069,5 +1100,75 @@ mod tests {
         assert!(res.is_ok());
         assert_eq!(state.version(), 2);
         assert_eq!(state.text(), "inserted text\nsecond");
+    }
+
+    #[test]
+    fn test_document_state_index_cache_hit_and_clone_sharing() {
+        let uri = Url::parse("file:///cache_hit.zsh").unwrap();
+        let state = DocumentState::new(uri, 1, "my_fn() { local x=1; }\n".to_string());
+
+        let idx1 = state.index();
+        let idx2 = state.index();
+        assert!(Arc::ptr_eq(&idx1, &idx2));
+        assert_eq!(idx1.functions.len(), 1);
+        assert_eq!(idx1.functions[0].name, "my_fn");
+
+        let cloned = state.clone();
+        let idx3 = cloned.index();
+        assert!(Arc::ptr_eq(&idx1, &idx3));
+    }
+
+    #[test]
+    fn test_document_state_index_cache_invalidated_on_apply_changes() {
+        let uri = Url::parse("file:///cache_invalidate.zsh").unwrap();
+        let mut state = DocumentState::new(uri, 1, "FOO=1\n".to_string());
+
+        let idx1 = state.index();
+        assert_eq!(idx1.variables.len(), 1);
+        assert_eq!(idx1.variables[0].name, "FOO");
+
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: "FOO=1\nBAR=2\n".to_string(),
+        }];
+        state.apply_changes(2, changes).unwrap();
+
+        let idx2 = state.index();
+        assert!(!Arc::ptr_eq(&idx1, &idx2));
+        assert_eq!(idx2.variables.len(), 2);
+        assert_eq!(idx2.variables[1].name, "BAR");
+    }
+
+    #[test]
+    fn test_document_state_index_cache_preserved_on_failed_apply_changes() {
+        let uri = Url::parse("file:///cache_rollback.zsh").unwrap();
+        let mut state = DocumentState::new(uri, 2, "FOO=1\n".to_string());
+
+        let idx1 = state.index();
+
+        // Outdated version should fail and preserve existing cache
+        let outdated = vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: "BAR=2\n".to_string(),
+        }];
+        assert!(matches!(
+            state.apply_changes(1, outdated),
+            Err(DocumentError::OutdatedVersion { .. })
+        ));
+        assert!(Arc::ptr_eq(&idx1, &state.index()));
+
+        // Invalid range should fail and preserve existing cache
+        let invalid_range = vec![TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(99, 0), Position::new(99, 1))),
+            range_length: None,
+            text: "x".to_string(),
+        }];
+        assert!(matches!(
+            state.apply_changes(3, invalid_range),
+            Err(DocumentError::InvalidRange(_))
+        ));
+        assert!(Arc::ptr_eq(&idx1, &state.index()));
     }
 }

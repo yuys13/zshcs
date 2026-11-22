@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tower_lsp::lsp_types::{Position, Url};
 
 use crate::analysis::model::DocumentIndex;
@@ -15,7 +16,7 @@ pub const MAX_SOURCED_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
 pub struct SourcedDocument {
     pub uri: Url,
     pub text: String,
-    pub index: DocumentIndex,
+    pub index: Arc<DocumentIndex>,
 }
 
 #[inline]
@@ -174,28 +175,42 @@ pub fn resolve_sourced_script(
     base_uri: &Url,
     doc_manager: Option<&DocumentManager>,
 ) -> Option<(Url, Option<Url>, String)> {
+    let (primary_uri, raw_uri, content, _) =
+        resolve_sourced_script_with_index(path_str, base_uri, doc_manager)?;
+    Some((primary_uri, raw_uri, content))
+}
+
+fn resolve_sourced_script_with_index(
+    path_str: &str,
+    base_uri: &Url,
+    doc_manager: Option<&DocumentManager>,
+) -> Option<(Url, Option<Url>, String, Arc<DocumentIndex>)> {
     let raw_path = expand_and_normalize_source_path(path_str, base_uri)?;
     let raw_uri = Url::from_file_path(&raw_path).ok();
     let canon_uri = resolve_source_path(path_str, base_uri);
 
-    let content = doc_manager
-        .and_then(|mgr| {
-            canon_uri
-                .as_ref()
-                .and_then(|u| mgr.get_content(u))
-                .or_else(|| raw_uri.as_ref().and_then(|u| mgr.get_content(u)))
-        })
-        .or_else(|| {
-            if let Some(ref u) = canon_uri
-                && let Ok(p) = u.to_file_path()
-            {
-                return read_sourced_file_bounded(&p);
-            }
-            read_sourced_file_bounded(&raw_path)
-        })?;
+    if let Some(mgr) = doc_manager {
+        let open_doc = canon_uri
+            .as_ref()
+            .and_then(|u| mgr.get(u))
+            .or_else(|| raw_uri.as_ref().and_then(|u| mgr.get(u)));
+        if let Some(doc) = open_doc {
+            let primary_uri = canon_uri.or_else(|| raw_uri.clone())?;
+            return Some((primary_uri, raw_uri, doc.text().to_string(), doc.index()));
+        }
+    }
+
+    let content = if let Some(ref u) = canon_uri
+        && let Ok(p) = u.to_file_path()
+    {
+        read_sourced_file_bounded(&p)
+    } else {
+        read_sourced_file_bounded(&raw_path)
+    }?;
 
     let primary_uri = canon_uri.or_else(|| raw_uri.clone())?;
-    Some((primary_uri, raw_uri, content))
+    let index = Arc::new(parse_document(&content));
+    Some((primary_uri, raw_uri, content, index))
 }
 
 pub(crate) fn prioritized_source_paths(
@@ -247,8 +262,8 @@ impl<'a> WorkspaceCollector<'a> {
                 break;
             }
 
-            let Some((target_uri, alt_uri, content)) =
-                resolve_sourced_script(&path_str, base_uri, self.doc_manager)
+            let Some((target_uri, alt_uri, content, child_index)) =
+                resolve_sourced_script_with_index(&path_str, base_uri, self.doc_manager)
             else {
                 continue;
             };
@@ -266,17 +281,14 @@ impl<'a> WorkspaceCollector<'a> {
                 self.visited_uris.insert(alt);
             }
 
-            let child_index = parse_document(&content);
             self.docs.push(SourcedDocument {
                 uri: target_uri.clone(),
                 text: content,
-                index: child_index,
+                index: Arc::clone(&child_index),
             });
 
-            // Recurse into nested sourced scripts using a cloned reference via index
-            let child_idx_clone = self.docs.last().unwrap().index.clone();
             self.collect(
-                &child_idx_clone,
+                &child_index,
                 &target_uri,
                 Position::new(u32::MAX, u32::MAX),
                 true,
@@ -350,5 +362,9 @@ mod tests {
         assert_eq!(sourced.len(), 2);
         assert_eq!(sourced[0].index.functions[0].name, "fn_a_in_memory");
         assert_eq!(sourced[1].index.variables[0].name, "VAR_B");
+
+        // Open buffer should reuse the exact same cached Arc<DocumentIndex>
+        let cached_a = doc_mgr.get_index(&a_uri).unwrap();
+        assert!(Arc::ptr_eq(&sourced[0].index, &cached_a));
     }
 }

@@ -316,11 +316,23 @@ pub fn get_local_symbol_hover_doc_at_with_manager(
     doc_manager: Option<&DocumentManager>,
 ) -> Option<String> {
     let index = parse_document(text);
-    if let Some(doc) = resolve_local_hover_in_index(&index, word, Some(position), is_variable_ref) {
+    get_local_symbol_hover_doc_with_index(&index, uri, word, position, is_variable_ref, doc_manager)
+}
+
+/// Resolves Markdown hover documentation for script-local symbols using a pre-parsed `DocumentIndex`.
+pub fn get_local_symbol_hover_doc_with_index(
+    index: &DocumentIndex,
+    uri: &Url,
+    word: &str,
+    position: Position,
+    is_variable_ref: bool,
+    doc_manager: Option<&DocumentManager>,
+) -> Option<String> {
+    if let Some(doc) = resolve_local_hover_in_index(index, word, Some(position), is_variable_ref) {
         return Some(doc);
     }
 
-    for sourced in collect_sourced_documents(&index, uri, position, doc_manager, true) {
+    for sourced in collect_sourced_documents(index, uri, position, doc_manager, true) {
         if let Some(doc) = resolve_local_hover_in_index(&sourced.index, word, None, is_variable_ref)
         {
             return Some(doc);
