@@ -661,8 +661,13 @@ impl LanguageServer for Backend {
             }
         };
 
-        let response =
-            find_definition_with_manager(&doc_text, &uri, position, Some(&self.document_manager));
+        let doc_manager = self.document_manager.clone();
+        let uri_for_task = uri.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            find_definition_with_manager(&doc_text, &uri_for_task, position, Some(&doc_manager))
+        })
+        .await
+        .unwrap_or(None);
         tracing::debug!(
             uri = %uri,
             found = response.is_some(),
