@@ -844,6 +844,7 @@ fn split_words_with_offsets(input: &str) -> Vec<(usize, &str)> {
 }
 
 const MAX_SOURCE_DEPTH: usize = 4;
+const MAX_SOURCED_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
 
 /// Extracts sourced script path arguments (`source <path>` or `. <path>`) from `text`
 /// that appear at or before the given `position`, ignoring heredoc bodies and comments.
@@ -992,6 +993,31 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
     stack.iter().collect()
 }
 
+fn read_sourced_file_bounded(path: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_SOURCED_FILE_BYTES {
+        return None;
+    }
+
+    let file = std::fs::File::open(path).ok()?;
+    let opened_metadata = file.metadata().ok()?;
+    if !opened_metadata.is_file() || opened_metadata.len() > MAX_SOURCED_FILE_BYTES {
+        return None;
+    }
+
+    let mut buf = Vec::new();
+    file.take(MAX_SOURCED_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > MAX_SOURCED_FILE_BYTES {
+        return None;
+    }
+
+    String::from_utf8(buf).ok()
+}
+
 fn resolve_sourced_script(
     path_str: &str,
     base_uri: &Url,
@@ -1037,9 +1063,9 @@ fn resolve_sourced_script(
             if let Some(ref u) = canon_uri
                 && let Ok(p) = u.to_file_path()
             {
-                return std::fs::read_to_string(p).ok();
+                return read_sourced_file_bounded(&p);
             }
-            std::fs::read_to_string(&raw_path).ok()
+            read_sourced_file_bounded(&raw_path)
         })?;
 
     let primary_uri = canon_uri.or_else(|| raw_uri.clone())?;
@@ -4914,6 +4940,44 @@ local \
         assert!(
             !names.iter().any(|(n, _)| *n == "after_func"),
             "Symbols from files sourced after cursor must not be included: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_sourced_script_skips_oversized_and_special_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oversized_path = dir.path().join("oversized.zsh");
+        let mut oversized_content = String::from("oversized_func() { : }\n");
+        let pad_len =
+            (MAX_SOURCED_FILE_BYTES as usize + 64).saturating_sub(oversized_content.len());
+        oversized_content.push_str(&"#".repeat(pad_len));
+        std::fs::write(&oversized_path, oversized_content).unwrap();
+
+        let subdir_path = dir.path().join("subdir");
+        std::fs::create_dir(&subdir_path).unwrap();
+
+        let normal_path = dir.path().join("normal.zsh");
+        std::fs::write(&normal_path, "normal_func() { : }\n").unwrap();
+
+        let main_path = dir.path().join("main.zsh");
+        let main_uri = tower_lsp::lsp_types::Url::from_file_path(&main_path).unwrap();
+        let mut main_text = String::from("source ./oversized.zsh\nsource ./subdir\n");
+        if cfg!(unix) {
+            main_text.push_str("source /dev/null\n");
+        }
+        main_text.push_str("source ./normal.zsh\n");
+
+        let doc = DocumentState::new(main_uri, 1, main_text);
+        let syms = extract_local_symbols(&doc, Position::new(10, 0));
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"normal_func"),
+            "Expected normal_func from normal.zsh, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"oversized_func"),
+            "Oversized sourced file must be skipped, got: {names:?}"
         );
     }
 }
