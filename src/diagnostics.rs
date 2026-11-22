@@ -1,8 +1,8 @@
 use std::time::Duration;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-/// Default timeout for executing `zsh -n`.
-pub const DEFAULT_SYNTAX_CHECK_TIMEOUT: Duration = Duration::from_millis(2000);
+pub use crate::runtime::syntax_check::DEFAULT_SYNTAX_CHECK_TIMEOUT;
+use crate::runtime::syntax_check::run_zsh_syntax_check;
 
 /// Runs syntax check on `text` using `zsh -n` with the default timeout.
 pub async fn check_syntax(text: &str) -> Vec<Diagnostic> {
@@ -11,60 +11,9 @@ pub async fn check_syntax(text: &str) -> Vec<Diagnostic> {
 
 /// Runs syntax check on `text` using `zsh -n` with a specified timeout.
 pub async fn check_syntax_with_timeout(text: &str, timeout_dur: Duration) -> Vec<Diagnostic> {
-    if text.trim().is_empty() {
+    let Some(stderr) = run_zsh_syntax_check(text, timeout_dur).await else {
         return Vec::new();
-    }
-
-    let temp_file = match tempfile::Builder::new()
-        .prefix("zshcs_diag_")
-        .suffix(".zsh")
-        .tempfile()
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to create temp file for zsh -n syntax check");
-            return Vec::new();
-        }
     };
-
-    let temp_path = temp_file.path().to_path_buf();
-    if let Err(e) = tokio::fs::write(&temp_path, text.as_bytes()).await {
-        tracing::warn!(error = %e, "Failed to write temp file for zsh -n syntax check");
-        return Vec::new();
-    }
-
-    let mut cmd = tokio::process::Command::new("zsh");
-    cmd.arg("-n")
-        .arg(&temp_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-
-    let child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to spawn zsh -n for syntax check");
-            return Vec::new();
-        }
-    };
-
-    let output = match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "zsh -n process failed while waiting for output");
-            return Vec::new();
-        }
-        Err(_) => {
-            tracing::warn!("zsh -n syntax check timed out after {:?}", timeout_dur);
-            return Vec::new();
-        }
-    };
-
-    if output.status.success() {
-        return Vec::new();
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
     parse_diagnostics(&stderr, text)
 }
 

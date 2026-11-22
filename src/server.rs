@@ -11,8 +11,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::completion::{
-    CAPTURE_ZSH, CompletionRequest, ManCache, ZPTYRC_ZSH, extract_local_symbols_with_manager,
-    merge_local_completions, resolve_completion_item_async, run_completion_daemon,
+    extract_local_symbols_with_manager, merge_local_completions, resolve_completion_item_async,
 };
 use crate::config::Config;
 use crate::definition::find_definition_with_manager;
@@ -23,6 +22,8 @@ use crate::hover::{
     extract_word_at_position, get_builtin_or_reserved_doc, get_hover_info_cached,
     get_local_symbol_hover_doc_at, is_variable_reference_at,
 };
+use crate::runtime::daemon::{CAPTURE_ZSH, CompletionRequest, ZPTYRC_ZSH, run_completion_daemon};
+use crate::runtime::man::ManCache;
 use crate::symbols::extract_document_symbols;
 
 #[derive(Debug)]
