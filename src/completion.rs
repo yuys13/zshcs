@@ -844,8 +844,8 @@ fn split_words_with_offsets(input: &str) -> Vec<(usize, &str)> {
     words
 }
 
-const MAX_SOURCE_DEPTH: usize = 4;
-const MAX_SOURCED_FILES: usize = 64;
+pub(crate) const MAX_SOURCE_DEPTH: usize = 4;
+pub(crate) const MAX_SOURCED_FILES: usize = 64;
 const MAX_SOURCED_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
 
 /// Extracts sourced script path arguments (`source <path>` or `. <path>`) from `text`
@@ -1020,7 +1020,7 @@ fn read_sourced_file_bounded(path: &Path) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-fn resolve_sourced_script(
+pub(crate) fn resolve_sourced_script(
     path_str: &str,
     base_uri: &Url,
     doc_manager: Option<&DocumentManager>,

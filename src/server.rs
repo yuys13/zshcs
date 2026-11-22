@@ -15,7 +15,7 @@ use crate::completion::{
     merge_local_completions, resolve_completion_item_async, run_completion_daemon,
 };
 use crate::config::Config;
-use crate::definition::find_definition;
+use crate::definition::find_definition_with_manager;
 use crate::diagnostics::check_syntax;
 use crate::document::DocumentManager;
 use crate::error::{ZshcsError, ZshcsResult};
@@ -661,7 +661,8 @@ impl LanguageServer for Backend {
             }
         };
 
-        let response = find_definition(&doc_text, &uri, position);
+        let response =
+            find_definition_with_manager(&doc_text, &uri, position, Some(&self.document_manager));
         tracing::debug!(
             uri = %uri,
             found = response.is_some(),
