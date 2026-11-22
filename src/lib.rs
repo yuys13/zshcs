@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod cli;
 pub mod completion;
 pub mod config;
@@ -8,6 +9,7 @@ pub mod document;
 pub mod error;
 pub mod hover;
 pub mod logging;
+pub mod runtime;
 pub mod server;
 pub mod symbols;
 

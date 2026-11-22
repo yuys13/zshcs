@@ -10,14 +10,21 @@ use tower_lsp::lsp_types::{
     Position, Range, Url,
 };
 
+use crate::analysis::builtins::get_builtin_or_reserved_doc;
+use crate::analysis::syntax::{
+    byte_to_utf16_col, detect_heredoc_delimiter, ends_with_line_continuation, find_read_command,
+    is_func_ident_char, is_reserved_keyword, is_var_ident_char, range_contains, skip_flags,
+    split_declaration_tokens, split_line_statements, split_words_with_offsets,
+};
 use crate::definition::{
-    byte_to_utf16_col, detect_heredoc_delimiter, find_innermost_enclosing_function,
-    find_read_command, is_func_ident_char, is_var_ident_char, resolve_source_path,
-    scan_function_body_ranges, split_declaration_tokens, split_line_statements,
+    find_innermost_enclosing_function, resolve_source_path, scan_function_body_ranges,
 };
 use crate::document::{DocumentManager, DocumentState};
 use crate::error::{ZshcsError, ZshcsResult};
-use crate::symbols::{is_reserved_keyword, range_contains, skip_flags};
+pub use crate::runtime::man::{
+    DEFAULT_RESOLVE_MAN_TIMEOUT, ManCache, is_eligible_for_external_command,
+};
+use crate::runtime::man::{ManPageResult, get_man_page_result, resolve_man_markdown_with_fetcher};
 
 pub const CAPTURE_ZSH: &str = include_str!("../bin/capture.zsh");
 pub const ZPTYRC_ZSH: &str = include_str!("../bin/zptyrc.zsh");
@@ -495,7 +502,7 @@ pub fn resolve_completion_item(mut item: CompletionItem) -> CompletionItem {
         }
     }
 
-    if let Some(doc) = crate::hover::get_builtin_or_reserved_doc(trimmed_label) {
+    if let Some(doc) = get_builtin_or_reserved_doc(trimmed_label) {
         item.documentation = Some(Documentation::MarkupContent(MarkupContent {
             kind: MarkupKind::Markdown,
             value: doc.to_string(),
@@ -503,195 +510,6 @@ pub fn resolve_completion_item(mut item: CompletionItem) -> CompletionItem {
     }
 
     item
-}
-
-pub type ManCache = dashmap::DashMap<String, Option<String>>;
-
-/// Default timeout for asynchronous man page retrieval during completion resolution (2000 milliseconds).
-pub const DEFAULT_RESOLVE_MAN_TIMEOUT: Duration = Duration::from_millis(2000);
-
-#[derive(Clone, Debug)]
-pub(crate) enum SingleFlightResult {
-    Found(String),
-    NotFound,
-    Timeout,
-    Error,
-}
-
-static IN_FLIGHT: std::sync::LazyLock<
-    dashmap::DashMap<String, tokio::sync::watch::Receiver<Option<SingleFlightResult>>>,
-> = std::sync::LazyLock::new(dashmap::DashMap::new);
-
-struct InFlightGuard {
-    key: String,
-    active: bool,
-}
-
-impl InFlightGuard {
-    fn new(key: String) -> Self {
-        Self { key, active: true }
-    }
-
-    fn complete(mut self) {
-        self.active = false;
-        IN_FLIGHT.remove(&self.key);
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if self.active {
-            IN_FLIGHT.remove(&self.key);
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn is_in_flight(key: &str) -> bool {
-    IN_FLIGHT.contains_key(key)
-}
-
-fn apply_single_flight_markdown_result(
-    result: &SingleFlightResult,
-    cache: &ManCache,
-    trimmed_label: &str,
-) -> Option<String> {
-    match result {
-        SingleFlightResult::Found(md) => {
-            cache.insert(trimmed_label.to_string(), Some(md.clone()));
-            Some(md.clone())
-        }
-        SingleFlightResult::NotFound => {
-            cache.insert(trimmed_label.to_string(), None);
-            None
-        }
-        SingleFlightResult::Timeout | SingleFlightResult::Error => {
-            // Do not cache transient timeouts or execution errors so future attempts can retry
-            None
-        }
-    }
-}
-
-/// Determines whether a completion item is eligible for external command man page lookup.
-pub fn is_eligible_for_external_command(kind: Option<CompletionItemKind>, label: &str) -> bool {
-    if let Some(k) = kind
-        && !matches!(k, CompletionItemKind::FUNCTION | CompletionItemKind::TEXT)
-    {
-        return false;
-    }
-    let trimmed = label.trim();
-    if trimmed.is_empty()
-        || trimmed.len() > 256
-        || trimmed.starts_with('-')
-        || trimmed.starts_with('.')
-        || trimmed.starts_with(':')
-        || trimmed.ends_with('.')
-        || trimmed.ends_with(':')
-        || !trimmed.chars().any(|c| c.is_alphanumeric())
-    {
-        return false;
-    }
-    trimmed
-        .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
-}
-
-/// Resolves formatted Markdown documentation for an external command using `ManCache`,
-/// single-flight request coalescing, negative caching, and timeout protection.
-pub(crate) async fn resolve_man_markdown_with_fetcher<F, Fut>(
-    trimmed_label: &str,
-    cache: &ManCache,
-    timeout_dur: Duration,
-    fetcher: F,
-) -> Option<String>
-where
-    F: FnOnce(String, Duration) -> Fut,
-    Fut: std::future::Future<Output = crate::hover::ManPageResult>,
-{
-    // 1. Fast path: check cache
-    if let Some(entry) = cache.get(trimmed_label) {
-        return entry.value().clone();
-    }
-
-    // 2. Single-Flight request deduplication
-    enum FlightRole {
-        Leader(
-            InFlightGuard,
-            tokio::sync::watch::Sender<Option<SingleFlightResult>>,
-        ),
-        Waiter(tokio::sync::watch::Receiver<Option<SingleFlightResult>>),
-    }
-
-    let role = match IN_FLIGHT.entry(trimmed_label.to_string()) {
-        dashmap::mapref::entry::Entry::Occupied(entry) => FlightRole::Waiter(entry.get().clone()),
-        dashmap::mapref::entry::Entry::Vacant(entry) => {
-            // Double-check cache in case a previous in-flight request completed just before locking
-            if let Some(entry_cache) = cache.get(trimmed_label) {
-                return entry_cache.value().clone();
-            }
-            let (tx, rx) = tokio::sync::watch::channel(None);
-            entry.insert(rx);
-            let guard = InFlightGuard::new(trimmed_label.to_string());
-            FlightRole::Leader(guard, tx)
-        }
-    };
-
-    match role {
-        FlightRole::Leader(guard, tx) => {
-            match fetcher(trimmed_label.to_string(), timeout_dur).await {
-                crate::hover::ManPageResult::Found(raw_man) => {
-                    let md = crate::hover::format_man_markdown(&raw_man);
-                    cache.insert(trimmed_label.to_string(), Some(md.clone()));
-                    let _ = tx.send(Some(SingleFlightResult::Found(md.clone())));
-                    guard.complete();
-                    Some(md)
-                }
-                crate::hover::ManPageResult::NotFound => {
-                    cache.insert(trimmed_label.to_string(), None);
-                    let _ = tx.send(Some(SingleFlightResult::NotFound));
-                    guard.complete();
-                    None
-                }
-                crate::hover::ManPageResult::Timeout => {
-                    let _ = tx.send(Some(SingleFlightResult::Timeout));
-                    guard.complete();
-                    None
-                }
-                crate::hover::ManPageResult::Error(_) => {
-                    let _ = tx.send(Some(SingleFlightResult::Error));
-                    guard.complete();
-                    None
-                }
-            }
-        }
-        FlightRole::Waiter(mut rx) => {
-            // Check if the result was already published before subscription
-            if let Some(ref res) = *rx.borrow() {
-                return apply_single_flight_markdown_result(res, cache, trimmed_label);
-            }
-
-            match timeout(timeout_dur, rx.changed()).await {
-                Ok(Ok(())) => {
-                    if let Some(ref res) = *rx.borrow() {
-                        return apply_single_flight_markdown_result(res, cache, trimmed_label);
-                    }
-                }
-                Ok(Err(_)) => {
-                    // Leader disconnected or dropped without a new value
-                    if let Some(ref res) = *rx.borrow() {
-                        return apply_single_flight_markdown_result(res, cache, trimmed_label);
-                    }
-                    if let Some(entry) = cache.get(trimmed_label) {
-                        return entry.value().clone();
-                    }
-                }
-                Err(_) => {
-                    // Waiter timed out waiting for the in-flight resolution
-                }
-            }
-            None
-        }
-    }
 }
 
 /// Resolves detailed documentation for a `CompletionItem` asynchronously using an underlying fetcher
@@ -704,7 +522,7 @@ pub(crate) async fn resolve_completion_item_async_with_fetcher<F, Fut>(
 ) -> CompletionItem
 where
     F: FnOnce(String, Duration) -> Fut,
-    Fut: std::future::Future<Output = crate::hover::ManPageResult>,
+    Fut: std::future::Future<Output = ManPageResult>,
 {
     // 1. Preserve existing documentation if present and non-empty
     let has_doc = match &item.documentation {
@@ -761,9 +579,7 @@ pub async fn resolve_completion_item_async_with_timeout(
         item,
         cache,
         timeout_dur,
-        |cmd: String, dur: Duration| async move {
-            crate::hover::get_man_page_result(&cmd, dur).await
-        },
+        |cmd: String, dur: Duration| async move { get_man_page_result(&cmd, dur).await },
     )
     .await
 }
@@ -819,29 +635,6 @@ impl LocalSymbol {
             detail,
         }
     }
-}
-
-/// Helper to split words with their start byte offsets in a string.
-fn split_words_with_offsets(input: &str) -> Vec<(usize, &str)> {
-    let mut words = Vec::new();
-    let mut in_word = false;
-    let mut start = 0;
-
-    for (i, c) in input.char_indices() {
-        if c.is_whitespace() {
-            if in_word {
-                words.push((start, &input[start..i]));
-                in_word = false;
-            }
-        } else if !in_word {
-            start = i;
-            in_word = true;
-        }
-    }
-    if in_word {
-        words.push((start, &input[start..]));
-    }
-    words
 }
 
 pub(crate) const MAX_SOURCE_DEPTH: usize = 4;
@@ -1211,13 +1004,6 @@ pub fn extract_local_symbols_with_manager(
     collector.collect(doc.text(), doc.uri(), position, 0);
 
     collector.symbols
-}
-
-/// Checks whether a line ends with an unescaped line continuation backslash.
-fn ends_with_line_continuation(line: &str) -> bool {
-    let trimmed = line.trim_end();
-    let backslash_count = trimmed.chars().rev().take_while(|c| *c == '\\').count();
-    backslash_count % 2 == 1
 }
 
 /// Extracts locally defined variables and functions from document text
@@ -3568,7 +3354,7 @@ mod tests {
         // Exactly one background fetch task must execute despite 20 concurrent requests
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
         assert!(cache.contains_key("single_flight_cmd"));
-        assert!(!is_in_flight("single_flight_cmd"));
+        assert!(!crate::runtime::man::is_in_flight("single_flight_cmd"));
     }
 
     #[tokio::test]
@@ -3619,7 +3405,9 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
         assert!(cache.contains_key("nonexistent_single_flight_cmd"));
         assert_eq!(*cache.get("nonexistent_single_flight_cmd").unwrap(), None);
-        assert!(!is_in_flight("nonexistent_single_flight_cmd"));
+        assert!(!crate::runtime::man::is_in_flight(
+            "nonexistent_single_flight_cmd"
+        ));
     }
 
     #[tokio::test]
@@ -3669,7 +3457,9 @@ mod tests {
 
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
         assert!(!cache.contains_key("timeout_single_flight_cmd"));
-        assert!(!is_in_flight("timeout_single_flight_cmd"));
+        assert!(!crate::runtime::man::is_in_flight(
+            "timeout_single_flight_cmd"
+        ));
     }
 
     #[tokio::test]
@@ -3688,7 +3478,9 @@ mod tests {
         // Zero timeout aborts immediately without caching transient timeouts, returns unmodified item
         assert_eq!(resolved.documentation, None);
         assert!(!cache.contains_key("timeout_protection_isolated_cmd"));
-        assert!(!is_in_flight("timeout_protection_isolated_cmd"));
+        assert!(!crate::runtime::man::is_in_flight(
+            "timeout_protection_isolated_cmd"
+        ));
     }
 
     #[test]
