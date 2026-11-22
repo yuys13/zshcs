@@ -1,6 +1,12 @@
 use std::time::Duration;
 use tower_lsp::lsp_types::{HoverContents, MarkupContent, MarkupKind, Position, Range};
 
+use crate::definition::{
+    detect_heredoc_delimiter, find_read_command, is_func_ident_char, is_var_ident_char,
+    split_declaration_tokens, split_line_statements, utf16_col_to_byte,
+};
+use crate::symbols::{is_reserved_keyword, skip_flags};
+
 /// Default timeout for asynchronous man page retrieval (5000 milliseconds).
 pub const DEFAULT_HOVER_MAN_TIMEOUT: Duration = Duration::from_millis(5000);
 
@@ -634,6 +640,380 @@ pub fn format_man_markdown(man_text: &str) -> String {
     format!("{fence}text\n{man_text}\n{fence}")
 }
 
+/// Returns `true` if the word at `range` is directly preceded by a shell variable sigil
+/// such as `$VAR`, `${VAR}`, `${#VAR}`, or `${(U)VAR}`.
+pub fn is_variable_reference_at(text: &str, range: Range) -> bool {
+    let Some(line) = text.lines().nth(range.start.line as usize) else {
+        return false;
+    };
+    let start_byte = utf16_col_to_byte(line, range.start.character);
+    let prefix = &line[..start_byte];
+    if prefix.ends_with('$') || prefix.ends_with("${") {
+        return true;
+    }
+    if let Some(brace_idx) = prefix.rfind("${") {
+        let between = &prefix[brace_idx + 2..];
+        if !between.contains('}')
+            && !between.contains(' ')
+            && !between.contains('\t')
+            && (between
+                .chars()
+                .all(|c| matches!(c, '#' | '!' | '^' | '=' | '~'))
+                || (between.starts_with('(') && between.ends_with(')')))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extracts contiguous `#` comment lines immediately preceding `def_line_idx` as Markdown text.
+fn extract_preceding_comment_block(lines: &[&str], def_line_idx: usize) -> Option<String> {
+    let mut collected = Vec::new();
+    let mut idx = def_line_idx;
+    while idx > 0 {
+        let trimmed = lines[idx - 1].trim();
+        if !trimmed.starts_with('#') || trimmed.starts_with("#!") {
+            break;
+        }
+        let body = trimmed.trim_start_matches('#');
+        let body = body.strip_prefix(' ').unwrap_or(body);
+        collected.push(body);
+        idx -= 1;
+    }
+    if collected.is_empty() {
+        return None;
+    }
+    collected.reverse();
+    let doc = collected.join("\n").trim().to_string();
+    if doc.is_empty() { None } else { Some(doc) }
+}
+
+fn format_local_symbol_markdown(
+    lines: &[&str],
+    def_line_idx: usize,
+    name: &str,
+    kind_label: &str,
+    signature: &str,
+) -> String {
+    let mut md = format!("### `{name}` ({kind_label})\n\n```zsh\n{signature}\n```");
+    if let Some(doc) = extract_preceding_comment_block(lines, def_line_idx) {
+        md.push_str("\n\n");
+        md.push_str(&doc);
+    }
+    md
+}
+
+fn find_local_function_hover(lines: &[&str], word: &str) -> Option<String> {
+    if word.is_empty()
+        || word.chars().next()?.is_ascii_digit()
+        || is_reserved_keyword(word)
+        || !word.chars().all(is_func_ident_char)
+    {
+        return None;
+    }
+
+    let mut heredoc_delimiter: Option<String> = None;
+    for (line_idx, &line) in lines.iter().enumerate() {
+        if let Some(ref delim) = heredoc_delimiter {
+            if line.trim_start_matches('\t').trim_end() == delim {
+                heredoc_delimiter = None;
+            }
+            continue;
+        }
+        if let Some(delim) = detect_heredoc_delimiter(line) {
+            heredoc_delimiter = Some(delim);
+        }
+
+        for stmt in split_line_statements(line) {
+            let trimmed = stmt.text.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            // POSIX style: `word() ...` or `word () ...`
+            if let Some(rest) = trimmed.strip_prefix(word) {
+                let rest_t = rest.trim_start();
+                if let Some(after_open) = rest_t.strip_prefix('(')
+                    && let Some(after_close) = after_open.trim_start().strip_prefix(')')
+                {
+                    let after_parens = after_close.trim_start();
+                    if after_parens.is_empty()
+                        || after_parens.starts_with('{')
+                        || after_parens.starts_with('#')
+                        || after_parens.starts_with(';')
+                    {
+                        return Some(format_local_symbol_markdown(
+                            lines,
+                            line_idx,
+                            word,
+                            "Local Function",
+                            trimmed,
+                        ));
+                    }
+                }
+            }
+
+            // Keyword style: `function [flags...] word ...`
+            if trimmed.starts_with("function ") || trimmed.starts_with("function\t") {
+                let after_fn = skip_flags(trimmed[8..].trim_start());
+                if let Some(rest) = after_fn.strip_prefix(word) {
+                    let rest_t = rest.trim_start();
+                    let is_header_end = rest_t.is_empty()
+                        || rest_t.starts_with('{')
+                        || rest_t.starts_with('#')
+                        || rest_t.starts_with(';')
+                        || (rest_t.starts_with('(') && rest_t.contains(')'));
+                    if is_header_end {
+                        return Some(format_local_symbol_markdown(
+                            lines,
+                            line_idx,
+                            word,
+                            "Local Function",
+                            trimmed,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn find_local_alias_hover(lines: &[&str], word: &str) -> Option<String> {
+    if word.is_empty()
+        || is_reserved_keyword(word)
+        || !word.chars().all(|c| is_func_ident_char(c) || c == '-')
+    {
+        return None;
+    }
+
+    let mut heredoc_delimiter: Option<String> = None;
+    for (line_idx, &line) in lines.iter().enumerate() {
+        if let Some(ref delim) = heredoc_delimiter {
+            if line.trim_start_matches('\t').trim_end() == delim {
+                heredoc_delimiter = None;
+            }
+            continue;
+        }
+        if let Some(delim) = detect_heredoc_delimiter(line) {
+            heredoc_delimiter = Some(delim);
+        }
+
+        for stmt in split_line_statements(line) {
+            let trimmed = stmt.text.trim();
+            if !(trimmed.starts_with("alias ") || trimmed.starts_with("alias\t")) {
+                continue;
+            }
+            for token in split_declaration_tokens(&trimmed[5..]) {
+                if token.text.starts_with('-') || token.text.starts_with('+') {
+                    continue;
+                }
+                if let Some(eq) = token.text.find('=')
+                    && token.text[..eq].trim() == word
+                {
+                    let sig = format!("alias {}", token.text.trim());
+                    return Some(format_local_symbol_markdown(
+                        lines,
+                        line_idx,
+                        word,
+                        "Local Alias",
+                        &sig,
+                    ));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn token_defines_variable(token_text: &str, var_name: &str) -> bool {
+    let Some(rest) = token_text.strip_prefix(var_name) else {
+        return false;
+    };
+    rest.is_empty()
+        || rest.starts_with('=')
+        || rest.starts_with("+=")
+        || (rest.starts_with('[')
+            && (rest.find(']').is_some_and(|close| {
+                let after = &rest[close + 1..];
+                after.is_empty() || after.starts_with('=') || after.starts_with("+=")
+            }) || rest.ends_with(']')))
+}
+
+fn find_local_variable_hover(lines: &[&str], word: &str) -> Option<String> {
+    if word.is_empty()
+        || word.chars().next()?.is_ascii_digit()
+        || is_reserved_keyword(word)
+        || !word.chars().all(is_var_ident_char)
+    {
+        return None;
+    }
+
+    let decl_keywords = [
+        "export", "typeset", "local", "declare", "readonly", "integer", "float",
+    ];
+    let mut heredoc_delimiter: Option<String> = None;
+
+    for (line_idx, &line) in lines.iter().enumerate() {
+        if let Some(ref delim) = heredoc_delimiter {
+            if line.trim_start_matches('\t').trim_end() == delim {
+                heredoc_delimiter = None;
+            }
+            continue;
+        }
+        if let Some(delim) = detect_heredoc_delimiter(line) {
+            heredoc_delimiter = Some(delim);
+        }
+
+        for stmt in split_line_statements(line) {
+            let trimmed = stmt.text.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            // 1. Keyword variable declarations (`export`, `typeset`, `local`, etc.)
+            if let Some(kw) = decl_keywords.iter().find(|&&kw| {
+                trimmed.starts_with(kw)
+                    && (trimmed[kw.len()..].starts_with(' ')
+                        || trimmed[kw.len()..].starts_with('\t'))
+            }) {
+                let matched = split_declaration_tokens(&trimmed[kw.len()..])
+                    .into_iter()
+                    .any(|t| {
+                        !t.text.starts_with('-')
+                            && !t.text.starts_with('+')
+                            && token_defines_variable(t.text, word)
+                    });
+                if matched {
+                    return Some(format_local_symbol_markdown(
+                        lines,
+                        line_idx,
+                        word,
+                        "Local Variable",
+                        trimmed,
+                    ));
+                }
+            }
+
+            // 2. Direct assignments (`VAR=...`, `VAR+=...`, `VAR[k]=...`)
+            for token in split_declaration_tokens(trimmed) {
+                if let Some(rest) = token.text.strip_prefix(word) {
+                    let is_direct = rest.starts_with('=')
+                        || rest.starts_with("+=")
+                        || (rest.starts_with('[')
+                            && rest.find(']').is_some_and(|close| {
+                                let after = &rest[close + 1..];
+                                after.starts_with('=') || after.starts_with("+=")
+                            }));
+                    if is_direct {
+                        return Some(format_local_symbol_markdown(
+                            lines,
+                            line_idx,
+                            word,
+                            "Local Variable",
+                            trimmed,
+                        ));
+                    }
+                }
+                if !token.text.contains('=') {
+                    break;
+                }
+            }
+
+            // 3. Loop variables (`for VAR ...`, `select VAR ...`) and `for (( VAR = ... ))`
+            let for_kw_len = if trimmed.starts_with("for ") || trimmed.starts_with("for\t") {
+                Some(4)
+            } else if trimmed.starts_with("select ") || trimmed.starts_with("select\t") {
+                Some(7)
+            } else {
+                None
+            };
+            if let Some(kw_len) = for_kw_len {
+                let after_kw = trimmed[kw_len..].trim_start();
+                if let Some(rest) = after_kw.strip_prefix(word)
+                    && (rest.is_empty()
+                        || rest.starts_with(' ')
+                        || rest.starts_with('\t')
+                        || rest.starts_with(';')
+                        || rest.starts_with('('))
+                {
+                    return Some(format_local_symbol_markdown(
+                        lines,
+                        line_idx,
+                        word,
+                        "Local Variable",
+                        trimmed,
+                    ));
+                }
+            }
+            if trimmed.starts_with("for ((") || trimmed.starts_with("for((") {
+                let after_for = trimmed
+                    .strip_prefix("for ((")
+                    .or_else(|| trimmed.strip_prefix("for(("))
+                    .unwrap_or("");
+                if let Some(close_idx) = after_for.find("))") {
+                    let clause = after_for[..close_idx].split(';').next().unwrap_or("");
+                    let matched = split_declaration_tokens(clause).into_iter().any(|t| {
+                        t.text.strip_prefix(word).is_some_and(|r| {
+                            r.is_empty()
+                                || r.starts_with('=')
+                                || r.starts_with("+=")
+                                || r.starts_with("++")
+                                || r.starts_with("--")
+                        })
+                    });
+                    if matched {
+                        return Some(format_local_symbol_markdown(
+                            lines,
+                            line_idx,
+                            word,
+                            "Local Variable",
+                            trimmed,
+                        ));
+                    }
+                }
+            }
+
+            // 4. `read` statements (`read VAR`, `read -r VAR`, `while read -r line`)
+            if let Some((_, after_read)) = find_read_command(trimmed) {
+                let matched = split_declaration_tokens(after_read).into_iter().any(|t| {
+                    !t.text.starts_with('-')
+                        && !t.text.starts_with('+')
+                        && t.text
+                            .strip_prefix(word)
+                            .is_some_and(|r| r.is_empty() || r.starts_with('='))
+                });
+                if matched {
+                    return Some(format_local_symbol_markdown(
+                        lines,
+                        line_idx,
+                        word,
+                        "Local Variable",
+                        trimmed,
+                    ));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolves Markdown hover documentation for script-local functions, aliases, and variables.
+pub fn get_local_symbol_hover_doc(text: &str, word: &str, is_variable_ref: bool) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if is_variable_ref {
+        find_local_variable_hover(&lines, word)
+    } else {
+        find_local_function_hover(&lines, word)
+            .or_else(|| find_local_alias_hover(&lines, word))
+            .or_else(|| find_local_variable_hover(&lines, word))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,5 +1532,61 @@ mod tests {
         // Even if we don't spawn man again, negative cache returns None
         let second = get_hover_info_cached(dummy, &cache).await;
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn test_get_local_symbol_hover_doc_function_variable_and_alias() {
+        let text = concat!(
+            "#!/usr/bin/env zsh\n",
+            "\n",
+            "# Deploys the application.\n",
+            "# Arguments: $1 - target environment\n",
+            "deploy_app() {\n",
+            "  echo \"$1\"\n",
+            "}\n",
+            "\n",
+            "# API token for service\n",
+            "export API_KEY=\"secret\"\n",
+            "PORT=8080\n",
+            "alias ll='ls -la'\n",
+            "\n",
+            "cat <<'EOF'\n",
+            "# fake comment\n",
+            "heredoc_func() { : }\n",
+            "EOF\n",
+            "\n",
+            "echo $PORT ${API_KEY}\n",
+        );
+
+        let fn_doc = get_local_symbol_hover_doc(text, "deploy_app", false)
+            .expect("Expected function hover doc");
+        assert!(fn_doc.contains("### `deploy_app` (Local Function)"));
+        assert!(fn_doc.contains("```zsh\ndeploy_app()\n```"));
+        assert!(fn_doc.contains("Deploys the application.\nArguments: $1 - target environment"));
+        assert!(!fn_doc.contains("/usr/bin/env"));
+
+        let var_doc =
+            get_local_symbol_hover_doc(text, "API_KEY", true).expect("Expected variable hover doc");
+        assert!(var_doc.contains("### `API_KEY` (Local Variable)"));
+        assert!(var_doc.contains("export API_KEY=\"secret\""));
+        assert!(var_doc.contains("API token for service"));
+
+        let port_range = extract_word_at_position(text, Position::new(18, 6))
+            .unwrap()
+            .1;
+        assert!(is_variable_reference_at(text, port_range));
+        let port_doc = get_local_symbol_hover_doc(text, "PORT", true)
+            .expect("Expected PORT variable hover doc");
+        assert!(port_doc.contains("PORT=8080"));
+
+        let alias_doc =
+            get_local_symbol_hover_doc(text, "ll", false).expect("Expected alias hover doc");
+        assert!(alias_doc.contains("### `ll` (Local Alias)"));
+        assert!(alias_doc.contains("alias ll='ls -la'"));
+
+        assert!(
+            get_local_symbol_hover_doc(text, "heredoc_func", false).is_none(),
+            "Heredoc body must be ignored"
+        );
     }
 }
