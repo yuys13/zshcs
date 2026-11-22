@@ -1190,59 +1190,6 @@ fn is_local_var_declaration_at(lines: &[&str], loc: &Location) -> bool {
     false
 }
 
-fn resolve_scoped_variable_definitions(
-    text: &str,
-    uri: &Url,
-    var_name: &str,
-    cursor_pos: Position,
-) -> Vec<Location> {
-    let var_locs = scan_variable_definitions(text, uri, var_name);
-    if var_locs.len() <= 1 {
-        return var_locs;
-    }
-
-    let fn_ranges = scan_function_body_ranges(text);
-    let cursor_fn = find_innermost_enclosing_function(&fn_ranges, cursor_pos);
-    let lines: Vec<&str> = text.lines().collect();
-
-    let classified: Vec<(Location, Option<Range>, bool)> = var_locs
-        .iter()
-        .map(|loc| {
-            let enc = find_innermost_enclosing_function(&fn_ranges, loc.range.start);
-            let is_local = enc.is_some() && is_local_var_declaration_at(&lines, loc);
-            (loc.clone(), enc, is_local)
-        })
-        .collect();
-
-    if let Some(cur_fn) = cursor_fn {
-        let has_local_in_cur = classified
-            .iter()
-            .any(|(_, enc, is_local)| *is_local && *enc == Some(cur_fn));
-        if has_local_in_cur {
-            let scoped: Vec<Location> = classified
-                .iter()
-                .filter(|(_, enc, _)| *enc == Some(cur_fn))
-                .map(|(loc, _, _)| loc.clone())
-                .collect();
-            if !scoped.is_empty() {
-                return scoped;
-            }
-        }
-    }
-
-    let visible: Vec<Location> = classified
-        .into_iter()
-        .filter(|(_, enc, is_local)| !(*is_local && *enc != cursor_fn))
-        .map(|(loc, _, _)| loc)
-        .collect();
-
-    if visible.is_empty() {
-        var_locs
-    } else {
-        visible
-    }
-}
-
 fn locations_to_response(locs: Vec<Location>) -> Option<GotoDefinitionResponse> {
     if locs.is_empty() {
         None
@@ -1461,13 +1408,7 @@ pub fn find_definition_with_manager(
         return locations_to_response(sourced_locs);
     }
 
-    // 5. Preserve fallback to scoped current-document variable scan if needed
-    match target {
-        DefinitionTarget::Variable(var_name) => locations_to_response(
-            resolve_scoped_variable_definitions(text, uri, &var_name, position),
-        ),
-        DefinitionTarget::FunctionOrVariable(_) => None,
-    }
+    None
 }
 
 #[cfg(test)]
@@ -2222,17 +2163,18 @@ done
             "TARGET=\"global\"\n",
             "fn_a() {\n",
             "  local TARGET=\"local_a\"\n",
-            "  echo \"$TARGET\"\n",
+            "  local ONLY_IN_A=\"secret\"\n",
+            "  echo \"$TARGET\" \"$ONLY_IN_A\"\n",
             "}\n",
             "fn_b() {\n",
             "  typeset TARGET=\"local_b\"\n",
-            "  echo \"$TARGET\"\n",
+            "  echo \"$TARGET\" \"$ONLY_IN_A\"\n",
             "}\n",
-            "echo \"$TARGET\"\n",
+            "echo \"$TARGET\" \"$ONLY_IN_A\"\n",
         );
 
         // Inside fn_a: jumps only to fn_a's `local TARGET` on line 2
-        let def_in_a = find_definition(text, &uri, Position::new(3, 10));
+        let def_in_a = find_definition(text, &uri, Position::new(4, 10));
         assert_eq!(
             def_in_a,
             Some(GotoDefinitionResponse::Scalar(Location {
@@ -2241,18 +2183,32 @@ done
             }))
         );
 
-        // Inside fn_b: jumps only to fn_b's `typeset TARGET` on line 6
-        let def_in_b = find_definition(text, &uri, Position::new(7, 10));
+        // Inside fn_a: jumps to fn_a's `local ONLY_IN_A` on line 3
+        let def_only_a = find_definition(text, &uri, Position::new(4, 20));
+        assert_eq!(
+            def_only_a,
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: Range::new(Position::new(3, 8), Position::new(3, 17)),
+            }))
+        );
+
+        // Inside fn_b: jumps only to fn_b's `typeset TARGET` on line 7
+        let def_in_b = find_definition(text, &uri, Position::new(8, 10));
         assert_eq!(
             def_in_b,
             Some(GotoDefinitionResponse::Scalar(Location {
                 uri: uri.clone(),
-                range: Range::new(Position::new(6, 10), Position::new(6, 16)),
+                range: Range::new(Position::new(7, 10), Position::new(7, 16)),
             }))
         );
 
+        // Inside fn_b and at top-level: ONLY_IN_A is not visible
+        assert_eq!(find_definition(text, &uri, Position::new(8, 20)), None);
+        assert_eq!(find_definition(text, &uri, Position::new(10, 18)), None);
+
         // At top-level: jumps only to global `TARGET` on line 0
-        let def_global = find_definition(text, &uri, Position::new(9, 8));
+        let def_global = find_definition(text, &uri, Position::new(10, 8));
         assert_eq!(
             def_global,
             Some(GotoDefinitionResponse::Scalar(Location {
