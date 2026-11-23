@@ -1205,16 +1205,18 @@ async fn test_stress_concurrent_50_clients_resolve() {
 
 #[tokio::test]
 async fn test_stress_concurrent_50_clients_resolve_external_command_man_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use zshcs::lsp::completion::resolve_completion_item_async_with_timeout;
-    use zshcs::runtime::man::ManCache;
+    use zshcs::lsp::completion::resolve_completion_item_async_with_fetcher;
+    use zshcs::runtime::man::{ManCache, ManPageResult};
 
     let count = 50;
     let barrier = Arc::new(Barrier::new(count));
     let cache = Arc::new(ManCache::new());
+    let fetch_calls = Arc::new(AtomicUsize::new(0));
 
-    let git_item = CompletionItem {
-        label: "git".to_string(),
+    let mock_item = CompletionItem {
+        label: "stress_mock_external_cmd".to_string(),
         kind: Some(CompletionItemKind::FUNCTION),
         ..Default::default()
     };
@@ -1223,25 +1225,36 @@ async fn test_stress_concurrent_50_clients_resolve_external_command_man_cache() 
         .map(|i| {
             let b = barrier.clone();
             let cache_clone = Arc::clone(&cache);
-            let item = git_item.clone();
+            let calls = Arc::clone(&fetch_calls);
+            let item = mock_item.clone();
             tokio::spawn(async move {
                 b.wait().await; // Synchronize simultaneous resolve burst
 
-                let resolved = resolve_completion_item_async_with_timeout(
+                let resolved = resolve_completion_item_async_with_fetcher(
                     item,
                     &cache_clone,
                     Duration::from_millis(5000),
+                    move |_cmd, _dur| {
+                        let calls = Arc::clone(&calls);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            ManPageResult::Found(
+                                "STRESS_MOCK(1)\n\nNAME\n  stress_mock_external_cmd - synthetic manual page"
+                                    .to_string(),
+                            )
+                        }
+                    },
                 )
                 .await;
                 match resolved.documentation {
                     Some(Documentation::MarkupContent(ref markup)) => {
                         assert_eq!(markup.kind, MarkupKind::Markdown);
-                        assert!(
-                            markup.value.to_lowercase().contains("git")
-                                || markup.value.to_lowercase().contains("repository")
-                        );
+                        assert!(markup.value.contains("synthetic manual page"));
                     }
-                    other => panic!("Client {i}: Expected MarkupContent for git, got {other:?}"),
+                    other => panic!(
+                        "Client {i}: Expected MarkupContent for stress_mock_external_cmd, got {other:?}"
+                    ),
                 }
             })
         })
@@ -1251,8 +1264,13 @@ async fn test_stress_concurrent_50_clients_resolve_external_command_man_cache() 
         h.await.unwrap();
     }
 
-    assert!(cache.contains_key("git"));
-    let cached = cache.get("git").unwrap();
-    let doc = cached.as_ref().expect("git man page should be cached");
-    assert!(doc.to_lowercase().contains("git") || doc.to_lowercase().contains("repository"));
+    assert_eq!(
+        fetch_calls.load(Ordering::SeqCst),
+        1,
+        "Single-flight should coalesce all 50 concurrent lookups into 1 fetch"
+    );
+    assert!(cache.contains_key("stress_mock_external_cmd"));
+    let cached = cache.get("stress_mock_external_cmd").unwrap();
+    let doc = cached.as_ref().expect("mock man page should be cached");
+    assert!(doc.contains("synthetic manual page"));
 }

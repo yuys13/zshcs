@@ -229,7 +229,7 @@ pub fn resolve_completion_item(mut item: CompletionItem) -> CompletionItem {
 
 /// Resolves detailed documentation for a `CompletionItem` asynchronously using an underlying fetcher
 /// with single-flight request coalescing, negative caching, and timeout protection.
-pub(crate) async fn resolve_completion_item_async_with_fetcher<F, Fut>(
+pub async fn resolve_completion_item_async_with_fetcher<F, Fut>(
     mut item: CompletionItem,
     cache: &ManCache,
     timeout_dur: Duration,
