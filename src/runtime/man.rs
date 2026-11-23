@@ -370,6 +370,7 @@ mod tests {
     use crate::lsp::completion::{
         resolve_completion_item_async_with_fetcher, resolve_completion_item_async_with_timeout,
     };
+    use rstest::rstest;
     use tower_lsp::lsp_types::{CompletionItem, Documentation};
 
     #[test]
@@ -618,121 +619,43 @@ mod tests {
         assert!(!is_in_flight("timeout_protection_isolated_cmd"));
     }
 
-    #[test]
-    fn test_is_eligible_for_external_command_comprehensive() {
-        // Valid commands
-        assert!(is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "git"
-        ));
-        assert!(is_eligible_for_external_command(
-            Some(CompletionItemKind::TEXT),
-            "cargo"
-        ));
-        assert!(is_eligible_for_external_command(None, "grep"));
-        assert!(is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "python3.11"
-        ));
-        assert!(is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "git-commit"
-        ));
-        assert!(is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "7z"
-        ));
-        assert!(is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "my_cmd_1"
-        ));
-
-        // Ineligible labels: flags, dots, colons, punctuation-only, path slashes
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "-v"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "--help"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "."
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            ".."
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "..."
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            ".gitignore"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            ".zshrc"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "::"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            ":wq"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "git."
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "test:"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "_"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "__"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            ""
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "   "
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "foo/bar"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "/usr/bin/git"
-        ));
-
-        // Ineligible kinds
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FILE),
-            "git"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FOLDER),
-            "git"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::KEYWORD),
-            "git"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::VARIABLE),
-            "git"
-        ));
+    #[rstest]
+    // Valid commands
+    #[case(Some(CompletionItemKind::FUNCTION), "git", true)]
+    #[case(Some(CompletionItemKind::TEXT), "cargo", true)]
+    #[case(None, "grep", true)]
+    #[case(Some(CompletionItemKind::FUNCTION), "python3.11", true)]
+    #[case(Some(CompletionItemKind::FUNCTION), "git-commit", true)]
+    #[case(Some(CompletionItemKind::FUNCTION), "7z", true)]
+    #[case(Some(CompletionItemKind::FUNCTION), "my_cmd_1", true)]
+    // Ineligible labels: flags, dots, colons, punctuation-only, path slashes
+    #[case(Some(CompletionItemKind::FUNCTION), "-v", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "--help", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), ".", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "..", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "...", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), ".gitignore", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), ".zshrc", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "::", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), ":wq", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "git.", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "test:", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "_", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "__", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "   ", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "foo/bar", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "/usr/bin/git", false)]
+    // Ineligible kinds
+    #[case(Some(CompletionItemKind::FILE), "git", false)]
+    #[case(Some(CompletionItemKind::FOLDER), "git", false)]
+    #[case(Some(CompletionItemKind::KEYWORD), "git", false)]
+    #[case(Some(CompletionItemKind::VARIABLE), "git", false)]
+    fn test_is_eligible_for_external_command_cases(
+        #[case] kind: Option<CompletionItemKind>,
+        #[case] label: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(is_eligible_for_external_command(kind, label), expected);
     }
 }

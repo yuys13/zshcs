@@ -786,57 +786,29 @@ mod tests {
         assert_eq!(state.get_line_prefix(Position::new(10, 0)), None);
     }
 
-    #[test]
-    fn test_document_state_get_line_prefix_backslash_continuation() {
+    #[rstest]
+    #[case("git commit \\\n  --am", 1, 6, Some("git commit   --am"))]
+    #[case(
+        "git \\\r\n  commit \\\r\n  --amend",
+        2,
+        9,
+        Some("git   commit   --amend")
+    )]
+    #[case("echo hello \\\\\ngit st", 1, 6, Some("git st"))]
+    #[case("# comment \\\ngit st", 1, 6, Some("git st"))]
+    #[case("echo hi # inline comment \\\ngit st", 1, 6, Some("git st"))]
+    #[case("echo 'literal \\\ngit st", 1, 6, Some("git st"))]
+    fn test_document_state_get_line_prefix_backslash_continuation(
+        #[case] text: &str,
+        #[case] line: u32,
+        #[case] character: u32,
+        #[case] expected: Option<&str>,
+    ) {
         let uri = Url::parse("file:///multiline.zsh").unwrap();
-
-        // 1. Two-line continued command
-        let state1 = DocumentState::new(uri.clone(), 1, "git commit \\\n  --am".to_string());
+        let state = DocumentState::new(uri, 1, text.to_string());
         assert_eq!(
-            state1.get_line_prefix(Position::new(1, 6)),
-            Some("git commit   --am".to_string())
-        );
-
-        // 2. Three-line continued command with CRLF
-        let state2 = DocumentState::new(
-            uri.clone(),
-            1,
-            "git \\\r\n  commit \\\r\n  --amend".to_string(),
-        );
-        assert_eq!(
-            state2.get_line_prefix(Position::new(2, 9)),
-            Some("git   commit   --amend".to_string())
-        );
-
-        // 3. Escaped trailing double backslash should NOT join
-        let state3 = DocumentState::new(uri.clone(), 1, "echo hello \\\\\ngit st".to_string());
-        assert_eq!(
-            state3.get_line_prefix(Position::new(1, 6)),
-            Some("git st".to_string())
-        );
-
-        // 4. Comment lines ending with backslash should NOT join
-        let state4 = DocumentState::new(uri.clone(), 1, "# comment \\\ngit st".to_string());
-        assert_eq!(
-            state4.get_line_prefix(Position::new(1, 6)),
-            Some("git st".to_string())
-        );
-
-        let state5 = DocumentState::new(
-            uri.clone(),
-            1,
-            "echo hi # inline comment \\\ngit st".to_string(),
-        );
-        assert_eq!(
-            state5.get_line_prefix(Position::new(1, 6)),
-            Some("git st".to_string())
-        );
-
-        // 5. Single-quoted line ending with backslash should NOT join
-        let state6 = DocumentState::new(uri, 1, "echo 'literal \\\ngit st".to_string());
-        assert_eq!(
-            state6.get_line_prefix(Position::new(1, 6)),
-            Some("git st".to_string())
+            state.get_line_prefix(Position::new(line, character)),
+            expected.map(str::to_string)
         );
     }
 

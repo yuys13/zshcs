@@ -2347,51 +2347,52 @@ local \
         assert!(names.contains(&"VAR_TWO"));
     }
 
-    #[test]
-    fn test_is_command_position_no_false_positives() {
-        assert!(is_command_position(""));
-        assert!(is_command_position("   "));
-        assert!(is_command_position("echo foo; "));
-        assert!(is_command_position("echo foo | "));
-        assert!(is_command_position("echo foo && "));
-        assert!(is_command_position("echo foo || "));
-        assert!(is_command_position("echo $( "));
-        assert!(is_command_position("if true; then "));
-        assert!(is_command_position("for x in 1 2; do "));
-        assert!(is_command_position("if true; then :; else "));
-
-        // Negative cases: words ending in "do", "then", "else" must NOT trigger command position
-        assert!(!is_command_position("echo todo "));
-        assert!(!is_command_position("echo pseudo "));
-        assert!(!is_command_position("cat /path/to/something_else "));
-        assert!(!is_command_position("grep lengthen "));
+    #[rstest]
+    #[case("", true)]
+    #[case("   ", true)]
+    #[case("echo foo; ", true)]
+    #[case("echo foo | ", true)]
+    #[case("echo foo && ", true)]
+    #[case("echo foo || ", true)]
+    #[case("echo $( ", true)]
+    #[case("if true; then ", true)]
+    #[case("for x in 1 2; do ", true)]
+    #[case("if true; then :; else ", true)]
+    // Negative cases: words ending in "do", "then", "else" must NOT trigger command position
+    #[case("echo todo ", false)]
+    #[case("echo pseudo ", false)]
+    #[case("cat /path/to/something_else ", false)]
+    #[case("grep lengthen ", false)]
+    fn test_is_command_position_no_false_positives(#[case] prefix: &str, #[case] expected: bool) {
+        assert_eq!(is_command_position(prefix), expected);
     }
 
-    #[test]
-    fn test_extract_completion_token() {
-        assert_eq!(extract_completion_token("echo $MY_"), "$MY_");
-        assert_eq!(extract_completion_token("echo ${MY_"), "${MY_");
-        assert_eq!(extract_completion_token("echo \"$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("echo \"${MY_"), "${MY_");
-        assert_eq!(extract_completion_token("FOO=$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("FOO=${MY_"), "${MY_");
-        assert_eq!(extract_completion_token("PATH=$PATH:$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("echo /path/to/$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("echo -Dprop=$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("arr[$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("echo foo,$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("FOO=$"), "$");
-        assert_eq!(extract_completion_token("FOO=${"), "${");
-        assert_eq!(extract_completion_token("echo ${#MY_"), "${#MY_");
-        assert_eq!(extract_completion_token("echo /path/to/my_"), "");
-        assert_eq!(extract_completion_token("./my_"), "");
-        assert_eq!(extract_completion_token("my_func"), "my_func");
-        assert_eq!(extract_completion_token("cat file.txt | my_"), "my_");
-        assert_eq!(extract_completion_token("foo; my_"), "my_");
-        assert_eq!(extract_completion_token("echo $(my_"), "my_");
-        assert_eq!(extract_completion_token("echo "), "");
-        assert_eq!(extract_completion_token("# echo $MY_"), "");
-        assert_eq!(extract_completion_token("echo '$MY_"), "");
+    #[rstest]
+    #[case("echo $MY_", "$MY_")]
+    #[case("echo ${MY_", "${MY_")]
+    #[case("echo \"$MY_", "$MY_")]
+    #[case("echo \"${MY_", "${MY_")]
+    #[case("FOO=$MY_", "$MY_")]
+    #[case("FOO=${MY_", "${MY_")]
+    #[case("PATH=$PATH:$MY_", "$MY_")]
+    #[case("echo /path/to/$MY_", "$MY_")]
+    #[case("echo -Dprop=$MY_", "$MY_")]
+    #[case("arr[$MY_", "$MY_")]
+    #[case("echo foo,$MY_", "$MY_")]
+    #[case("FOO=$", "$")]
+    #[case("FOO=${", "${")]
+    #[case("echo ${#MY_", "${#MY_")]
+    #[case("echo /path/to/my_", "")]
+    #[case("./my_", "")]
+    #[case("my_func", "my_func")]
+    #[case("cat file.txt | my_", "my_")]
+    #[case("foo; my_", "my_")]
+    #[case("echo $(my_", "my_")]
+    #[case("echo ", "")]
+    #[case("# echo $MY_", "")]
+    #[case("echo '$MY_", "")]
+    fn test_extract_completion_token(#[case] prefix: &str, #[case] expected: &str) {
+        assert_eq!(extract_completion_token(prefix), expected);
     }
 
     #[test]
@@ -2917,22 +2918,24 @@ local \
         );
     }
 
-    #[test]
-    fn test_daemon_label_matches_local_variants() {
-        assert!(daemon_label_matches_local("MY_VAR", "MY_VAR"));
-        assert!(daemon_label_matches_local("$MY_VAR", "MY_VAR"));
-        assert!(daemon_label_matches_local("${MY_VAR}", "MY_VAR"));
-        assert!(daemon_label_matches_local("${MY_VAR", "MY_VAR"));
-        assert!(daemon_label_matches_local("MY_VAR:description", "MY_VAR"));
-        assert!(daemon_label_matches_local("$MY_VAR:description", "MY_VAR"));
-        assert!(daemon_label_matches_local(
-            "${MY_VAR}:description",
-            "MY_VAR"
-        ));
-        assert!(daemon_label_matches_local("${#MY_VAR}", "MY_VAR"));
-        assert!(daemon_label_matches_local("${#MY_VAR", "MY_VAR"));
-        assert!(daemon_label_matches_local("${#MY_VAR}:length", "MY_VAR"));
-        assert!(!daemon_label_matches_local("OTHER_VAR", "MY_VAR"));
+    #[rstest]
+    #[case("MY_VAR", "MY_VAR", true)]
+    #[case("$MY_VAR", "MY_VAR", true)]
+    #[case("${MY_VAR}", "MY_VAR", true)]
+    #[case("${MY_VAR", "MY_VAR", true)]
+    #[case("MY_VAR:description", "MY_VAR", true)]
+    #[case("$MY_VAR:description", "MY_VAR", true)]
+    #[case("${MY_VAR}:description", "MY_VAR", true)]
+    #[case("${#MY_VAR}", "MY_VAR", true)]
+    #[case("${#MY_VAR", "MY_VAR", true)]
+    #[case("${#MY_VAR}:length", "MY_VAR", true)]
+    #[case("OTHER_VAR", "MY_VAR", false)]
+    fn test_daemon_label_matches_local_variants(
+        #[case] label: &str,
+        #[case] name: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(daemon_label_matches_local(label, name), expected);
     }
 
     #[test]

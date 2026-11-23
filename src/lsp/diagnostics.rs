@@ -119,109 +119,108 @@ fn calculate_diagnostic_range(doc_lines: &[&str], line_num: u32) -> Range {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn test_parse_diagnostic_standard_parse_error() {
-        let stderr = "zsh:2: parse error near `;'";
-        let text = "echo hello\nif [[ ; then\n  echo bad\nfi";
+    #[rstest]
+    #[case(
+        "zsh:2: parse error near `;'",
+        "echo hello\nif [[ ; then\n  echo bad\nfi",
+        "parse error near `;'",
+        Position::new(1, 0),
+        Position::new(1, 12)
+    )]
+    #[case(
+        "zsh:1: unmatched \"",
+        "echo \"unclosed quote",
+        "unmatched \"",
+        Position::new(0, 0),
+        Position::new(0, 20)
+    )]
+    #[case(
+        "/var/folders/tmp_test.zsh:3: parse error near `then'",
+        "line1\nline2\nthen\nline4",
+        "parse error near `then'",
+        Position::new(2, 0),
+        Position::new(2, 4)
+    )]
+    #[case(
+        "zsh: parse error near `\\n'",
+        "if true",
+        "parse error near `\\n'",
+        Position::new(0, 0),
+        Position::new(0, 7)
+    )]
+    #[case(
+        "zsh:999: parse error near `end'",
+        "line1\nline2\nline3",
+        "parse error near `end'",
+        Position::new(2, 0),
+        Position::new(2, 5)
+    )]
+    #[case(
+        "zsh:0: parse error",
+        "first line",
+        "parse error",
+        Position::new(0, 0),
+        Position::new(0, 10)
+    )]
+    #[case(
+        "zsh:1: parse error",
+        "",
+        "parse error",
+        Position::new(0, 0),
+        Position::new(0, 0)
+    )]
+    #[case(
+        "zsh:2: parse error near `;'",
+        "echo 1\n日本語テスト 👨‍👩‍👧‍👦 ;;\necho 3",
+        "parse error near `;'",
+        Position::new(1, 0),
+        Position::new(1, "日本語テスト 👨‍👩‍👧‍👦 ;;".encode_utf16().count() as u32)
+    )]
+    #[case(
+        "zsh:2: parse error near `;'",
+        "echo hello\r\nif [[ ; then\r\n  echo bad\r\nfi\r\n",
+        "parse error near `;'",
+        Position::new(1, 0),
+        Position::new(1, 12)
+    )]
+    #[case(
+        "zsh:1: parse error near `then'",
+        "if [[ ; then",
+        "parse error near `then'",
+        Position::new(0, 0),
+        Position::new(0, 12)
+    )]
+    #[case(
+        "/path:with:colons/file.zsh:7: parse error near `fi'",
+        "1\n2\n3\n4\n5\n6\nfi\n8",
+        "parse error near `fi'",
+        Position::new(6, 0),
+        Position::new(6, 2)
+    )]
+    fn test_parse_diagnostic_single_line_cases(
+        #[case] stderr: &str,
+        #[case] text: &str,
+        #[case] expected_msg: &str,
+        #[case] expected_start: Position,
+        #[case] expected_end: Position,
+    ) {
         let diags = parse_diagnostics(stderr, text);
         assert_eq!(diags.len(), 1);
         let diag = &diags[0];
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(diag.source, Some("zshcs".to_string()));
-        assert_eq!(diag.message, "parse error near `;'");
-        assert_eq!(diag.range.start, Position::new(1, 0));
-        assert_eq!(diag.range.end, Position::new(1, 12));
+        assert_eq!(diag.message, expected_msg);
+        assert_eq!(diag.range.start, expected_start);
+        assert_eq!(diag.range.end, expected_end);
     }
 
-    #[test]
-    fn test_parse_diagnostic_unmatched_quote() {
-        let stderr = "zsh:1: unmatched \"";
-        let text = "echo \"unclosed quote";
-        let diags = parse_diagnostics(stderr, text);
-        assert_eq!(diags.len(), 1);
-        let diag = &diags[0];
-        assert_eq!(diag.message, "unmatched \"");
-        assert_eq!(diag.range.start, Position::new(0, 0));
-        assert_eq!(diag.range.end, Position::new(0, 20));
-    }
-
-    #[test]
-    fn test_parse_diagnostic_file_path_prefix() {
-        let stderr = "/var/folders/tmp_test.zsh:3: parse error near `then'";
-        let text = "line1\nline2\nthen\nline4";
-        let diags = parse_diagnostics(stderr, text);
-        assert_eq!(diags.len(), 1);
-        let diag = &diags[0];
-        assert_eq!(diag.message, "parse error near `then'");
-        assert_eq!(diag.range.start, Position::new(2, 0));
-        assert_eq!(diag.range.end, Position::new(2, 4));
-    }
-
-    #[test]
-    fn test_parse_diagnostic_no_line_number() {
-        let stderr = "zsh: parse error near `\\n'";
-        let text = "if true";
-        let diags = parse_diagnostics(stderr, text);
-        assert_eq!(diags.len(), 1);
-        let diag = &diags[0];
-        assert_eq!(diag.message, "parse error near `\\n'");
-        assert_eq!(diag.range.start, Position::new(0, 0));
-        assert_eq!(diag.range.end, Position::new(0, 7));
-    }
-
-    #[test]
-    fn test_parse_diagnostic_out_of_bounds_line() {
-        let stderr = "zsh:999: parse error near `end'";
-        let text = "line1\nline2\nline3";
-        let diags = parse_diagnostics(stderr, text);
-        assert_eq!(diags.len(), 1);
-        let diag = &diags[0];
-        // Line 999 clamped to line 2 (0-indexed, 3rd line)
-        assert_eq!(diag.range.start, Position::new(2, 0));
-        assert_eq!(diag.range.end, Position::new(2, 5));
-    }
-
-    #[test]
-    fn test_parse_diagnostic_zero_line() {
-        let stderr = "zsh:0: parse error";
-        let text = "first line";
-        let diags = parse_diagnostics(stderr, text);
-        assert_eq!(diags.len(), 1);
-        let diag = &diags[0];
-        assert_eq!(diag.range.start, Position::new(0, 0));
-        assert_eq!(diag.range.end, Position::new(0, 10));
-    }
-
-    #[test]
-    fn test_parse_diagnostic_empty_text() {
-        let stderr = "zsh:1: parse error";
-        let text = "";
-        let diags = parse_diagnostics(stderr, text);
-        assert_eq!(diags.len(), 1);
-        let diag = &diags[0];
-        assert_eq!(diag.range.start, Position::new(0, 0));
-        assert_eq!(diag.range.end, Position::new(0, 0));
-    }
-
-    #[test]
-    fn test_parse_diagnostic_multibyte_line_range() {
-        let stderr = "zsh:2: parse error near `;'";
-        let text = "echo 1\n日本語テスト 👨‍👩‍👧‍👦 ;;\necho 3";
-        let diags = parse_diagnostics(stderr, text);
-        assert_eq!(diags.len(), 1);
-        let diag = &diags[0];
-        assert_eq!(diag.range.start, Position::new(1, 0));
-        // "日本語テスト 👨‍👩‍👧‍👦 ;;" utf16 len:
-        // 6 + 1 + 11 + 1 + 2 = 21
-        let expected_utf16 = "日本語テスト 👨‍👩‍👧‍👦 ;;".encode_utf16().count() as u32;
-        assert_eq!(diag.range.end, Position::new(1, expected_utf16));
-    }
-
-    #[test]
-    fn test_parse_diagnostics_empty_or_whitespace_stderr() {
-        assert!(parse_diagnostics("", "text").is_empty());
-        assert!(parse_diagnostics("   \n\n  \t ", "text").is_empty());
+    #[rstest]
+    #[case("")]
+    #[case("   \n\n  \t ")]
+    fn test_parse_diagnostics_empty_or_whitespace_stderr(#[case] stderr: &str) {
+        assert!(parse_diagnostics(stderr, "text").is_empty());
     }
 
     #[test]
@@ -304,37 +303,5 @@ mod tests {
         let (line3, msg3) = extract_line_and_message("fatal syntax error");
         assert_eq!(line3, 1);
         assert_eq!(msg3, "fatal syntax error");
-    }
-
-    #[test]
-    fn test_parse_diagnostic_crlf() {
-        let stderr = "zsh:2: parse error near `;'";
-        let text = "echo hello\r\nif [[ ; then\r\n  echo bad\r\nfi\r\n";
-        let diags = parse_diagnostics(stderr, text);
-        assert_eq!(diags.len(), 1);
-        let diag = &diags[0];
-        assert_eq!(diag.range.start, Position::new(1, 0));
-        assert_eq!(diag.range.end, Position::new(1, 12));
-    }
-
-    #[test]
-    fn test_parse_diagnostic_no_trailing_newline() {
-        let stderr = "zsh:1: parse error near `then'";
-        let text = "if [[ ; then";
-        let diags = parse_diagnostics(stderr, text);
-        assert_eq!(diags.len(), 1);
-        let diag = &diags[0];
-        assert_eq!(diag.range.start, Position::new(0, 0));
-        assert_eq!(diag.range.end, Position::new(0, 12));
-    }
-
-    #[test]
-    fn test_parse_diagnostic_path_with_multiple_colons() {
-        let stderr = "/path:with:colons/file.zsh:7: parse error near `fi'";
-        let text = "1\n2\n3\n4\n5\n6\nfi\n8";
-        let diags = parse_diagnostics(stderr, text);
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].range.start, Position::new(6, 0));
-        assert_eq!(diags[0].message, "parse error near `fi'");
     }
 }
