@@ -638,6 +638,7 @@ pub fn run_doctor() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn test_check_result_helpers() {
@@ -689,5 +690,93 @@ mod tests {
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn test_check_status_symbols_and_labels() {
+        assert_eq!(CheckStatus::Pass.symbol(), "[✓]");
+        assert_eq!(CheckStatus::Pass.label(), "PASS");
+
+        assert_eq!(CheckStatus::Warn.symbol(), "[!]");
+        assert_eq!(CheckStatus::Warn.label(), "WARN");
+
+        assert_eq!(CheckStatus::Fail.symbol(), "[✗]");
+        assert_eq!(CheckStatus::Fail.label(), "FAIL");
+    }
+
+    #[rstest]
+    #[case(
+        vec![
+            CheckResult::new("Zsh Executable", CheckStatus::Pass, "zsh 5.9"),
+            CheckResult::new("Zpty Module", CheckStatus::Pass, "module loaded"),
+        ],
+        true,
+        (2, 0, 0),
+        "[✓] Zsh Executable: zsh 5.9",
+        "Result: 2/2 checks passed",
+    )]
+    #[case(
+        vec![
+            CheckResult::new("Zsh Executable", CheckStatus::Pass, "zsh 5.9"),
+            CheckResult::new("Zpty Module", CheckStatus::Fail, "module not found"),
+            CheckResult::new("Custom Check", CheckStatus::Warn, "deprecated config"),
+        ],
+        false,
+        (1, 1, 1),
+        "[✗] Zpty Module: module not found",
+        "Result: 1/3 checks passed, 1 failed, 1 warning(s)",
+    )]
+    #[case(
+        vec![
+            CheckResult::new("Zsh Executable", CheckStatus::Pass, "zsh 5.9"),
+            CheckResult::new("Zpty Module", CheckStatus::Fail, "module not found"),
+        ],
+        false,
+        (1, 1, 0),
+        "[✗] Zpty Module: module not found",
+        "Result: 1/2 checks passed, 1 failed. Please address the failed items above.",
+    )]
+    #[case(
+        vec![
+            CheckResult::new("Zsh Executable", CheckStatus::Pass, "zsh 5.9"),
+            CheckResult::new("Zpty Module", CheckStatus::Pass, "module loaded"),
+            CheckResult::new("Cache Directory", CheckStatus::Warn, "sub-optimal directory"),
+        ],
+        true,
+        (2, 0, 1),
+        "[!] Cache Directory: sub-optimal directory",
+        "Result: 2/3 checks passed, 1 warning(s). Your environment is ready for zshcs!",
+    )]
+    #[case(
+        vec![CheckResult::new("Zsh Executable", CheckStatus::Fail, "missing zsh")],
+        false,
+        (0, 1, 0),
+        "[✗] Zsh Executable: missing zsh",
+        "Result: 0/1 checks passed, 1 failed. Please address the failed items above.",
+    )]
+    fn test_doctor_report_rendering(
+        #[case] checks: Vec<CheckResult>,
+        #[case] expected_all_passed: bool,
+        #[case] expected_counts: (usize, usize, usize),
+        #[case] expected_line: &str,
+        #[case] expected_summary: &str,
+    ) {
+        let report = DoctorReport::new(checks);
+        assert_eq!(report.is_all_passed(), expected_all_passed);
+        assert_eq!(
+            (
+                report.pass_count(),
+                report.fail_count(),
+                report.warn_count()
+            ),
+            expected_counts
+        );
+
+        let mut output = Vec::new();
+        report.render(&mut output).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+
+        assert!(rendered.contains(expected_line));
+        assert!(rendered.contains(expected_summary));
     }
 }

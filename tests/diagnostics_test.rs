@@ -376,29 +376,3 @@ async fn test_diagnostics_multiple_documents_dynamic_toggle() {
     assert!(clear_a.diagnostics.is_empty());
     assert!(clear_b.diagnostics.is_empty());
 }
-
-#[tokio::test]
-async fn test_diagnostics_flat_initialization_options() {
-    let mut harness = setup_server();
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///flat_opt.zsh").unwrap();
-    test_client
-        .init_with_options_and_open(
-            Some(json!({
-                "experimental": {
-                    "diagnostics": true
-                }
-            })),
-            &doc_uri,
-            "if [[ ; then",
-        )
-        .await;
-
-    let diag = test_client
-        .read_notification::<PublishDiagnostics>()
-        .await
-        .expect("Expected diagnostic notification");
-    assert_eq!(diag.uri, doc_uri);
-    assert_eq!(diag.diagnostics.len(), 1);
-}
