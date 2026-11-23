@@ -264,27 +264,34 @@ pub fn resolve_variable_defs<'a>(
         return matches;
     }
 
+    let local_fns: HashSet<usize> = matches
+        .iter()
+        .filter(|v| v.is_function_local)
+        .filter_map(|v| v.enclosing_fn)
+        .collect();
+
     let cursor_fn = cursor_pos.and_then(|pos| find_innermost_enclosing_function(index, pos));
 
-    if let Some(cur_fn) = cursor_fn {
-        let has_local_in_cur = matches
+    if let Some(cur_fn) = cursor_fn
+        && local_fns.contains(&cur_fn)
+    {
+        let scoped: Vec<&VariableDef> = matches
             .iter()
-            .any(|v| v.is_function_local && v.enclosing_fn == Some(cur_fn));
-        if has_local_in_cur {
-            let scoped: Vec<&VariableDef> = matches
-                .iter()
-                .copied()
-                .filter(|v| v.enclosing_fn == Some(cur_fn))
-                .collect();
-            if !scoped.is_empty() {
-                return scoped;
-            }
+            .copied()
+            .filter(|v| v.enclosing_fn == Some(cur_fn))
+            .collect();
+        if !scoped.is_empty() {
+            return scoped;
         }
     }
 
     matches
         .into_iter()
-        .filter(|v| !(v.is_function_local && v.enclosing_fn != cursor_fn))
+        .filter(|v| {
+            !(v.enclosing_fn != cursor_fn
+                && v.enclosing_fn
+                    .is_some_and(|enc_fn| local_fns.contains(&enc_fn)))
+        })
         .collect()
 }
 
@@ -393,6 +400,71 @@ fn_b() {
         // Inside fn_b: Y is not visible
         let y_in_b = resolve_variable_defs(&index, "Y", Some(Position::new(8, 11)));
         assert!(y_in_b.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_variable_defs_local_reassignment_does_not_leak() {
+        let text = r#"
+X="global"
+fn_a() {
+    local X="local_a"
+    X="reassigned_a"
+    local Y="only_a"
+    Y="reassigned_y"
+    typeset -g Z="global_from_a"
+    export E="exported_from_a"
+    G="implicit_global_from_a"
+    echo "$X"
+}
+fn_b() {
+    echo "$X"
+    echo "$Y"
+    echo "$Z"
+    echo "$E"
+    echo "$G"
+}
+echo "$X"
+echo "$Y"
+"#;
+        let index = parse_document(text);
+
+        // Inside fn_a: X resolves to both local declaration and reassignment in fn_a
+        let x_in_a = resolve_variable_defs(&index, "X", Some(Position::new(10, 11)));
+        let x_in_a_lines: Vec<u32> = x_in_a.iter().map(|v| v.name_range.start.line).collect();
+        assert_eq!(x_in_a_lines, vec![3, 4]);
+
+        // Inside fn_b: X resolves only to global X (neither local X nor reassignment in fn_a leaks)
+        let x_in_b = resolve_variable_defs(&index, "X", Some(Position::new(13, 11)));
+        let x_in_b_lines: Vec<u32> = x_in_b.iter().map(|v| v.name_range.start.line).collect();
+        assert_eq!(x_in_b_lines, vec![1]);
+
+        // Inside fn_b: Y is not visible at all (neither local Y nor reassignment in fn_a leaks)
+        let y_in_b = resolve_variable_defs(&index, "Y", Some(Position::new(14, 11)));
+        assert!(y_in_b.is_empty());
+
+        // Top-level and None cursor_pos: local X/Y and their reassignments in fn_a do not leak
+        let x_top = resolve_variable_defs(&index, "X", Some(Position::new(19, 7)));
+        let x_top_lines: Vec<u32> = x_top.iter().map(|v| v.name_range.start.line).collect();
+        assert_eq!(x_top_lines, vec![1]);
+
+        let y_top = resolve_variable_defs(&index, "Y", Some(Position::new(20, 7)));
+        assert!(y_top.is_empty());
+
+        let y_none = resolve_variable_defs(&index, "Y", None);
+        assert!(y_none.is_empty());
+
+        // Global declarations/assignments without local declaration remain visible across scopes
+        let z_in_b = resolve_variable_defs(&index, "Z", Some(Position::new(15, 11)));
+        assert_eq!(z_in_b.len(), 1);
+        assert_eq!(z_in_b[0].name_range.start.line, 7);
+
+        let e_in_b = resolve_variable_defs(&index, "E", Some(Position::new(16, 11)));
+        assert_eq!(e_in_b.len(), 1);
+        assert_eq!(e_in_b[0].name_range.start.line, 8);
+
+        let g_in_b = resolve_variable_defs(&index, "G", Some(Position::new(17, 11)));
+        assert_eq!(g_in_b.len(), 1);
+        assert_eq!(g_in_b[0].name_range.start.line, 9);
     }
 
     #[test]
