@@ -112,6 +112,21 @@ pub async fn get_hover_info_with_timeout(
     word: &str,
     timeout_dur: Duration,
 ) -> Option<HoverContents> {
+    get_hover_info_with_fetcher(word, timeout_dur, |w, dur| async move {
+        get_man_page(&w, dur).await
+    })
+    .await
+}
+
+pub(crate) async fn get_hover_info_with_fetcher<F, Fut>(
+    word: &str,
+    timeout_dur: Duration,
+    fetcher: F,
+) -> Option<HoverContents>
+where
+    F: FnOnce(String, Duration) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
     // 1. Check static dictionary for word or basename
     if let Some(doc) = get_builtin_or_reserved_doc(word) {
         return Some(HoverContents::Markup(MarkupContent {
@@ -137,7 +152,7 @@ pub async fn get_hover_info_with_timeout(
     }
 
     // 2. Query man page asynchronously
-    let man_text = get_man_page(word, timeout_dur).await?;
+    let man_text = fetcher(word.to_string(), timeout_dur).await?;
     if man_text.is_empty() {
         return None;
     }
@@ -587,11 +602,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_hover_info_timeout_handling() {
-        // Zero timeout should expire immediately
-        let hover = get_hover_info_with_timeout("ls", Duration::from_nanos(1)).await;
-        // Either times out and returns None, or if cached returns Some
-        // We verify that it does not panic or hang
-        let _ = hover;
+        // Slow command must deterministically time out and return None
+        let hover =
+            get_hover_info_with_fetcher("ls", Duration::from_millis(20), |w, dur| async move {
+                match crate::runtime::man::get_man_page_result_with_command(
+                    &w,
+                    dur,
+                    "zsh",
+                    &["-c", "sleep 10"],
+                )
+                .await
+                {
+                    ManPageResult::Found(page) => Some(page),
+                    _ => None,
+                }
+            })
+            .await;
+        assert!(hover.is_none());
     }
 
     #[tokio::test]

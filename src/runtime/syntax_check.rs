@@ -5,6 +5,15 @@ pub const DEFAULT_SYNTAX_CHECK_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Runs `zsh -n` on `text` with `timeout_dur` and returns `Some(stderr)` if syntax errors are reported.
 pub async fn run_zsh_syntax_check(text: &str, timeout_dur: Duration) -> Option<String> {
+    run_zsh_syntax_check_with_command(text, timeout_dur, "zsh", &["-n"]).await
+}
+
+pub(crate) async fn run_zsh_syntax_check_with_command(
+    text: &str,
+    timeout_dur: Duration,
+    program: &str,
+    args: &[&str],
+) -> Option<String> {
     if text.trim().is_empty() {
         return None;
     }
@@ -27,8 +36,8 @@ pub async fn run_zsh_syntax_check(text: &str, timeout_dur: Duration) -> Option<S
         return None;
     }
 
-    let mut cmd = tokio::process::Command::new("zsh");
-    cmd.arg("-n")
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
         .arg(&temp_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -59,4 +68,50 @@ pub async fn run_zsh_syntax_check(text: &str, timeout_dur: Duration) -> Option<S
     }
 
     Some(String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_run_zsh_syntax_check_empty_and_whitespace() {
+        assert_eq!(
+            run_zsh_syntax_check("", DEFAULT_SYNTAX_CHECK_TIMEOUT).await,
+            None
+        );
+        assert_eq!(
+            run_zsh_syntax_check("   \n\t ", DEFAULT_SYNTAX_CHECK_TIMEOUT).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_zsh_syntax_check_valid_script() {
+        let res = run_zsh_syntax_check(
+            "echo ok\nif true; then :; fi\n",
+            DEFAULT_SYNTAX_CHECK_TIMEOUT,
+        )
+        .await;
+        assert_eq!(res, None);
+    }
+
+    #[tokio::test]
+    async fn test_run_zsh_syntax_check_invalid_script() {
+        let res = run_zsh_syntax_check("if [[ ; then\n", DEFAULT_SYNTAX_CHECK_TIMEOUT).await;
+        let stderr = res.expect("Expected syntax error stderr");
+        assert!(stderr.contains("parse error"), "Got stderr: {stderr}");
+    }
+
+    #[tokio::test]
+    async fn test_run_zsh_syntax_check_timeout() {
+        let res = run_zsh_syntax_check_with_command(
+            "if [[ ; then\n",
+            Duration::from_millis(20),
+            "zsh",
+            &["-c", "sleep 10"],
+        )
+        .await;
+        assert_eq!(res, None);
+    }
 }

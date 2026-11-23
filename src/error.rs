@@ -139,10 +139,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_error_conversion_and_display() {
-        let result = tokio::time::timeout(std::time::Duration::from_millis(1), async {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        })
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>()).await;
 
         let elapsed_err = result.unwrap_err();
         let err: ZshcsError = elapsed_err.into();

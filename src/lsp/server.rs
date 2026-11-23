@@ -36,6 +36,7 @@ pub struct Backend {
     man_cache: Arc<ManCache>,
     diagnostic_tasks: Arc<dashmap::DashMap<Url, (u64, tokio::task::AbortHandle)>>,
     diagnostic_task_seq: Arc<std::sync::atomic::AtomicU64>,
+    diagnostics_debounce: Duration,
 }
 
 impl Backend {
@@ -86,6 +87,7 @@ impl Backend {
             man_cache: Arc::new(dashmap::DashMap::new()),
             diagnostic_tasks: Arc::new(dashmap::DashMap::new()),
             diagnostic_task_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            diagnostics_debounce: Duration::from_millis(150),
         })
     }
 
@@ -136,6 +138,7 @@ impl Backend {
             man_cache: Arc::new(dashmap::DashMap::new()),
             diagnostic_tasks: Arc::new(dashmap::DashMap::new()),
             diagnostic_task_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            diagnostics_debounce: Duration::from_millis(150),
         })
     }
 
@@ -149,6 +152,11 @@ impl Backend {
 
     pub fn man_cache(&self) -> Arc<ManCache> {
         Arc::clone(&self.man_cache)
+    }
+
+    pub fn with_diagnostics_debounce(mut self, debounce: Duration) -> Self {
+        self.diagnostics_debounce = debounce;
+        self
     }
 
     pub async fn is_diagnostics_enabled(&self) -> bool {
@@ -409,7 +417,7 @@ impl LanguageServer for Backend {
             .await;
 
         if self.is_diagnostics_enabled().await {
-            self.spawn_diagnostics_task(uri, version, Some(Duration::from_millis(150)));
+            self.spawn_diagnostics_task(uri, version, Some(self.diagnostics_debounce));
         }
     }
 
@@ -1338,5 +1346,83 @@ done
         assert!(backend.hover(hover_params).await.unwrap().is_none());
         assert!(backend.goto_definition(def_params).await.unwrap().is_none());
         assert!(backend.document_symbol(sym_params).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_backend_shutdown_stops_spawned_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("daemon.pid");
+        let mock_capture = format!(
+            r#"#!/usr/bin/env zsh
+echo $$ > "{pid}"
+while IFS= read -r msg; do
+    case "$msg" in
+        chdir:*) ;;
+        input:*)
+            printf 'alive_item\n\x01EOC\x01\n'
+            ;;
+    esac
+done
+"#,
+            pid = pid_file.display()
+        );
+
+        let (service, mut socket) = LspService::new(|client| {
+            Backend::new_with_scripts(client, &mock_capture, "# mock zptyrc\n")
+                .unwrap()
+                .with_diagnostics_debounce(Duration::ZERO)
+        });
+        let _drain = tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
+        let backend = service.inner();
+
+        let uri = Url::parse("file:///shutdown_daemon.zsh").unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: "git \n".to_string(),
+                },
+            })
+            .await;
+
+        let comp_res = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(0, 4),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap();
+        assert!(comp_res.is_some());
+        assert!(pid_file.exists(), "Daemon must have been spawned");
+
+        // Shutdown stops the running daemon
+        backend.shutdown().await.unwrap();
+
+        // Subsequent completion request should no longer receive daemon items
+        let after_shutdown = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position::new(0, 4),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await;
+        assert!(
+            matches!(after_shutdown, Ok(None) | Err(_)),
+            "Expected no daemon completion after shutdown, got: {after_shutdown:?}"
+        );
     }
 }
