@@ -269,24 +269,45 @@ pub(crate) fn prioritized_source_paths(
 struct WorkspaceCollector<'a> {
     doc_manager: Option<&'a DocumentManager>,
     visited_uris: HashSet<Url>,
-    docs: Vec<SourcedDocument>,
+    loaded_files: usize,
 }
 
 impl<'a> WorkspaceCollector<'a> {
-    fn collect(
+    fn new(base_uri: &Url, doc_manager: Option<&'a DocumentManager>) -> Self {
+        let mut visited_uris = HashSet::new();
+        visited_uris.insert(base_uri.clone());
+        if let Ok(path) = base_uri.to_file_path()
+            && let Ok(canon) = path.canonicalize()
+            && let Ok(canon_uri) = Url::from_file_path(canon)
+        {
+            visited_uris.insert(canon_uri);
+        }
+
+        Self {
+            doc_manager,
+            visited_uris,
+            loaded_files: 0,
+        }
+    }
+
+    fn visit<T, F>(
         &mut self,
         index: &DocumentIndex,
         base_uri: &Url,
         cursor_pos: Position,
         include_after_cursor: bool,
         depth: usize,
-    ) {
-        if depth >= MAX_SOURCE_DEPTH || self.docs.len() >= MAX_SOURCED_FILES {
-            return;
+        visitor: &mut F,
+    ) -> Option<T>
+    where
+        F: FnMut(&SourcedDocument) -> Option<T>,
+    {
+        if depth >= MAX_SOURCE_DEPTH || self.loaded_files >= MAX_SOURCED_FILES {
+            return None;
         }
 
         for path_str in prioritized_source_paths(index, cursor_pos, include_after_cursor) {
-            if self.docs.len() >= MAX_SOURCED_FILES {
+            if self.loaded_files >= MAX_SOURCED_FILES {
                 break;
             }
 
@@ -313,22 +334,57 @@ impl<'a> WorkspaceCollector<'a> {
             if let Some(raw_uri) = uris.raw_uri {
                 self.visited_uris.insert(raw_uri);
             }
+            self.loaded_files += 1;
 
-            self.docs.push(SourcedDocument {
-                uri: uris.primary_uri.clone(),
+            let doc = SourcedDocument {
+                uri: uris.primary_uri,
                 text: content,
-                index: Arc::clone(&child_index),
-            });
+                index: child_index,
+            };
 
-            self.collect(
-                &child_index,
-                &uris.primary_uri,
+            if let Some(found) = visitor(&doc) {
+                return Some(found);
+            }
+
+            if let Some(found) = self.visit(
+                &doc.index,
+                &doc.uri,
                 Position::new(u32::MAX, u32::MAX),
                 true,
                 depth + 1,
-            );
+                visitor,
+            ) {
+                return Some(found);
+            }
         }
+
+        None
     }
+}
+
+/// Traverses sourced scripts referenced from `index` in priority order, invoking `visitor`
+/// on each resolved document and short-circuiting as soon as `visitor` returns `Some(T)`.
+/// Preserves cycle detection, depth cap (`MAX_SOURCE_DEPTH`), and file count cap (`MAX_SOURCED_FILES`).
+pub fn find_in_sourced_documents<T, F>(
+    index: &DocumentIndex,
+    base_uri: &Url,
+    cursor_pos: Position,
+    doc_manager: Option<&DocumentManager>,
+    include_after_cursor: bool,
+    mut visitor: F,
+) -> Option<T>
+where
+    F: FnMut(&SourcedDocument) -> Option<T>,
+{
+    let mut collector = WorkspaceCollector::new(base_uri, doc_manager);
+    collector.visit(
+        index,
+        base_uri,
+        cursor_pos,
+        include_after_cursor,
+        0,
+        &mut visitor,
+    )
 }
 
 /// Collects and parses sourced scripts referenced from `index` in priority order,
@@ -340,26 +396,23 @@ pub fn collect_sourced_documents(
     doc_manager: Option<&DocumentManager>,
     include_after_cursor: bool,
 ) -> Vec<SourcedDocument> {
-    let mut visited_uris = HashSet::new();
-    visited_uris.insert(base_uri.clone());
-    if let Ok(path) = base_uri.to_file_path()
-        && let Ok(canon) = path.canonicalize()
-        && let Ok(canon_uri) = Url::from_file_path(canon)
-    {
-        visited_uris.insert(canon_uri);
-    }
-
-    let mut collector = WorkspaceCollector {
+    let mut docs = Vec::new();
+    find_in_sourced_documents::<(), _>(
+        index,
+        base_uri,
+        cursor_pos,
         doc_manager,
-        visited_uris,
-        docs: Vec::new(),
-    };
-    collector.collect(index, base_uri, cursor_pos, include_after_cursor, 0);
-    collector.docs
+        include_after_cursor,
+        |doc| {
+            docs.push(doc.clone());
+            None
+        },
+    );
+    docs
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::Cell;
     use tempfile::tempdir;
@@ -372,11 +425,11 @@ mod tests {
         SOURCED_LOAD_COUNT.with(|c| c.set(c.get() + 1));
     }
 
-    fn reset_load_count() {
+    pub(crate) fn reset_load_count() {
         SOURCED_LOAD_COUNT.with(|c| c.set(0));
     }
 
-    fn get_load_count() -> usize {
+    pub(crate) fn get_load_count() -> usize {
         SOURCED_LOAD_COUNT.with(|c| c.get())
     }
 
@@ -536,5 +589,45 @@ mod tests {
         );
         assert_eq!(sourced.len(), 1);
         assert_eq!(sourced[0].index.functions[0].name, "fn_in_memory");
+    }
+
+    #[test]
+    fn test_find_in_sourced_documents_short_circuits_without_loading_remaining_or_nested_files() {
+        let dir = tempdir().unwrap();
+        let main_path = dir.path().join("main.zsh");
+        let a_path = dir.path().join("a.zsh");
+        let b_path = dir.path().join("b.zsh");
+        let nested_path = dir.path().join("nested.zsh");
+
+        std::fs::write(&nested_path, "nested_fn() { : }\n").unwrap();
+        std::fs::write(&a_path, "source ./nested.zsh\ntarget_fn() { : }\n").unwrap();
+        std::fs::write(&b_path, "other_fn() { : }\n").unwrap();
+
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let main_idx = parse_document("source ./a.zsh\nsource ./b.zsh\n");
+
+        reset_load_count();
+        let found = find_in_sourced_documents(
+            &main_idx,
+            &main_uri,
+            Position::new(2, 0),
+            None,
+            true,
+            |doc| {
+                doc.index
+                    .functions
+                    .iter()
+                    .find(|f| f.name == "target_fn")
+                    .map(|f| (doc.uri.clone(), f.name.clone()))
+            },
+        );
+
+        let a_canon_uri = Url::from_file_path(a_path.canonicalize().unwrap()).unwrap();
+        assert_eq!(found, Some((a_canon_uri, "target_fn".to_string())));
+        assert_eq!(
+            get_load_count(),
+            1,
+            "Short-circuiting visitor should load only a.zsh and skip nested.zsh and b.zsh"
+        );
     }
 }

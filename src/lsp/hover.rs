@@ -7,7 +7,7 @@ use crate::analysis::parser::parse_document;
 use crate::analysis::scope::{resolve_alias_defs, resolve_function_defs, resolve_variable_defs};
 pub use crate::analysis::syntax::is_word_char;
 use crate::analysis::syntax::utf16_col_to_byte;
-use crate::analysis::workspace::collect_sourced_documents;
+use crate::analysis::workspace::find_in_sourced_documents;
 use crate::document::DocumentManager;
 pub use crate::runtime::man::{
     DEFAULT_HOVER_MAN_TIMEOUT, ManPageResult, clean_man_text, format_man_markdown, get_man_page,
@@ -332,14 +332,9 @@ pub fn get_local_symbol_hover_doc_with_index(
         return Some(doc);
     }
 
-    for sourced in collect_sourced_documents(index, uri, position, doc_manager, true) {
-        if let Some(doc) = resolve_local_hover_in_index(&sourced.index, word, None, is_variable_ref)
-        {
-            return Some(doc);
-        }
-    }
-
-    None
+    find_in_sourced_documents(index, uri, position, doc_manager, true, |sourced| {
+        resolve_local_hover_in_index(&sourced.index, word, None, is_variable_ref)
+    })
 }
 
 #[cfg(test)]
@@ -1033,6 +1028,43 @@ alias ll='ls -la'
                 None,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn test_local_symbol_hover_short_circuits_on_first_matching_sourced_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.zsh");
+        let a_path = dir.path().join("a.zsh");
+        let b_path = dir.path().join("b.zsh");
+        let nested_path = dir.path().join("nested.zsh");
+
+        std::fs::write(&nested_path, "nested_fn() { : }\n").unwrap();
+        std::fs::write(
+            &a_path,
+            "source ./nested.zsh\n# Target doc\ntarget_fn() { : }\n",
+        )
+        .unwrap();
+        std::fs::write(&b_path, "other_fn() { : }\n").unwrap();
+
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let main_text = "source ./a.zsh\nsource ./b.zsh\ntarget_fn\n";
+
+        crate::analysis::workspace::tests::reset_load_count();
+        let doc = get_local_symbol_hover_doc_at_with_manager(
+            main_text,
+            &main_uri,
+            "target_fn",
+            Position::new(2, 2),
+            false,
+            None,
+        )
+        .expect("Expected hover doc for target_fn");
+        assert!(doc.contains("Target doc"));
+        assert_eq!(
+            crate::analysis::workspace::tests::get_load_count(),
+            1,
+            "Should short-circuit after finding target_fn in a.zsh without loading nested.zsh or b.zsh"
         );
     }
 }
