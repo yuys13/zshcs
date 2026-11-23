@@ -2,30 +2,14 @@ mod common;
 
 use common::setup_server_mock as setup_server;
 use serde_json::json;
-use tower_lsp::lsp_types::{
-    ClientCapabilities, DidChangeConfigurationParams, DidOpenTextDocumentParams,
-    DocumentSymbolParams, DocumentSymbolResponse, InitializeParams, InitializedParams,
-    LogMessageParams, OneOf, SymbolKind, TextDocumentIdentifier, TextDocumentItem, Url,
-    notification::{DidChangeConfiguration, DidOpenTextDocument, Initialized, LogMessage},
-    request::{DocumentSymbolRequest, Initialize},
-};
+use tower_lsp::lsp_types::{DocumentSymbolResponse, OneOf, SymbolKind, Url};
 
 #[tokio::test]
 async fn test_symbols_capability_registered_on_initialize() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        ..Default::default()
-    };
-
-    let init_result = test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
+    let init_result = test_client.initialize(None).await;
 
     assert_eq!(
         init_result.capabilities.document_symbol_provider,
@@ -38,24 +22,6 @@ async fn test_symbols_disabled_by_default() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
     let doc_uri = Url::parse("file:///default_sym.zsh").unwrap();
     let text = r#"
 my_func() {
@@ -63,29 +29,9 @@ my_func() {
 }
 alias ll='ls -la'
 "#;
+    test_client.init_and_open(&doc_uri, text).await;
 
-    test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: text.to_string(),
-            },
-        })
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
-    let sym_res = test_client
-        .send_request::<DocumentSymbolRequest>(DocumentSymbolParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let sym_res = test_client.document_symbols(&doc_uri).await.unwrap();
 
     assert!(sym_res.is_none());
 }
@@ -94,31 +40,6 @@ alias ll='ls -la'
 async fn test_symbols_enabled_via_initialization_options() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
-
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        initialization_options: Some(json!({
-            "zshcs": {
-                "experimental": {
-                    "symbols": true
-                }
-            }
-        })),
-        capabilities: ClientCapabilities::default(),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     let doc_uri = Url::parse("file:///enabled_sym.zsh").unwrap();
     let text = r#"
@@ -131,29 +52,21 @@ hello() {
 
 alias gs='git status'
 "#;
-
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: text.to_string(),
-            },
-        })
+        .init_with_options_and_open(
+            Some(json!({
+                "zshcs": {
+                    "experimental": {
+                        "symbols": true
+                    }
+                }
+            })),
+            &doc_uri,
+            text,
+        )
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
-    let sym_res = test_client
-        .send_request::<DocumentSymbolRequest>(DocumentSymbolParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let sym_res = test_client.document_symbols(&doc_uri).await.unwrap();
 
     assert!(sym_res.is_some());
     if let Some(DocumentSymbolResponse::Nested(symbols)) = sym_res {
@@ -181,31 +94,6 @@ async fn test_symbols_hierarchy_nested_functions_and_locals() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        initialization_options: Some(json!({
-            "zshcs": {
-                "experimental": {
-                    "symbols": true
-                }
-            }
-        })),
-        capabilities: ClientCapabilities::default(),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
     let doc_uri = Url::parse("file:///nested_sym.zsh").unwrap();
     let text = r#"
 outer() {
@@ -218,29 +106,21 @@ outer() {
     local c=3
 }
 "#;
-
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: text.to_string(),
-            },
-        })
+        .init_with_options_and_open(
+            Some(json!({
+                "zshcs": {
+                    "experimental": {
+                        "symbols": true
+                    }
+                }
+            })),
+            &doc_uri,
+            text,
+        )
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
-    let sym_res = test_client
-        .send_request::<DocumentSymbolRequest>(DocumentSymbolParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let sym_res = test_client.document_symbols(&doc_uri).await.unwrap();
 
     assert!(sym_res.is_some());
     if let Some(DocumentSymbolResponse::Nested(symbols)) = sym_res {
@@ -275,80 +155,31 @@ async fn test_symbols_dynamic_toggle_via_did_change_configuration() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    // 1. Initialize with default (disabled)
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
     let doc_uri = Url::parse("file:///toggle_sym.zsh").unwrap();
     let text = r#"
 test_func() {
     local v=100
 }
 "#;
-
-    test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: text.to_string(),
-            },
-        })
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    // 1. Initialize with default (disabled)
+    test_client.init_and_open(&doc_uri, text).await;
 
     // Disabled initially
-    let res_disabled = test_client
-        .send_request::<DocumentSymbolRequest>(DocumentSymbolParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let res_disabled = test_client.document_symbols(&doc_uri).await.unwrap();
     assert!(res_disabled.is_none());
 
     // 2. Enable dynamically via workspace/didChangeConfiguration
     test_client
-        .send_notification::<DidChangeConfiguration>(DidChangeConfigurationParams {
-            settings: json!({
-                "zshcs": {
-                    "experimental": {
-                        "symbols": true
-                    }
+        .change_configuration(json!({
+            "zshcs": {
+                "experimental": {
+                    "symbols": true
                 }
-            }),
-        })
+            }
+        }))
         .await;
 
-    let res_enabled = test_client
-        .send_request::<DocumentSymbolRequest>(DocumentSymbolParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let res_enabled = test_client.document_symbols(&doc_uri).await.unwrap();
     assert!(res_enabled.is_some());
     if let Some(DocumentSymbolResponse::Nested(syms)) = res_enabled {
         assert_eq!(syms.len(), 1);
@@ -357,27 +188,16 @@ test_func() {
 
     // 3. Disable again dynamically
     test_client
-        .send_notification::<DidChangeConfiguration>(DidChangeConfigurationParams {
-            settings: json!({
-                "zshcs": {
-                    "experimental": {
-                        "symbols": false
-                    }
+        .change_configuration(json!({
+            "zshcs": {
+                "experimental": {
+                    "symbols": false
                 }
-            }),
-        })
+            }
+        }))
         .await;
 
-    let res_disabled_again = test_client
-        .send_request::<DocumentSymbolRequest>(DocumentSymbolParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let res_disabled_again = test_client.document_symbols(&doc_uri).await.unwrap();
     assert!(res_disabled_again.is_none());
 }
 
@@ -386,40 +206,18 @@ async fn test_symbols_unopened_document_returns_none() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        initialization_options: Some(json!({
+    test_client
+        .init_with_options(Some(json!({
             "zshcs": {
                 "experimental": {
                     "symbols": true
                 }
             }
-        })),
-        capabilities: ClientCapabilities::default(),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
+        })))
         .await;
 
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
     let unopened_uri = Url::parse("file:///nonexistent.zsh").unwrap();
-    let res = test_client
-        .send_request::<DocumentSymbolRequest>(DocumentSymbolParams {
-            text_document: TextDocumentIdentifier { uri: unopened_uri },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let res = test_client.document_symbols(&unopened_uri).await.unwrap();
 
     assert!(res.is_none());
 }
@@ -430,49 +228,19 @@ async fn test_symbols_flat_and_nested_settings_variants() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        initialization_options: Some(json!({
-            "experimental": {
-                "symbols": true
-            }
-        })),
-        capabilities: ClientCapabilities::default(),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
     let doc_uri = Url::parse("file:///flat_settings.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "fn() { :; }".to_string(),
-            },
-        })
+        .init_with_options_and_open(
+            Some(json!({
+                "experimental": {
+                    "symbols": true
+                }
+            })),
+            &doc_uri,
+            "fn() { :; }",
+        )
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
-    let res = test_client
-        .send_request::<DocumentSymbolRequest>(DocumentSymbolParams {
-            text_document: TextDocumentIdentifier { uri: doc_uri },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let res = test_client.document_symbols(&doc_uri).await.unwrap();
     assert!(res.is_some());
 }

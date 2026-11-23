@@ -569,17 +569,7 @@ async fn test_multi_document_isolation() {
     test_client.init_and_open(&doc_a, "content A").await;
 
     // Open second document
-    test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_b.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "content B".to_string(),
-            },
-        })
-        .await;
-    test_client.read_notification::<LogMessage>().await;
+    test_client.open_document(&doc_b, "content B").await;
 
     // Modify doc_a
     test_client
@@ -629,17 +619,7 @@ async fn test_multi_document_did_close() {
 
     test_client.init_and_open(&doc_a, "initial A").await;
 
-    test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_b.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "initial B".to_string(),
-            },
-        })
-        .await;
-    test_client.read_notification::<LogMessage>().await;
+    test_client.open_document(&doc_b, "initial B").await;
 
     // Close doc_a
     test_client
@@ -1021,17 +1001,7 @@ async fn test_did_change_multibyte_text() {
 
     // Replace emoji "🎉" (2 UTF-16 code units) with "🚀"
     let doc_uri2 = Url::parse("file:///emoji_sync.zsh").unwrap();
-    test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri2.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "Hello 🎉 world".to_string(),
-            },
-        })
-        .await;
-    test_client.read_notification::<LogMessage>().await;
+    test_client.open_document(&doc_uri2, "Hello 🎉 world").await;
 
     test_client
         .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
@@ -1301,17 +1271,7 @@ async fn test_reopen_closed_document() {
     assert_eq!(content, None);
 
     // Reopen
-    test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "reopened text".to_string(),
-            },
-        })
-        .await;
-    test_client.read_notification::<LogMessage>().await;
+    test_client.open_document(&doc_uri, "reopened text").await;
 
     // Modify
     test_client
