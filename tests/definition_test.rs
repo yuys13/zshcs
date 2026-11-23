@@ -1,6 +1,6 @@
 mod common;
 
-use common::{TestClient, setup_server_mock as setup_server};
+use common::setup_server_mock as setup_server;
 use serde_json::json;
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
@@ -14,8 +14,8 @@ use tower_lsp::lsp_types::{
 
 #[tokio::test]
 async fn test_definition_capability_registered_on_initialize() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -37,8 +37,8 @@ async fn test_definition_capability_registered_on_initialize() {
 
 #[tokio::test]
 async fn test_definition_disabled_by_default() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // Initialize with default options (definition = false)
     let initialize_params = InitializeParams {
@@ -145,8 +145,8 @@ source ./helper.zsh
 
 #[tokio::test]
 async fn test_definition_enabled_function_jump() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -255,8 +255,8 @@ process_data
 
 #[tokio::test]
 async fn test_definition_enabled_variable_jump() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -408,8 +408,8 @@ echo "Cache: $CACHE_SIZE"
 
 #[tokio::test]
 async fn test_definition_enabled_source_jump() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let temp_dir = tempdir().unwrap();
     let helper_path = temp_dir.path().join("helper.zsh");
@@ -513,8 +513,8 @@ async fn test_definition_enabled_source_jump() {
 
 #[tokio::test]
 async fn test_definition_dynamic_toggle_via_did_change_configuration() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // Initialize with default (disabled)
     let initialize_params = InitializeParams {
@@ -633,8 +633,8 @@ async fn test_definition_dynamic_toggle_via_did_change_configuration() {
 
 #[tokio::test]
 async fn test_definition_unopened_document_and_edge_cases() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -739,8 +739,8 @@ async fn test_definition_unopened_document_and_edge_cases() {
 
 #[tokio::test]
 async fn test_definition_surrogate_and_multibyte_integration() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -833,8 +833,8 @@ async fn test_definition_surrogate_and_multibyte_integration() {
 
 #[tokio::test]
 async fn test_definition_advanced_syntax_and_multi_statement() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -987,8 +987,8 @@ echo "Upper: ${(U)USER_NAME}"
 
 #[tokio::test]
 async fn test_definition_nested_expansions_loops_and_compound_source() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let temp_dir = tempdir().unwrap();
     let lib_path = temp_dir.path().join("sublib.zsh");
@@ -1123,8 +1123,8 @@ done
 
 #[tokio::test]
 async fn test_definition_alias_and_local_variable_scoping() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -1242,8 +1242,8 @@ async fn test_definition_alias_and_local_variable_scoping() {
 
 #[tokio::test]
 async fn test_definition_across_sourced_scripts_and_open_buffers() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let dir = tempdir().unwrap();
     let helper_path = dir.path().join("helper.zsh");

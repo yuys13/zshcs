@@ -12,8 +12,8 @@ use tower_lsp::lsp_types::{
 
 #[tokio::test]
 async fn test_initialize() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -56,8 +56,8 @@ async fn test_initialize() {
 
 #[tokio::test]
 async fn test_initialize_trigger_characters_present() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams::default();
     let result = test_client
@@ -81,8 +81,8 @@ async fn test_initialize_trigger_characters_present() {
 
 #[tokio::test]
 async fn test_initialized() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // Send initialize request first
     let initialize_params = InitializeParams {
@@ -146,8 +146,8 @@ async fn test_initialized() {
 
 #[tokio::test]
 async fn test_did_open() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // Initialize first
     let initialize_params = InitializeParams {
@@ -195,8 +195,8 @@ async fn test_did_open() {
 
 #[tokio::test]
 async fn test_did_change_full_sync() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///test_change.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "initial content").await;
@@ -233,8 +233,8 @@ async fn test_did_change_full_sync() {
 
 #[tokio::test]
 async fn test_did_change_incremental_sync() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///test_incremental.zsh").unwrap();
     let initial_text = "line1\nline2\nline3".to_string();
@@ -316,8 +316,8 @@ async fn test_did_change_incremental_sync() {
 
 #[tokio::test]
 async fn test_did_change_ordering() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///test_ordering.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "").await;
@@ -359,8 +359,8 @@ async fn test_did_change_ordering() {
 
 #[tokio::test]
 async fn test_did_change_mixed() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///test_mixed.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "Old").await;
@@ -402,8 +402,8 @@ async fn test_did_change_mixed() {
 
 #[tokio::test]
 async fn test_did_change_invalid_range() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///invalid_range.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "original").await;
@@ -427,8 +427,8 @@ async fn test_did_change_invalid_range() {
 
 #[tokio::test]
 async fn test_did_change_document_not_found() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///not_opened.zsh").unwrap();
 
@@ -463,8 +463,8 @@ async fn test_did_change_document_not_found() {
 
 #[tokio::test]
 async fn test_execute_command_edge_cases() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams::default();
     test_client
@@ -514,8 +514,8 @@ async fn test_execute_command_edge_cases() {
 
 #[tokio::test]
 async fn test_shutdown() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams::default();
     test_client
@@ -534,8 +534,8 @@ async fn test_shutdown() {
 
 #[tokio::test]
 async fn test_initialize_execute_command_capabilities() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -560,8 +560,8 @@ async fn test_initialize_execute_command_capabilities() {
 
 #[tokio::test]
 async fn test_multi_document_isolation() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_a = Url::parse("file:///doc_a.zsh").unwrap();
     let doc_b = Url::parse("file:///doc_b.zsh").unwrap();
@@ -621,8 +621,8 @@ async fn test_multi_document_isolation() {
 
 #[tokio::test]
 async fn test_multi_document_did_close() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_a = Url::parse("file:///close_a.zsh").unwrap();
     let doc_b = Url::parse("file:///close_b.zsh").unwrap();
@@ -697,8 +697,8 @@ async fn test_multi_document_did_close() {
 
 #[tokio::test]
 async fn test_did_close_handler() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///test_close_standalone.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "echo closing").await;
@@ -750,8 +750,8 @@ async fn test_did_close_handler() {
 
 #[tokio::test]
 async fn test_did_close_unopened_document() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams::default();
     test_client
@@ -784,8 +784,8 @@ async fn test_did_close_unopened_document() {
 
 #[tokio::test]
 async fn test_did_change_outdated_version() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///outdated_version.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "initial text").await;
@@ -834,8 +834,8 @@ async fn test_did_change_outdated_version() {
 
 #[tokio::test]
 async fn test_completion_after_did_close() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///completion_closed.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git s").await;
@@ -874,8 +874,8 @@ async fn test_completion_after_did_close() {
 
 #[tokio::test]
 async fn test_did_change_multiline_replacement() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///multiline_replace.zsh").unwrap();
     let initial_text = "line1\nline2\nline3\nline4";
@@ -908,8 +908,8 @@ async fn test_did_change_multiline_replacement() {
 
 #[tokio::test]
 async fn test_did_change_insert_at_boundaries() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///boundaries.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "middle").await;
@@ -954,8 +954,8 @@ async fn test_did_change_insert_at_boundaries() {
 
 #[tokio::test]
 async fn test_did_change_delete_lines() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///delete_lines.zsh").unwrap();
     let initial_text = "alpha\nbeta\ngamma";
@@ -988,8 +988,8 @@ async fn test_did_change_delete_lines() {
 
 #[tokio::test]
 async fn test_did_change_multibyte_text() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///multibyte_sync.zsh").unwrap();
     let initial_text = "日本語の\nテストです\n終わり";
@@ -1059,8 +1059,8 @@ async fn test_did_change_multibyte_text() {
 
 #[tokio::test]
 async fn test_did_change_out_of_bounds_line() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///out_of_bounds_line.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "line1\nline2").await;
@@ -1096,8 +1096,8 @@ async fn test_did_change_out_of_bounds_line() {
 
 #[tokio::test]
 async fn test_execute_command_malformed_arguments_comprehensive() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams::default();
     test_client
@@ -1167,8 +1167,8 @@ async fn test_execute_command_malformed_arguments_comprehensive() {
 
 #[tokio::test]
 async fn test_interleaved_sync_and_completion() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///typing_simulation.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -1238,8 +1238,8 @@ async fn test_interleaved_sync_and_completion() {
 
 #[tokio::test]
 async fn test_rapid_burst_completion_requests() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///burst.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -1270,8 +1270,8 @@ async fn test_rapid_burst_completion_requests() {
 
 #[tokio::test]
 async fn test_reopen_closed_document() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///reopen.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "initial text").await;
@@ -1341,8 +1341,8 @@ async fn test_reopen_closed_document() {
 
 #[tokio::test]
 async fn test_double_did_close() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///double_close.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "content").await;
@@ -1381,8 +1381,8 @@ async fn test_double_did_close() {
 
 #[tokio::test]
 async fn test_did_change_on_closed_document() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///change_after_close.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "content").await;
@@ -1418,8 +1418,8 @@ async fn test_did_change_on_closed_document() {
 
 #[tokio::test]
 async fn test_rapid_open_change_close_reopen_cycle() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///rapid_cycle.zsh").unwrap();
 
@@ -1503,8 +1503,8 @@ async fn test_rapid_open_change_close_reopen_cycle() {
 
 #[tokio::test]
 async fn test_close_and_immediate_completion_race() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///race_close.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;

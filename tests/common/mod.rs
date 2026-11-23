@@ -121,7 +121,10 @@ impl<'a> TestClient<'a> {
             let response_json = read_message(self.stream)
                 .await
                 .ok_or_else(tower_lsp::jsonrpc::Error::internal_error)?;
-            if response_json.contains("\"method\"") && !response_json.contains("\"id\"") {
+            if let Ok(value) = serde_json::from_str::<Value>(&response_json)
+                && value.get("method").is_some()
+                && value.get("id").is_none()
+            {
                 self.notification_queue.push_back(response_json);
                 continue;
             }
@@ -249,54 +252,85 @@ pub const MOCK_DUMMY_CAPTURE: &str =
     "#!/bin/zsh\nwhile read -r line; do\n  printf \"status\\tshow status\\x01EOC\\x01\\n\"\ndone\n";
 pub const MOCK_DUMMY_ZPTYRC: &str = "";
 
-pub fn setup_server_mock() -> (DuplexStream, tokio::task::JoinHandle<()>) {
-    setup_server_with_scripts(MOCK_DUMMY_CAPTURE, MOCK_DUMMY_ZPTYRC)
+pub struct TestHarness {
+    pub stream: DuplexStream,
+    server_handle: Option<tokio::task::JoinHandle<()>>,
+    _cache_dir: tempfile::TempDir,
 }
 
-pub fn setup_server() -> (DuplexStream, tokio::task::JoinHandle<()>) {
-    let (client_stream, server_stream) = tokio::io::duplex(4096);
-    let (service, client_socket) = LspService::new(|client| {
-        let temp_cache = tempfile::tempdir().expect("Failed to create test cache dir");
-        let cache_path = temp_cache.keep();
-        Backend::new_with_scripts_and_cache(
-            client,
+impl TestHarness {
+    pub fn new() -> Self {
+        Self::with_scripts(
             zshcs::runtime::daemon::CAPTURE_ZSH,
             zshcs::runtime::daemon::ZPTYRC_ZSH,
-            Some(cache_path),
         )
-        .expect("Failed to initialize test backend")
-    });
+    }
 
-    let server_handle = tokio::spawn(async move {
-        let (server_read, server_write) = tokio::io::split(server_stream);
-        Server::new(server_read, server_write, client_socket)
-            .serve(service)
-            .await;
-    });
+    pub fn mock() -> Self {
+        Self::with_scripts(MOCK_DUMMY_CAPTURE, MOCK_DUMMY_ZPTYRC)
+    }
 
-    (client_stream, server_handle)
+    pub fn with_scripts(capture_script: &str, zptyrc_script: &str) -> Self {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let temp_cache = tempfile::tempdir().expect("Failed to create test cache dir");
+        let cache_path = temp_cache.path().to_path_buf();
+        let (service, client_socket) = LspService::new(move |client| {
+            Backend::new_with_scripts_and_cache(
+                client,
+                capture_script,
+                zptyrc_script,
+                Some(cache_path),
+            )
+            .expect("Failed to initialize test backend with scripts")
+        });
+
+        let server_handle = tokio::spawn(async move {
+            let (server_read, server_write) = tokio::io::split(server_stream);
+            Server::new(server_read, server_write, client_socket)
+                .serve(service)
+                .await;
+        });
+
+        Self {
+            stream: client_stream,
+            server_handle: Some(server_handle),
+            _cache_dir: temp_cache,
+        }
+    }
+
+    pub fn client(&mut self) -> TestClient<'_> {
+        TestClient::new(&mut self.stream)
+    }
+
+    pub fn take_server_handle(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.server_handle.take()
+    }
 }
 
-pub fn setup_server_with_scripts(
-    capture_script: &'static str,
-    zptyrc_script: &'static str,
-) -> (DuplexStream, tokio::task::JoinHandle<()>) {
-    let (client_stream, server_stream) = tokio::io::duplex(4096);
-    let (service, client_socket) = LspService::new(move |client| {
-        let temp_cache = tempfile::tempdir().expect("Failed to create test cache dir");
-        let cache_path = temp_cache.keep();
-        Backend::new_with_scripts_and_cache(client, capture_script, zptyrc_script, Some(cache_path))
-            .expect("Failed to initialize test backend with scripts")
-    });
+impl Default for TestHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    let server_handle = tokio::spawn(async move {
-        let (server_read, server_write) = tokio::io::split(server_stream);
-        Server::new(server_read, server_write, client_socket)
-            .serve(service)
-            .await;
-    });
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        if let Some(handle) = self.server_handle.take() {
+            handle.abort();
+        }
+    }
+}
 
-    (client_stream, server_handle)
+pub fn setup_server_mock() -> TestHarness {
+    TestHarness::mock()
+}
+
+pub fn setup_server() -> TestHarness {
+    TestHarness::new()
+}
+
+pub fn setup_server_with_scripts(capture_script: &str, zptyrc_script: &str) -> TestHarness {
+    TestHarness::with_scripts(capture_script, zptyrc_script)
 }
 
 pub fn get_completion_items(response: CompletionResponse) -> Vec<CompletionItem> {

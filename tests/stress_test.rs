@@ -168,8 +168,8 @@ while IFS= read -r line; do
     printf "\x01EOC\x01\n"
 done
 "#;
-    let (mut client_stream, _server_handle) = common::setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = common::setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///stress_10k.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "cmd ").await;
@@ -206,8 +206,8 @@ while IFS= read -r line; do
     printf "\x01EOC\x01\n"
 done
 "#;
-    let (mut client_stream, _server_handle) = common::setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = common::setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///stress_stderr.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "cmd ").await;
@@ -240,8 +240,8 @@ while IFS= read -r line; do
     printf "\xff\xfe\n"
 done
 "#;
-    let (mut client_stream, _server_handle) = common::setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = common::setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///invalid_utf8.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "cmd ").await;
@@ -279,9 +279,8 @@ while IFS= read -r line; do
     printf "\x01EOC\x01\n"
 done
 "#;
-                let (mut client_stream, _server_handle) =
-                    common::setup_server_with_scripts(mock_script, "");
-                let mut test_client = common::TestClient::new(&mut client_stream);
+                let mut harness = common::setup_server_with_scripts(mock_script, "");
+                let mut test_client = harness.client();
 
                 let doc_uri = Url::parse(&format!("file:///client_{i}.zsh")).unwrap();
                 test_client.init_and_open(&doc_uri, "git ").await;
@@ -317,8 +316,8 @@ done
 #[tokio::test]
 async fn test_stress_rapid_interleaved_sync_and_completion_burst() {
     // Single client performing rapid back-to-back edits and completions
-    let (mut client_stream, _server_handle) = common::setup_server_mock();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = common::setup_server_mock();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///burst_interleaved.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "g").await;
@@ -370,9 +369,8 @@ while IFS= read -r line; do
     printf "\x01EOC\x01\n"
 done
 "#;
-    let (mut client_stream, _server_handle) =
-        common::setup_server_with_scripts(mock_delay_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = common::setup_server_with_scripts(mock_delay_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///channel_saturation.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "test ").await;
@@ -403,8 +401,8 @@ done
 
 #[tokio::test]
 async fn test_stress_multi_document_concurrent_edits() {
-    let (mut client_stream, _server_handle) = common::setup_server_mock();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = common::setup_server_mock();
+    let mut test_client = harness.client();
 
     let doc_a = Url::parse("file:///concurrent_doc_a.zsh").unwrap();
     let doc_b = Url::parse("file:///concurrent_doc_b.zsh").unwrap();
@@ -741,8 +739,8 @@ fn test_fuzz_position_to_byte_offset_invariants() {
 
 #[tokio::test]
 async fn test_stress_did_change_random_incremental_edits_fuzz() {
-    let (mut client_stream, _server_handle) = common::setup_server_mock();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = common::setup_server_mock();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///fuzz_incremental.zsh").unwrap();
     let mut expected_text = "initial text 🚀\nline 2 日本語\nline 3 𩸽\n".to_string();
@@ -833,8 +831,8 @@ async fn test_stress_did_change_random_incremental_edits_fuzz() {
 
 #[tokio::test]
 async fn test_stress_did_change_malformed_ranges_and_split_surrogates() {
-    let (mut client_stream, _server_handle) = common::setup_server_mock();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = common::setup_server_mock();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///malformed_ranges.zsh").unwrap();
     let initial_text = "A𩸽B\nC🚀D\n";
@@ -1173,8 +1171,8 @@ async fn test_stress_concurrent_50_clients_resolve() {
         .map(|i| {
             let b = barrier.clone();
             tokio::spawn(async move {
-                let (mut client_stream, _server_handle) = common::setup_server_mock();
-                let mut test_client = common::TestClient::new(&mut client_stream);
+                let mut harness = common::setup_server_mock();
+                let mut test_client = harness.client();
 
                 let doc_uri = Url::parse(&format!("file:///client_resolve_{i}.zsh")).unwrap();
                 test_client.init_and_open(&doc_uri, "echo").await;

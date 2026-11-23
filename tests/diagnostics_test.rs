@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestClient, setup_server_mock as setup_server};
+use common::setup_server_mock as setup_server;
 use serde_json::json;
 use tower_lsp::lsp_types::{
     ClientCapabilities, DiagnosticSeverity, DidChangeConfigurationParams,
@@ -19,8 +19,8 @@ use tower_lsp::lsp_types::{
 
 #[tokio::test]
 async fn test_diagnostics_disabled_by_default() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // Initialize with default params (diagnostics disabled)
     let initialize_params = InitializeParams {
@@ -70,8 +70,8 @@ async fn test_diagnostics_disabled_by_default() {
 
 #[tokio::test]
 async fn test_diagnostics_enabled_via_initialization_options() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // Initialize with experimental diagnostics enabled
     let initialize_params = InitializeParams {
@@ -156,8 +156,8 @@ async fn test_diagnostics_enabled_via_initialization_options() {
 
 #[tokio::test]
 async fn test_diagnostics_dynamic_enable_and_disable_via_did_change_configuration() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // Initialize with default (disabled)
     let initialize_params = InitializeParams::default();
@@ -239,8 +239,8 @@ async fn test_diagnostics_dynamic_enable_and_disable_via_did_change_configuratio
 
 #[tokio::test]
 async fn test_diagnostics_cleared_on_did_close() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // Initialize with diagnostics enabled
     let initialize_params = InitializeParams {
@@ -304,8 +304,8 @@ async fn test_diagnostics_cleared_on_did_close() {
 
 #[tokio::test]
 async fn test_diagnostics_did_save_triggers_diagnostics() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         initialization_options: Some(json!({
@@ -365,8 +365,8 @@ async fn test_diagnostics_did_save_triggers_diagnostics() {
 
 #[tokio::test]
 async fn test_diagnostics_debounce_rapid_changes() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         initialization_options: Some(json!({
@@ -443,8 +443,8 @@ async fn test_diagnostics_debounce_rapid_changes() {
 
 #[tokio::test]
 async fn test_diagnostics_did_save_with_syntax_error() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         initialization_options: Some(json!({
@@ -504,8 +504,8 @@ async fn test_diagnostics_did_save_with_syntax_error() {
 
 #[tokio::test]
 async fn test_diagnostics_multiple_documents_dynamic_toggle() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams::default();
     test_client
@@ -600,8 +600,8 @@ async fn test_diagnostics_multiple_documents_dynamic_toggle() {
 
 #[tokio::test]
 async fn test_diagnostics_flat_initialization_options() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // Initialize with flat experimental options
     let initialize_params = InitializeParams {

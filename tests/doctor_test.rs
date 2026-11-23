@@ -11,6 +11,34 @@ use zshcs::doctor::{
 
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set<V: AsRef<std::ffi::OsStr>>(key: &'static str, value: V) -> Self {
+        let original = std::env::var_os(key);
+        // SAFETY: Tests calling this hold ENV_MUTEX.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: Tests calling this hold ENV_MUTEX.
+        unsafe {
+            match &self.original {
+                Some(val) => std::env::set_var(self.key, val),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 #[test]
 fn test_cli_parse_doctor_subcommand() {
     let args = ["zshcs", "doctor"];
@@ -37,6 +65,7 @@ fn test_binary_help_includes_doctor_subcommand() {
 
 #[test]
 fn test_binary_doctor_subcommand_execution() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let bin_path = env!("CARGO_BIN_EXE_zshcs");
     let output = Command::new(bin_path)
         .arg("doctor")
@@ -123,19 +152,12 @@ fn test_check_cache_directory_default_env() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let temp_dir = tempdir().unwrap();
     let cache_path = temp_dir.path().join("env_cache");
-    // SAFETY: Single-threaded test execution scope for env var test
-    unsafe {
-        std::env::set_var("ZSHCS_CACHE_DIR", &cache_path);
-    }
+    let _env_guard = EnvVarGuard::set("ZSHCS_CACHE_DIR", &cache_path);
 
     let res = check_cache_directory(None);
     assert_eq!(res.status, CheckStatus::Pass);
     assert_eq!(res.name, "Cache Directory");
     assert!(cache_path.exists());
-
-    unsafe {
-        std::env::remove_var("ZSHCS_CACHE_DIR");
-    }
 }
 
 #[test]
@@ -248,21 +270,14 @@ fn test_check_cache_directory_empty_env_vars() {
     std::fs::create_dir_all(&home_path).unwrap();
 
     // Set empty strings for ZSHCS_CACHE_DIR and XDG_CACHE_HOME, valid HOME
-    unsafe {
-        std::env::set_var("ZSHCS_CACHE_DIR", "");
-        std::env::set_var("XDG_CACHE_HOME", "");
-        std::env::set_var("HOME", &home_path);
-    }
+    let _zshcs_cache_guard = EnvVarGuard::set("ZSHCS_CACHE_DIR", "");
+    let _xdg_cache_guard = EnvVarGuard::set("XDG_CACHE_HOME", "");
+    let _home_guard = EnvVarGuard::set("HOME", &home_path);
 
     let res = check_cache_directory(None);
     assert_eq!(res.status, CheckStatus::Pass);
     assert_eq!(res.name, "Cache Directory");
     assert!(home_path.join(".cache/zshcs/zsh").exists());
-
-    unsafe {
-        std::env::remove_var("ZSHCS_CACHE_DIR");
-        std::env::remove_var("XDG_CACHE_HOME");
-    }
 }
 
 #[test]

@@ -16,8 +16,8 @@ use zshcs::Backend;
 
 #[tokio::test]
 async fn test_completion() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///test.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git s").await;
@@ -48,8 +48,8 @@ async fn test_completion() {
 
 #[tokio::test]
 async fn test_completion_consecutive() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///consecutive.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -97,8 +97,8 @@ async fn test_completion_consecutive() {
 
 #[tokio::test]
 async fn test_completion_after_change() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///after_change.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -138,8 +138,8 @@ async fn test_completion_after_change() {
 
 #[tokio::test]
 async fn test_completion_with_description() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///description.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "ls -").await;
@@ -172,9 +172,8 @@ async fn test_completion_with_description() {
 #[tokio::test]
 async fn test_daemon_crash_tolerance() {
     // Mock capture script that exits immediately
-    let (mut client_stream, _server_handle) =
-        setup_server_with_scripts("#!/usr/bin/env zsh\nexit 1\n", "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts("#!/usr/bin/env zsh\nexit 1\n", "");
+    let mut test_client = harness.client();
     let doc_uri = Url::parse("file:///crash.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
 
@@ -199,11 +198,11 @@ async fn test_daemon_crash_tolerance() {
 #[tokio::test]
 async fn test_daemon_timeout() {
     // Mock capture script that sleeps, preventing an immediate EOC response
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(
+    let mut harness = setup_server_with_scripts(
         "#!/usr/bin/env zsh\nwhile read -r p; do sleep 10; done\n",
         "",
     );
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut test_client = harness.client();
     let doc_uri = Url::parse("file:///timeout.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
 
@@ -236,9 +235,8 @@ async fn test_daemon_timeout_recovery_on_subsequent_request() {
     let count_file_path = temp_dir.path().join("spawn_count.txt");
     let count_path_str = count_file_path.to_str().unwrap().to_string();
 
-    let mock_script = Box::leak(
-        format!(
-            r#"#!/usr/bin/env zsh
+    let mock_script = format!(
+        r#"#!/usr/bin/env zsh
 count_file="{count_path_str}"
 count=0
 if [[ -f "$count_file" ]]; then
@@ -257,11 +255,9 @@ while IFS= read -r line; do
     fi
 done
 "#
-        )
-        .into_boxed_str(),
     );
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(&mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///timeout_recovery.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -319,8 +315,8 @@ while IFS= read -r line; do
     printf "\x01EOC\x01\n"
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///empty_cand.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "some_cmd ").await;
@@ -354,8 +350,8 @@ while IFS= read -r line; do
     printf "\x01EOC\x01\n"
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///mixed_formats.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -397,8 +393,8 @@ while IFS= read -r line; do
     printf "branch\tList branches\x01EOC\x01\n"
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///inline_eoc.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -437,8 +433,8 @@ while IFS= read -r line; do
     printf "\x01EOC\x01\r\n"
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///crlf_mock.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -475,8 +471,8 @@ while IFS= read -r line; do
     printf "\x01EOC\x01\n"
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///unicode_mock.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "test ").await;
@@ -515,8 +511,8 @@ while IFS= read -r line; do
     printf "\x01EOC\x01\n"
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///special_mock.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "test ").await;
@@ -554,8 +550,8 @@ while IFS= read -r line; do
     printf "\x01EOC\x01\n"
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///stderr_mock.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -597,8 +593,8 @@ read -r line
 printf "candidate1\tdesc1\n"
 exit 1
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///crash_mid.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -629,8 +625,8 @@ while IFS= read -r line; do
     printf "\x01EOC\x01\n"
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///large_cand.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "test ").await;
@@ -659,11 +655,11 @@ done
 
 #[tokio::test]
 async fn test_completion_unopened_document() {
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(
+    let mut harness = setup_server_with_scripts(
         "#!/bin/zsh\nwhile read -r line; do\n  printf \"\\x01EOC\\x01\\n\"\ndone\n",
         "",
     );
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut test_client = harness.client();
 
     let initialize_params = tower_lsp::lsp_types::InitializeParams::default();
     test_client
@@ -695,11 +691,11 @@ async fn test_completion_unopened_document() {
 
 #[tokio::test]
 async fn test_completion_out_of_bounds_position() {
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(
+    let mut harness = setup_server_with_scripts(
         "#!/bin/zsh\nwhile read -r line; do\n  printf \"\\x01EOC\\x01\\n\"\ndone\n",
         "",
     );
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///out_of_bounds.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -722,8 +718,8 @@ async fn test_completion_out_of_bounds_position() {
 
 #[tokio::test]
 async fn test_completion_multiline_document() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///multiline.zsh").unwrap();
     let doc_content = "#!/usr/bin/env zsh\ngit s\nls -";
@@ -788,8 +784,8 @@ async fn test_completion_multiline_document() {
 
 #[tokio::test]
 async fn test_completion_multibyte_prefix() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///multibyte_prefix.zsh").unwrap();
     // Japanese comment on line 0, "git s" on line 1
@@ -850,8 +846,8 @@ async fn test_completion_multibyte_prefix() {
 
 #[tokio::test]
 async fn test_completion_middle_of_word() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///middle_word.zsh").unwrap();
     test_client
@@ -879,8 +875,8 @@ async fn test_completion_middle_of_word() {
 
 #[tokio::test]
 async fn test_completion_crlf_document() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///crlf_doc.zsh").unwrap();
     let doc_content = "echo 1\r\ngit s\r\necho 2";
@@ -915,9 +911,8 @@ done
     let handles: Vec<_> = (0..5)
         .map(|i| {
             tokio::spawn(async move {
-                let (mut client_stream, _server_handle) =
-                    setup_server_with_scripts(mock_capture, "");
-                let mut test_client = common::TestClient::new(&mut client_stream);
+                let mut harness = setup_server_with_scripts(mock_capture, "");
+                let mut test_client = harness.client();
                 let doc_uri = Url::parse(&format!("file:///concurrent_{i}.zsh")).unwrap();
                 test_client.init_and_open(&doc_uri, "git s").await;
 
@@ -962,8 +957,8 @@ while IFS= read -r line; do
     fi
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///recovery.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -1038,8 +1033,8 @@ while IFS= read -r line; do
     fi
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///exit_between.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -1100,8 +1095,8 @@ while IFS= read -r line; do
     fi
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri_1 = Url::parse("file:///project/dir_one/file1.zsh").unwrap();
     let doc_uri_2 = Url::parse("file:///project/dir_two/file2.zsh").unwrap();
@@ -1201,8 +1196,8 @@ async fn test_completion_relative_path_and_working_directory_real() {
     let uri_a = Url::from_file_path(&script_a).unwrap();
     let uri_b = Url::from_file_path(&script_b).unwrap();
 
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // 1. Open script in dir A and complete `cat alp`
     test_client.init_and_open(&uri_a, "cat alp").await;
@@ -1297,8 +1292,8 @@ async fn test_completion_chdir_spaces_and_special_path() {
     let script_file = special_dir.join("main.zsh");
     let script_uri = Url::from_file_path(&script_file).unwrap();
 
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     test_client.init_and_open(&script_uri, "cat spe").await;
 
@@ -1328,8 +1323,8 @@ async fn test_completion_chdir_spaces_and_special_path() {
 
 #[tokio::test]
 async fn test_completion_chdir_non_file_uri() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("untitled:untitled-1").unwrap();
     test_client.init_and_open(&doc_uri, "git s").await;
@@ -1377,8 +1372,8 @@ while IFS= read -r line; do
     fi
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///workspace/project/script.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
@@ -1441,8 +1436,8 @@ done
 
 #[tokio::test]
 async fn test_completion_chdir_non_existent_directory() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///non/existent/path/dir/script.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git s").await;
@@ -1480,8 +1475,8 @@ async fn test_completion_chdir_unusual_characters_and_symbols() {
     let script_file = special_dir.join("main.zsh");
     let script_uri = Url::from_file_path(&script_file).unwrap();
 
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     test_client.init_and_open(&script_uri, "cat comp").await;
 
@@ -1525,8 +1520,8 @@ async fn test_completion_rapid_directory_switching_stress() {
         dir_uris.push((Url::from_file_path(&script).unwrap(), format!("marker_{i}")));
     }
 
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // Initialize with the first document
     test_client.init_and_open(&dir_uris[0].0, "cat mark").await;
@@ -1747,8 +1742,8 @@ while read -r line; do
 done
 "#;
 
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///kinds_test.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "cmd ").await;
@@ -1832,8 +1827,8 @@ async fn test_zsh_script_unit_test_harness() {
 
 #[tokio::test]
 async fn test_completion_resolve_builtin() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_builtin.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "echo").await;
@@ -1866,8 +1861,8 @@ async fn test_completion_resolve_builtin() {
 
 #[tokio::test]
 async fn test_completion_resolve_reserved_word() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_reserved.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "if").await;
@@ -1900,8 +1895,8 @@ async fn test_completion_resolve_reserved_word() {
 
 #[tokio::test]
 async fn test_completion_resolve_fallback_and_passthrough() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_fallback.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "some_cmd").await;
@@ -1948,8 +1943,8 @@ async fn test_completion_resolve_empty_doc_and_field_preservation() {
         Command, CompletionItemLabelDetails, CompletionItemTag, InsertTextFormat, TextEdit,
     };
 
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_fields.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "echo").await;
@@ -2040,8 +2035,8 @@ while read -r line; do
 done
 "#;
 
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///e2e_resolve.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "ec").await;
@@ -2115,8 +2110,8 @@ async fn test_completion_resolve_real_zsh_daemon_e2e() {
         InitializeParams, InitializedParams, notification::Initialized, request::Initialize,
     };
 
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // 1. Handshake verification: Verify capabilities.completion_provider.resolve_provider == Some(true)
     let init_result = test_client
@@ -2229,8 +2224,8 @@ async fn test_completion_resolve_real_zsh_daemon_e2e() {
 
 #[tokio::test]
 async fn test_completion_resolve_external_command_man_e2e() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_man_external.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git").await;
@@ -2268,8 +2263,8 @@ async fn test_completion_resolve_external_command_man_e2e() {
 
 #[tokio::test]
 async fn test_completion_resolve_caching_and_negative_caching_e2e() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_caching.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git").await;
@@ -2326,8 +2321,8 @@ async fn test_completion_resolve_real_zsh_daemon_external_command_e2e() {
         InitializeParams, InitializedParams, notification::Initialized, request::Initialize,
     };
 
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // Initialize handshake
     test_client
@@ -2398,8 +2393,8 @@ async fn test_completion_resolve_real_zsh_daemon_external_command_e2e() {
 
 #[tokio::test]
 async fn test_completion_resolve_external_command_empty_doc_placeholder_e2e() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_empty_doc.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git").await;
@@ -2458,8 +2453,8 @@ async fn test_completion_resolve_external_command_empty_doc_placeholder_e2e() {
 
 #[tokio::test]
 async fn test_completion_local_variable_dollar_context() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///local_var_test.zsh").unwrap();
     let doc_text = "MY_LOCAL_VAR=\"foo\"\necho $MY_";
@@ -2497,8 +2492,8 @@ async fn test_completion_local_variable_dollar_context() {
 
 #[tokio::test]
 async fn test_completion_local_variable_braced_dollar_context() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///braced_var_test.zsh").unwrap();
     let doc_text = "BRACED_LOCAL_VAR=\"bar\"\necho ${BRACED_";
@@ -2534,8 +2529,8 @@ async fn test_completion_local_variable_braced_dollar_context() {
 
 #[tokio::test]
 async fn test_completion_local_function_context() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///local_func_test.zsh").unwrap();
     let doc_text = "my_local_func() {\n    echo \"hello\"\n}\nmy_";
@@ -2573,8 +2568,8 @@ async fn test_completion_local_function_context() {
 
 #[tokio::test]
 async fn test_completion_scope_boundary_after_cursor_excluded() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///scope_boundary_test.zsh").unwrap();
     let doc_text = "echo $MY_\nMY_LOCAL_VAR=\"foo\"\nmy_after_func() { : }";
@@ -2611,8 +2606,8 @@ async fn test_completion_scope_boundary_after_cursor_excluded() {
 
 #[tokio::test]
 async fn test_completion_hybrid_merge_and_deduplication() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///dedup_test.zsh").unwrap();
     let doc_text = "PATH=\"/custom/bin:$PATH\"\necho $P";
@@ -2658,8 +2653,8 @@ async fn test_completion_hybrid_merge_and_deduplication() {
 
 #[tokio::test]
 async fn test_completion_local_variable_in_assignment_and_path() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///assign_var_test.zsh").unwrap();
     let doc_text = "BASE_DIR=\"/opt\"\nTARGET=$BASE_";
@@ -2697,8 +2692,8 @@ async fn test_completion_local_variable_in_assignment_and_path() {
 
 #[tokio::test]
 async fn test_completion_local_variable_after_comment_with_heredoc() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///comment_heredoc_test.zsh").unwrap();
     let doc_text = "# Usage: cat <<EOF\nMY_PRESERVED_VAR=\"val\"\necho $MY_PRESERVED_";
@@ -2736,8 +2731,8 @@ async fn test_completion_local_variable_after_comment_with_heredoc() {
 
 #[tokio::test]
 async fn test_completion_local_variable_in_arithmetic_expression() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///arithmetic_var_test.zsh").unwrap();
     let doc_text = "COUNT_LIMIT=100\necho $((COUNT_";
@@ -2774,8 +2769,8 @@ async fn test_completion_local_variable_in_arithmetic_expression() {
 
 #[tokio::test]
 async fn test_completion_local_function_inside_subshell_in_double_quotes() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///subshell_double_quote_test.zsh").unwrap();
     let doc_text = "my_custom_func() { :; }\necho \"$(my_custom_";
@@ -2812,8 +2807,8 @@ async fn test_completion_local_function_inside_subshell_in_double_quotes() {
 
 #[tokio::test]
 async fn test_no_completion_local_function_in_plain_double_quotes() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///plain_double_quote_test.zsh").unwrap();
     let doc_text = "my_custom_func() { :; }\necho \"hello my_custom_";
@@ -2847,8 +2842,8 @@ async fn test_no_completion_local_function_in_plain_double_quotes() {
 
 #[tokio::test]
 async fn test_no_completion_local_function_in_assignment_or_redirection() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///assign_redir_test.zsh").unwrap();
     let doc_text = "my_custom_func() { :; }\nTARGET=my_custom_\ncat > my_custom_";
@@ -2909,8 +2904,8 @@ async fn test_no_completion_local_function_in_assignment_or_redirection() {
 
 #[tokio::test]
 async fn test_completion_deduplication_builtin_resword() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///dedup_commands.zsh").unwrap();
     // Test both 'exp' (e.g. export) and 'loc' (e.g. local)
@@ -2981,8 +2976,8 @@ while IFS= read -r line; do
     fi
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///multiline_cmd.zsh").unwrap();
     let text = "git \\\n  st";
@@ -3022,8 +3017,8 @@ while IFS= read -r line; do
     fi
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///local_alias.zsh").unwrap();
     let text = "alias my_custom_alias='git status --short'\nmy_custom_";
@@ -3061,8 +3056,8 @@ while IFS= read -r line; do
     fi
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let helper_path = dir.path().join("helper.zsh");
@@ -3185,8 +3180,8 @@ while IFS= read -r line; do
     fi
 done
 "#;
-    let (mut client_stream, _server_handle) = setup_server_with_scripts(mock_script, "");
-    let mut test_client = common::TestClient::new(&mut client_stream);
+    let mut harness = setup_server_with_scripts(mock_script, "");
+    let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///completion_scoping.zsh").unwrap();
     let text = concat!(
