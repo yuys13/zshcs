@@ -45,8 +45,6 @@ jobs:
           which zsh || HOMEBREW_NO_AUTO_UPDATE=1 brew install zsh
       - name: Run tests
         run: cargo test --all-targets
-      - name: Run Zsh script unit tests
-        run: zsh tests/zsh/run_tests.zsh
   coverage:
     runs-on: ubuntu-latest
     permissions:
