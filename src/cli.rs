@@ -61,8 +61,47 @@ mod tests {
     #[case(&["zshcs", "-V"], ErrorKind::DisplayVersion)]
     #[case(&["zshcs", "--invalid-option"], ErrorKind::UnknownArgument)]
     #[case(&["zshcs", "invalid-subcommand"], ErrorKind::InvalidSubcommand)]
+    #[case(&["zshcs", "--stdio", "--stdio"], ErrorKind::ArgumentConflict)]
+    #[case(&["zshcs", "--STDIO"], ErrorKind::UnknownArgument)]
+    #[case(&["zshcs", ""], ErrorKind::InvalidSubcommand)]
     fn test_cli_error_arguments(#[case] args: &[&str], #[case] expected_kind: ErrorKind) {
         let err = Cli::try_parse_from(args).unwrap_err();
         assert_eq!(err.kind(), expected_kind);
+    }
+
+    #[test]
+    fn test_cli_struct_traits() {
+        let cli1 = Cli {
+            stdio: true,
+            command: None,
+        };
+        let cli2 = cli1.clone();
+        assert_eq!(cli1, cli2);
+        let debug_str = format!("{cli1:?}");
+        assert!(debug_str.contains("Cli"));
+        assert!(debug_str.contains("stdio: true"));
+
+        let cli_doc = Cli {
+            stdio: false,
+            command: Some(Commands::Doctor),
+        };
+        let cli_doc_clone = cli_doc.clone();
+        assert_eq!(cli_doc, cli_doc_clone);
+        assert!(format!("{cli_doc:?}").contains("Doctor"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cli_parse_non_utf8_os_argument() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid_utf8_arg = OsString::from_vec(vec![0x66, 0x6f, 0x80, 0x6f]); // "fo\x80o"
+        let args = [OsString::from("zshcs"), invalid_utf8_arg];
+        let res = Cli::try_parse_from(args);
+        assert!(
+            res.is_err(),
+            "Invalid UTF-8 arguments must result in an error, not panic"
+        );
     }
 }

@@ -1231,4 +1231,112 @@ done
             "extract_local_symbols_with_manager should run on tokio blocking thread pool"
         );
     }
+
+    #[tokio::test]
+    async fn test_backend_dynamic_toggle_experimental_features_via_did_change_configuration() {
+        let (service, _socket) =
+            LspService::new(|client| Backend::new_with_scripts(client, "", "").unwrap());
+        let backend = service.inner();
+
+        let uri = Url::parse("file:///toggle_features.zsh").unwrap();
+        let text = "my_fn() {\n  local v=1\n}\nsetopt promptsubst\nmy_fn\n";
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: text.to_string(),
+                },
+            })
+            .await;
+
+        let hover_params = HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(3, 2),
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let def_params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(4, 2),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let sym_params = DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        // 1. All disabled by default
+        assert!(backend.hover(hover_params.clone()).await.unwrap().is_none());
+        assert!(
+            backend
+                .goto_definition(def_params.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .document_symbol(sym_params.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // 2. Enable all dynamically via did_change_configuration (awaited deterministically)
+        backend
+            .did_change_configuration(DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "zshcs": {
+                        "experimental": {
+                            "hover": true,
+                            "definition": true,
+                            "symbols": true
+                        }
+                    }
+                }),
+            })
+            .await;
+
+        assert!(backend.hover(hover_params.clone()).await.unwrap().is_some());
+        assert!(
+            backend
+                .goto_definition(def_params.clone())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .document_symbol(sym_params.clone())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // 3. Disable all dynamically
+        backend
+            .did_change_configuration(DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "zshcs": {
+                        "experimental": {
+                            "hover": false,
+                            "definition": false,
+                            "symbols": false
+                        }
+                    }
+                }),
+            })
+            .await;
+
+        assert!(backend.hover(hover_params).await.unwrap().is_none());
+        assert!(backend.goto_definition(def_params).await.unwrap().is_none());
+        assert!(backend.document_symbol(sym_params).await.unwrap().is_none());
+    }
 }

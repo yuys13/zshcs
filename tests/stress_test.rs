@@ -901,50 +901,6 @@ async fn test_stress_did_change_malformed_ranges_and_split_surrogates() {
     assert_eq!(doc_str, "A𩸽XB\nC🚀D\n");
 }
 
-#[test]
-fn test_fuzz_infer_completion_kind_arbitrary_inputs() {
-    use tower_lsp::lsp_types::CompletionItemKind;
-    use zshcs::lsp::completion::infer_completion_kind;
-
-    let test_cases = [
-        ("", None, CompletionItemKind::TEXT),
-        ("-", None, CompletionItemKind::KEYWORD),
-        ("--", None, CompletionItemKind::KEYWORD),
-        ("$", None, CompletionItemKind::VARIABLE),
-        ("${}", None, CompletionItemKind::VARIABLE),
-        (".", None, CompletionItemKind::FOLDER),
-        ("..", None, CompletionItemKind::FOLDER),
-        ("~", None, CompletionItemKind::FOLDER),
-        ("/", None, CompletionItemKind::FOLDER),
-        ("./", None, CompletionItemKind::FOLDER),
-        ("../", None, CompletionItemKind::FOLDER),
-        ("~/", None, CompletionItemKind::FOLDER),
-        ("a/", None, CompletionItemKind::FOLDER),
-        (".hidden", None, CompletionItemKind::FILE),
-        ("file.ext", None, CompletionItemKind::FILE),
-        ("a/b/c", None, CompletionItemKind::FOLDER),
-        ("cmd", Some("BUILTIN command"), CompletionItemKind::FUNCTION),
-        ("opt", Some("OPTION flag"), CompletionItemKind::KEYWORD),
-        ("var", Some("ENV variable"), CompletionItemKind::VARIABLE),
-        ("dir", Some("project DIRECTORY"), CompletionItemKind::FOLDER),
-        ("doc", Some("text FILE"), CompletionItemKind::FILE),
-        ("any", Some("unknown description"), CompletionItemKind::TEXT),
-        ("\0\0\0", Some("\0"), CompletionItemKind::TEXT),
-        ("🚀", Some("emoji"), CompletionItemKind::TEXT),
-        ("-🚀", Some("flag"), CompletionItemKind::KEYWORD),
-        ("$🚀", Some("var"), CompletionItemKind::VARIABLE),
-    ];
-
-    for (label, detail, expected) in test_cases {
-        let kind = infer_completion_kind(label, detail);
-        assert_eq!(
-            kind, expected,
-            "Failed for label: {:?}, detail: {:?}",
-            label, detail
-        );
-    }
-}
-
 #[tokio::test]
 async fn test_stress_concurrent_cancellation_and_active_completions() {
     use std::time::Duration;

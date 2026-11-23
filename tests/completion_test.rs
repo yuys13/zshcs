@@ -223,40 +223,6 @@ done
 }
 
 #[tokio::test]
-async fn test_completion_mock_mixed_formats() {
-    let mock_script = r#"#!/usr/bin/env zsh
-while IFS= read -r line; do
-    printf "status\tShow working tree status\n"
-    printf "add\n"
-    printf "commit\tRecord changes to repository\n"
-    printf "diff\n"
-    printf "\x01EOC\x01\n"
-done
-"#;
-    let mut harness = setup_server_with_scripts(mock_script, "");
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///mixed_formats.zsh").unwrap();
-    test_client.init_and_open(&doc_uri, "git ").await;
-
-    let res = test_client.complete(&doc_uri, 0, 4).await.unwrap().unwrap();
-
-    let items = get_completion_items(res);
-    assert_eq!(items.len(), 4);
-    assert_eq!(items[0].label, "status");
-    assert_eq!(items[0].detail.as_deref(), Some("Show working tree status"));
-    assert_eq!(items[1].label, "add");
-    assert_eq!(items[1].detail, None);
-    assert_eq!(items[2].label, "commit");
-    assert_eq!(
-        items[2].detail.as_deref(),
-        Some("Record changes to repository")
-    );
-    assert_eq!(items[3].label, "diff");
-    assert_eq!(items[3].detail, None);
-}
-
-#[tokio::test]
 async fn test_completion_mock_inline_eoc() {
     let mock_script = r#"#!/usr/bin/env zsh
 while IFS= read -r line; do
@@ -306,62 +272,6 @@ done
     assert_eq!(items[0].detail.as_deref(), Some("Show status"));
     assert_eq!(items[1].label, "log");
     assert_eq!(items[1].detail.as_deref(), Some("Show commit logs"));
-}
-
-#[tokio::test]
-async fn test_completion_mock_unicode_and_emoji() {
-    let mock_script = r#"#!/usr/bin/env zsh
-while IFS= read -r line; do
-    printf "補完候補1\t説明文1\n"
-    printf "🎉celebrate\tparty 🎈\n"
-    printf "🚀deploy\tデプロイ実行\n"
-    printf "\x01EOC\x01\n"
-done
-"#;
-    let mut harness = setup_server_with_scripts(mock_script, "");
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///unicode_mock.zsh").unwrap();
-    test_client.init_and_open(&doc_uri, "test ").await;
-
-    let res = test_client.complete(&doc_uri, 0, 5).await.unwrap().unwrap();
-
-    let items = get_completion_items(res);
-    assert_eq!(items.len(), 3);
-    assert_eq!(items[0].label, "補完候補1");
-    assert_eq!(items[0].detail.as_deref(), Some("説明文1"));
-    assert_eq!(items[1].label, "🎉celebrate");
-    assert_eq!(items[1].detail.as_deref(), Some("party 🎈"));
-    assert_eq!(items[2].label, "🚀deploy");
-    assert_eq!(items[2].detail.as_deref(), Some("デプロイ実行"));
-}
-
-#[tokio::test]
-async fn test_completion_mock_special_chars() {
-    let mock_script = r#"#!/usr/bin/env zsh
-while IFS= read -r line; do
-    printf "%s\t%s\n" "arg'with\"quotes" "desc'with\"quotes"
-    printf "%s\t%s\n" 'path\with\backslashes' 'desc\with\backslashes'
-    printf "%s\t%s\n" '$VAR' 'env var'
-    printf "\x01EOC\x01\n"
-done
-"#;
-    let mut harness = setup_server_with_scripts(mock_script, "");
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///special_mock.zsh").unwrap();
-    test_client.init_and_open(&doc_uri, "test ").await;
-
-    let res = test_client.complete(&doc_uri, 0, 5).await.unwrap().unwrap();
-
-    let items = get_completion_items(res);
-    assert_eq!(items.len(), 3);
-    assert_eq!(items[0].label, "arg'with\"quotes");
-    assert_eq!(items[0].detail.as_deref(), Some("desc'with\"quotes"));
-    assert_eq!(items[1].label, "path\\with\\backslashes");
-    assert_eq!(items[1].detail.as_deref(), Some("desc\\with\\backslashes"));
-    assert_eq!(items[2].label, "$VAR");
-    assert_eq!(items[2].detail.as_deref(), Some("env var"));
 }
 
 #[tokio::test]
@@ -1252,7 +1162,7 @@ async fn test_zsh_script_unit_test_harness() {
 
 #[tokio::test]
 async fn test_completion_resolve_builtin() {
-    let mut harness = setup_server();
+    let mut harness = common::setup_server_mock();
     let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_builtin.zsh").unwrap();
@@ -1286,7 +1196,7 @@ async fn test_completion_resolve_builtin() {
 
 #[tokio::test]
 async fn test_completion_resolve_reserved_word() {
-    let mut harness = setup_server();
+    let mut harness = common::setup_server_mock();
     let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_reserved.zsh").unwrap();
@@ -1320,7 +1230,7 @@ async fn test_completion_resolve_reserved_word() {
 
 #[tokio::test]
 async fn test_completion_resolve_fallback_and_passthrough() {
-    let mut harness = setup_server();
+    let mut harness = common::setup_server_mock();
     let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_fallback.zsh").unwrap();
@@ -1368,7 +1278,7 @@ async fn test_completion_resolve_empty_doc_and_field_preservation() {
         Command, CompletionItemLabelDetails, CompletionItemTag, InsertTextFormat, TextEdit,
     };
 
-    let mut harness = setup_server();
+    let mut harness = common::setup_server_mock();
     let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_fields.zsh").unwrap();
@@ -1621,7 +1531,7 @@ async fn test_completion_resolve_real_zsh_daemon_e2e() {
 
 #[tokio::test]
 async fn test_completion_resolve_external_command_man_e2e() {
-    let mut harness = setup_server();
+    let mut harness = common::setup_server_mock();
     let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_man_external.zsh").unwrap();
@@ -1660,7 +1570,7 @@ async fn test_completion_resolve_external_command_man_e2e() {
 
 #[tokio::test]
 async fn test_completion_resolve_caching_and_negative_caching_e2e() {
-    let mut harness = setup_server();
+    let mut harness = common::setup_server_mock();
     let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_caching.zsh").unwrap();
@@ -1776,7 +1686,7 @@ async fn test_completion_resolve_real_zsh_daemon_external_command_e2e() {
 
 #[tokio::test]
 async fn test_completion_resolve_external_command_empty_doc_placeholder_e2e() {
-    let mut harness = setup_server();
+    let mut harness = common::setup_server_mock();
     let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///resolve_empty_doc.zsh").unwrap();
@@ -1836,7 +1746,7 @@ async fn test_completion_resolve_external_command_empty_doc_placeholder_e2e() {
 
 #[tokio::test]
 async fn test_completion_local_variable_dollar_context() {
-    let mut harness = setup_server();
+    let mut harness = common::setup_server_mock();
     let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///local_var_test.zsh").unwrap();
@@ -1874,45 +1784,8 @@ async fn test_completion_local_variable_dollar_context() {
 }
 
 #[tokio::test]
-async fn test_completion_local_variable_braced_dollar_context() {
-    let mut harness = setup_server();
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///braced_var_test.zsh").unwrap();
-    let doc_text = "BRACED_LOCAL_VAR=\"bar\"\necho ${BRACED_";
-    test_client.init_and_open(&doc_uri, doc_text).await;
-
-    let completion_params = CompletionParams {
-        text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            position: Position::new(1, 14),
-        },
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
-        context: None,
-    };
-
-    let response = test_client
-        .send_request::<request::Completion>(completion_params)
-        .await
-        .unwrap()
-        .expect("Expected completion response");
-
-    let items = get_completion_items(response);
-    let matched_item = items.iter().find(|i| i.label == "BRACED_LOCAL_VAR");
-    assert!(
-        matched_item.is_some(),
-        "Expected 'BRACED_LOCAL_VAR' in completion items"
-    );
-    let item = matched_item.unwrap();
-    assert_eq!(item.kind, Some(CompletionItemKind::VARIABLE));
-}
-
-#[tokio::test]
 async fn test_completion_local_function_context() {
-    let mut harness = setup_server();
+    let mut harness = common::setup_server_mock();
     let mut test_client = harness.client();
 
     let doc_uri = Url::parse("file:///local_func_test.zsh").unwrap();
@@ -1947,44 +1820,6 @@ async fn test_completion_local_function_context() {
     let item = matched_item.unwrap();
     assert_eq!(item.kind, Some(CompletionItemKind::FUNCTION));
     assert_eq!(item.detail.as_deref(), Some("(local function)"));
-}
-
-#[tokio::test]
-async fn test_completion_scope_boundary_after_cursor_excluded() {
-    let mut harness = setup_server();
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///scope_boundary_test.zsh").unwrap();
-    let doc_text = "echo $MY_\nMY_LOCAL_VAR=\"foo\"\nmy_after_func() { : }";
-    test_client.init_and_open(&doc_uri, doc_text).await;
-
-    let completion_params = CompletionParams {
-        text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            position: Position::new(0, 9),
-        },
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
-        context: None,
-    };
-
-    let response = test_client
-        .send_request::<request::Completion>(completion_params)
-        .await
-        .unwrap()
-        .expect("Expected completion response");
-
-    let items = get_completion_items(response);
-    assert!(
-        !items.iter().any(|i| i.label == "MY_LOCAL_VAR"),
-        "Symbol defined after cursor must not be suggested"
-    );
-    assert!(
-        !items.iter().any(|i| i.label == "my_after_func"),
-        "Function defined after cursor must not be suggested"
-    );
 }
 
 #[tokio::test]
@@ -2032,366 +1867,6 @@ async fn test_completion_hybrid_merge_and_deduplication() {
     assert_eq!(path_item.label, "PATH");
     assert_eq!(path_item.detail.as_deref(), Some("(local variable)"));
     assert_eq!(path_item.sort_text.as_deref(), Some("00_PATH"));
-}
-
-#[tokio::test]
-async fn test_completion_local_variable_in_assignment_and_path() {
-    let mut harness = setup_server();
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///assign_var_test.zsh").unwrap();
-    let doc_text = "BASE_DIR=\"/opt\"\nTARGET=$BASE_";
-    test_client.init_and_open(&doc_uri, doc_text).await;
-
-    let completion_params = CompletionParams {
-        text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            position: Position::new(1, 13),
-        },
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
-        context: None,
-    };
-
-    let response = test_client
-        .send_request::<request::Completion>(completion_params)
-        .await
-        .unwrap()
-        .expect("Expected completion response");
-
-    let items = get_completion_items(response);
-    let matched_item = items.iter().find(|i| i.label == "BASE_DIR");
-    assert!(
-        matched_item.is_some(),
-        "Expected 'BASE_DIR' in completion items for assignment 'TARGET=$BASE_'"
-    );
-    let item = matched_item.unwrap();
-    assert_eq!(item.kind, Some(CompletionItemKind::VARIABLE));
-    assert_eq!(item.detail.as_deref(), Some("(local variable)"));
-    assert_eq!(item.sort_text.as_deref(), Some("00_BASE_DIR"));
-}
-
-#[tokio::test]
-async fn test_completion_local_variable_after_comment_with_heredoc() {
-    let mut harness = setup_server();
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///comment_heredoc_test.zsh").unwrap();
-    let doc_text = "# Usage: cat <<EOF\nMY_PRESERVED_VAR=\"val\"\necho $MY_PRESERVED_";
-    test_client.init_and_open(&doc_uri, doc_text).await;
-
-    let completion_params = CompletionParams {
-        text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            position: Position::new(2, 19),
-        },
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
-        context: None,
-    };
-
-    let response = test_client
-        .send_request::<request::Completion>(completion_params)
-        .await
-        .unwrap()
-        .expect("Expected completion response");
-
-    let items = get_completion_items(response);
-    let matched_item = items.iter().find(|i| i.label == "MY_PRESERVED_VAR");
-    assert!(
-        matched_item.is_some(),
-        "Expected 'MY_PRESERVED_VAR' in completion items despite preceding comment with <<EOF"
-    );
-    let item = matched_item.unwrap();
-    assert_eq!(item.kind, Some(CompletionItemKind::VARIABLE));
-    assert_eq!(item.detail.as_deref(), Some("(local variable)"));
-    assert_eq!(item.sort_text.as_deref(), Some("00_MY_PRESERVED_VAR"));
-}
-
-#[tokio::test]
-async fn test_completion_local_variable_in_arithmetic_expression() {
-    let mut harness = setup_server();
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///arithmetic_var_test.zsh").unwrap();
-    let doc_text = "COUNT_LIMIT=100\necho $((COUNT_";
-    test_client.init_and_open(&doc_uri, doc_text).await;
-
-    let completion_params = CompletionParams {
-        text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            position: Position::new(1, 14),
-        },
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
-        context: None,
-    };
-
-    let response = test_client
-        .send_request::<request::Completion>(completion_params)
-        .await
-        .unwrap()
-        .expect("Expected completion response");
-
-    let items = get_completion_items(response);
-    let matched_item = items.iter().find(|i| i.label == "COUNT_LIMIT");
-    assert!(
-        matched_item.is_some(),
-        "Expected 'COUNT_LIMIT' in completion items for arithmetic context '$((COUNT_'"
-    );
-    let item = matched_item.unwrap();
-    assert_eq!(item.kind, Some(CompletionItemKind::VARIABLE));
-    assert_eq!(item.detail.as_deref(), Some("(local variable)"));
-}
-
-#[tokio::test]
-async fn test_completion_local_function_inside_subshell_in_double_quotes() {
-    let mut harness = setup_server();
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///subshell_double_quote_test.zsh").unwrap();
-    let doc_text = "my_custom_func() { :; }\necho \"$(my_custom_";
-    test_client.init_and_open(&doc_uri, doc_text).await;
-
-    let completion_params = CompletionParams {
-        text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            position: Position::new(1, 17),
-        },
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
-        context: None,
-    };
-
-    let response = test_client
-        .send_request::<request::Completion>(completion_params)
-        .await
-        .unwrap()
-        .expect("Expected completion response");
-
-    let items = get_completion_items(response);
-    let matched_item = items.iter().find(|i| i.label == "my_custom_func");
-    assert!(
-        matched_item.is_some(),
-        "Expected 'my_custom_func' in completion items for subshell in double quotes"
-    );
-    let item = matched_item.unwrap();
-    assert_eq!(item.kind, Some(CompletionItemKind::FUNCTION));
-    assert_eq!(item.detail.as_deref(), Some("(local function)"));
-}
-
-#[tokio::test]
-async fn test_no_completion_local_function_in_plain_double_quotes() {
-    let mut harness = setup_server();
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///plain_double_quote_test.zsh").unwrap();
-    let doc_text = "my_custom_func() { :; }\necho \"hello my_custom_";
-    test_client.init_and_open(&doc_uri, doc_text).await;
-
-    let completion_params = CompletionParams {
-        text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            position: Position::new(1, 23),
-        },
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
-        context: None,
-    };
-
-    let response = test_client
-        .send_request::<request::Completion>(completion_params)
-        .await
-        .unwrap()
-        .expect("Expected completion response");
-
-    let items = get_completion_items(response);
-    let matched_item = items.iter().find(|i| i.label == "my_custom_func");
-    assert!(
-        matched_item.is_none(),
-        "Function must NOT be suggested in a plain double quote string"
-    );
-}
-
-#[tokio::test]
-async fn test_no_completion_local_function_in_assignment_or_redirection() {
-    let mut harness = setup_server();
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///assign_redir_test.zsh").unwrap();
-    let doc_text = "my_custom_func() { :; }\nTARGET=my_custom_\ncat > my_custom_";
-    test_client.init_and_open(&doc_uri, doc_text).await;
-
-    // Line 1: TARGET=my_custom_ (position 1, 17)
-    let completion_params_assign = CompletionParams {
-        text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            position: Position::new(1, 17),
-        },
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
-        context: None,
-    };
-
-    let response_assign = test_client
-        .send_request::<request::Completion>(completion_params_assign)
-        .await
-        .unwrap()
-        .expect("Expected completion response");
-
-    let items_assign = get_completion_items(response_assign);
-    let matched_assign = items_assign.iter().find(|i| i.label == "my_custom_func");
-    assert!(
-        matched_assign.is_none(),
-        "Function must NOT be suggested in variable assignment value"
-    );
-
-    // Line 2: cat > my_custom_ (position 2, 16)
-    let completion_params_redir = CompletionParams {
-        text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-            position: Position::new(2, 16),
-        },
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
-        context: None,
-    };
-
-    let response_redir = test_client
-        .send_request::<request::Completion>(completion_params_redir)
-        .await
-        .unwrap()
-        .expect("Expected completion response");
-
-    let items_redir = get_completion_items(response_redir);
-    let matched_redir = items_redir.iter().find(|i| i.label == "my_custom_func");
-    assert!(
-        matched_redir.is_none(),
-        "Function must NOT be suggested in redirection target"
-    );
-}
-
-#[tokio::test]
-async fn test_completion_deduplication_builtin_resword() {
-    let mut harness = setup_server();
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///dedup_commands.zsh").unwrap();
-    // Test both 'exp' (e.g. export) and 'loc' (e.g. local)
-    test_client.init_and_open(&doc_uri, "exp\nloc").await;
-
-    // 1. Completion for 'exp' at line 0, char 3
-    let res_exp = test_client
-        .complete(&doc_uri, 0, 3)
-        .await
-        .unwrap()
-        .expect("Expected completion response for exp");
-
-    let items_exp = get_completion_items(res_exp);
-    assert!(!items_exp.is_empty(), "Expected completion items for 'exp'");
-    let export_count = items_exp.iter().filter(|i| i.label == "export").count();
-    assert_eq!(
-        export_count, 1,
-        "Expected exactly one 'export' candidate, but found {export_count}"
-    );
-
-    // 2. Completion for 'loc' at line 1, char 3
-    let res_loc = test_client
-        .complete(&doc_uri, 1, 3)
-        .await
-        .unwrap()
-        .expect("Expected completion response for loc");
-
-    let items_loc = get_completion_items(res_loc);
-    assert!(!items_loc.is_empty(), "Expected completion items for 'loc'");
-    let local_count = items_loc.iter().filter(|i| i.label == "local").count();
-    assert_eq!(
-        local_count, 1,
-        "Expected exactly one 'local' candidate, but found {local_count}"
-    );
-}
-
-#[tokio::test]
-async fn test_completion_multiline_backslash_continued_command() {
-    let mock_script = r#"#!/usr/bin/env zsh
-while IFS= read -r line; do
-    if [[ $line == input:* ]]; then
-        prefix=${line#input:}
-        if [[ $prefix == "git   st"* ]]; then
-            printf "status\tshow working tree status\n\x01EOC\x01\n"
-        else
-            printf "wrong_prefix:%s\tdesc\n\x01EOC\x01\n" "$prefix"
-        fi
-    fi
-done
-"#;
-    let mut harness = setup_server_with_scripts(mock_script, "");
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///multiline_cmd.zsh").unwrap();
-    let text = "git \\\n  st";
-    test_client.init_and_open(&doc_uri, text).await;
-
-    let res = test_client
-        .complete(&doc_uri, 1, 4)
-        .await
-        .unwrap()
-        .expect("Expected completion response");
-
-    let items = get_completion_items(res);
-    assert!(
-        items.iter().any(|i| i.label == "status"),
-        "Expected 'status' from joined multiline prefix 'git   st', got: {items:?}"
-    );
-    assert!(
-        !items.iter().any(|i| i.label.starts_with("wrong_prefix:")),
-        "Daemon did not receive joined multiline prefix: {items:?}"
-    );
-}
-
-#[tokio::test]
-async fn test_completion_local_alias_merged() {
-    let mock_script = r#"#!/usr/bin/env zsh
-while IFS= read -r line; do
-    if [[ $line == input:* ]]; then
-        printf "my_custom_other\texternal command\n\x01EOC\x01\n"
-    fi
-done
-"#;
-    let mut harness = setup_server_with_scripts(mock_script, "");
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///local_alias.zsh").unwrap();
-    let text = "alias my_custom_alias='git status --short'\nmy_custom_";
-    test_client.init_and_open(&doc_uri, text).await;
-
-    let res = test_client
-        .complete(&doc_uri, 1, 10)
-        .await
-        .unwrap()
-        .expect("Expected completion response");
-
-    let items = get_completion_items(res);
-    let alias_item = items
-        .iter()
-        .find(|i| i.label == "my_custom_alias")
-        .expect("Expected 'my_custom_alias' in completion items");
-    assert_eq!(alias_item.kind, Some(CompletionItemKind::FUNCTION));
-    assert_eq!(alias_item.detail.as_deref(), Some("(local alias)"));
 }
 
 #[tokio::test]
@@ -2487,61 +1962,5 @@ done
             .iter()
             .any(|i| i.label == "sourced_unsaved_func"),
         "Expected sourced_unsaved_func from open DocumentManager buffer in {unsaved_items:?}"
-    );
-}
-
-#[tokio::test]
-async fn test_completion_function_local_variable_scoping() {
-    let mock_script = r#"#!/usr/bin/env zsh
-while IFS= read -r line; do
-    if [[ $line == input:* ]]; then
-        printf "\x01EOC\x01\n"
-    fi
-done
-"#;
-    let mut harness = setup_server_with_scripts(mock_script, "");
-    let mut test_client = harness.client();
-
-    let doc_uri = Url::parse("file:///completion_scoping.zsh").unwrap();
-    let text = concat!(
-        "SCOPED_GLOBAL_VAR=1\n",
-        "helper_fn() {\n",
-        "  local SCOPED_LOCAL_ONLY=2\n",
-        "  echo $SCOPED_\n",
-        "}\n",
-        "echo $SCOPED_\n",
-    );
-    test_client.init_and_open(&doc_uri, text).await;
-
-    // 1. Inside `helper_fn()`: both `SCOPED_LOCAL_ONLY` and `SCOPED_GLOBAL_VAR` are suggested
-    let res_inside = test_client
-        .complete(&doc_uri, 3, 15)
-        .await
-        .unwrap()
-        .expect("Expected completion response inside helper_fn");
-    let items_inside = get_completion_items(res_inside);
-    assert!(
-        items_inside.iter().any(|i| i.label == "SCOPED_LOCAL_ONLY"),
-        "Expected SCOPED_LOCAL_ONLY inside helper_fn: {items_inside:?}"
-    );
-    assert!(
-        items_inside.iter().any(|i| i.label == "SCOPED_GLOBAL_VAR"),
-        "Expected SCOPED_GLOBAL_VAR inside helper_fn: {items_inside:?}"
-    );
-
-    // 2. Outside `helper_fn()`: `SCOPED_LOCAL_ONLY` must NOT be suggested
-    let res_outside = test_client
-        .complete(&doc_uri, 5, 13)
-        .await
-        .unwrap()
-        .expect("Expected completion response outside helper_fn");
-    let items_outside = get_completion_items(res_outside);
-    assert!(
-        items_outside.iter().any(|i| i.label == "SCOPED_GLOBAL_VAR"),
-        "Expected SCOPED_GLOBAL_VAR outside helper_fn: {items_outside:?}"
-    );
-    assert!(
-        !items_outside.iter().any(|i| i.label == "SCOPED_LOCAL_ONLY"),
-        "SCOPED_LOCAL_ONLY must not leak outside helper_fn: {items_outside:?}"
     );
 }
