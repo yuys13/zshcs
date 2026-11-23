@@ -65,10 +65,11 @@ impl DocumentState {
 
     /// Returns the lazily parsed and cached `DocumentIndex` for the current document version.
     pub fn index(&self) -> Arc<DocumentIndex> {
-        Arc::clone(
-            self.index_cache
-                .get_or_init(|| Arc::new(parse_document(&self.text))),
-        )
+        Arc::clone(self.index_cache.get_or_init(|| {
+            #[cfg(test)]
+            run_on_index_parse_hook();
+            Arc::new(parse_document(&self.text))
+        }))
     }
 
     /// Safely applies incremental or full synchronization changes to the document text.
@@ -267,7 +268,8 @@ impl DocumentManager {
 
     /// Returns the cached `DocumentIndex` of a document if it is open.
     pub fn get_index(&self, uri: &Url) -> Option<Arc<DocumentIndex>> {
-        self.documents.get(uri).map(|doc| doc.index())
+        let doc = self.documents.get(uri).map(|doc| doc.clone())?;
+        Some(doc.index())
     }
 
     /// Retrieves the line prefix at a given position for a document.
@@ -326,6 +328,27 @@ pub fn position_to_byte_offset(text: &str, position: Position) -> Option<usize> 
     }
 
     Some(line_offset + byte_offset)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ON_INDEX_PARSE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_on_index_parse_hook() {
+    let hook = ON_INDEX_PARSE_HOOK.with(|cell| cell.borrow_mut().take());
+    if let Some(f) = hook {
+        f();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_on_index_parse_hook(hook: impl FnOnce() + 'static) {
+    ON_INDEX_PARSE_HOOK.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(hook));
+    });
 }
 
 #[cfg(test)]
@@ -1170,5 +1193,32 @@ mod tests {
             Err(DocumentError::InvalidRange(_))
         ));
         assert!(Arc::ptr_eq(&idx1, &state.index()));
+    }
+
+    #[test]
+    fn test_get_index_releases_dashmap_lock_before_parsing() {
+        let mgr = DocumentManager::new();
+        let uri = Url::parse("file:///lock_scope.zsh").unwrap();
+        mgr.open(uri.clone(), 1, "FOO=1\n".to_string());
+
+        let mgr_clone = mgr.clone();
+        let uri_clone = uri.clone();
+        set_on_index_parse_hook(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let acquired = mgr_clone.get_mut(&uri_clone).is_some();
+                let _ = tx.send(acquired);
+            });
+            let acquired = rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .expect("DashMap shard write lock should not be blocked during cold index parse");
+            assert!(acquired);
+            handle.join().unwrap();
+        });
+
+        let idx1 = mgr.get_index(&uri).unwrap();
+        let idx2 = mgr.get_index(&uri).unwrap();
+        assert!(Arc::ptr_eq(&idx1, &idx2));
+        assert_eq!(idx1.variables[0].name, "FOO");
     }
 }

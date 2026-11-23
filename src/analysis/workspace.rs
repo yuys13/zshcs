@@ -212,7 +212,8 @@ fn load_sourced_script_with_index(
             .canon_uri
             .as_ref()
             .and_then(|u| mgr.get(u))
-            .or_else(|| uris.raw_uri.as_ref().and_then(|u| mgr.get(u)));
+            .or_else(|| uris.raw_uri.as_ref().and_then(|u| mgr.get(u)))
+            .map(|doc| doc.clone());
         if let Some(doc) = open_doc {
             return Some((doc.text().to_string(), doc.index()));
         }
@@ -495,5 +496,45 @@ mod tests {
 
         assert_eq!(sourced.len(), 1);
         assert_eq!(get_load_count(), 1);
+    }
+
+    #[test]
+    fn test_collect_sourced_documents_releases_dashmap_lock_before_parsing_open_doc() {
+        let dir = tempdir().unwrap();
+        let main_path = dir.path().join("main.zsh");
+        let a_path = dir.path().join("a.zsh");
+
+        std::fs::write(&a_path, "fn_disk() { : }\n").unwrap();
+
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let a_uri = Url::from_file_path(&a_path).unwrap();
+        let doc_mgr = DocumentManager::new();
+        doc_mgr.open(a_uri.clone(), 1, "fn_in_memory() { : }\n".to_string());
+
+        let mgr_clone = doc_mgr.clone();
+        let a_uri_clone = a_uri.clone();
+        crate::document::set_on_index_parse_hook(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let acquired = mgr_clone.get_mut(&a_uri_clone).is_some();
+                let _ = tx.send(acquired);
+            });
+            let acquired = rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .expect("DashMap shard write lock should not be blocked during sourced doc parse");
+            assert!(acquired);
+            handle.join().unwrap();
+        });
+
+        let main_idx = parse_document("source ./a.zsh\n");
+        let sourced = collect_sourced_documents(
+            &main_idx,
+            &main_uri,
+            Position::new(1, 0),
+            Some(&doc_mgr),
+            true,
+        );
+        assert_eq!(sourced.len(), 1);
+        assert_eq!(sourced[0].index.functions[0].name, "fn_in_memory");
     }
 }
