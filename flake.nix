@@ -46,7 +46,6 @@
           testInputs = with pkgs; [
             git
             man-db
-            man-pages
             zsh
           ];
         in
@@ -94,7 +93,7 @@
 
             preCheck = ''
               export HOME=$TMPDIR
-              export MANPATH="${pkgs.git}/share/man:${pkgs.man-pages}/share/man:$MANPATH"
+              export MANPATH="${pkgs.git}/share/man:$MANPATH"
             '';
           };
 
@@ -108,7 +107,7 @@
             packages = [ rustDevToolchain ] ++ testInputs;
 
             shellHook = ''
-              export MANPATH="${pkgs.git}/share/man:${pkgs.man-pages}/share/man:$MANPATH"
+              export MANPATH="${pkgs.git}/share/man:$MANPATH"
               echo "Rust development environment loaded"
               cargo --version
             '';
