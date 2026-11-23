@@ -367,31 +367,295 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::completion::{
+        resolve_completion_item_async_with_fetcher, resolve_completion_item_async_with_timeout,
+    };
+    use rstest::rstest;
+    use tower_lsp::lsp_types::{CompletionItem, Documentation};
 
     #[test]
     fn test_clean_man_text_overstrikes_and_escapes() {
         let raw_bold = "N\x08NA\x08AM\x08ME\x08E";
         assert_eq!(clean_man_text(raw_bold), "NAME");
 
+        let raw_triple = "c\x08c\x08c";
+        assert_eq!(clean_man_text(raw_triple), "c");
+
         let raw_underline = "_\x08f_\x08o_\x08o";
         assert_eq!(clean_man_text(raw_underline), "foo");
+
+        let raw_under_bold = "_\x08c\x08c";
+        assert_eq!(clean_man_text(raw_under_bold), "c");
 
         let raw_ansi = "\x1b[1mhello\x1b[0m \x1b[4mworld\x1b[0m";
         assert_eq!(clean_man_text(raw_ansi), "hello world");
 
         let raw_unicode = "grep \u{2212}v pattern";
         assert_eq!(clean_man_text(raw_unicode), "grep -v pattern");
+
+        let raw_plain = "Simple line\nSecond line\n";
+        assert_eq!(clean_man_text(raw_plain), "Simple line\nSecond line");
+    }
+
+    #[test]
+    fn test_clean_man_text_tabs_and_cr() {
+        // Tab stop expansion (every 8 columns)
+        let raw_tabs = "a\tb";
+        assert_eq!(clean_man_text(raw_tabs), "a       b");
+
+        // Carriage return reset column
+        let raw_cr = "hello\rworld";
+        assert_eq!(clean_man_text(raw_cr), "world");
+    }
+
+    #[test]
+    fn test_clean_man_text_multibyte_and_form_feed() {
+        // Form feed reset column
+        let raw_ff = "hello\x0cworld";
+        assert_eq!(clean_man_text(raw_ff), "world");
+
+        // Multibyte character overstrike with underline
+        let raw_under_mb = "_\x08あ";
+        assert_eq!(clean_man_text(raw_under_mb), "あ");
+
+        let raw_mb_under = "あ\x08_";
+        assert_eq!(clean_man_text(raw_mb_under), "あ");
+
+        // Multibyte overwrite
+        let raw_overwrite = "あ\x08い";
+        assert_eq!(clean_man_text(raw_overwrite), "い");
     }
 
     #[test]
     fn test_format_man_markdown_escaping() {
-        let plain = "hello world";
-        assert_eq!(format_man_markdown(plain), "```text\nhello world\n```");
+        let plain = "NAME\n    git - fast version control";
+        assert_eq!(
+            format_man_markdown(plain),
+            "```text\nNAME\n    git - fast version control\n```"
+        );
 
-        let with_backticks = "```zsh\necho hi\n```";
+        let with_backticks = "Run ```command``` to execute.";
         assert_eq!(
             format_man_markdown(with_backticks),
-            "````text\n```zsh\necho hi\n```\n````"
+            "````text\nRun ```command``` to execute.\n````"
         );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_single_flight_deduplication() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        let cache = Arc::new(ManCache::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count = 20;
+        let barrier = Arc::new(Barrier::new(count));
+
+        let mut handles = Vec::new();
+        for _ in 0..count {
+            let cache_clone = Arc::clone(&cache);
+            let barrier_clone = Arc::clone(&barrier);
+            let count_clone = Arc::clone(&call_count);
+            handles.push(tokio::spawn(async move {
+                barrier_clone.wait().await;
+                let item = CompletionItem {
+                    label: "single_flight_cmd".to_string(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    ..Default::default()
+                };
+                resolve_completion_item_async_with_fetcher(
+                    item,
+                    &cache_clone,
+                    Duration::from_millis(2000),
+                    move |_cmd, _dur| {
+                        let cnt = count_clone;
+                        async move {
+                            cnt.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                            ManPageResult::Found(
+                                "single_flight_cmd(1) - single flight documentation".to_string(),
+                            )
+                        }
+                    },
+                )
+                .await
+            }));
+        }
+
+        for handle in handles {
+            let resolved = handle.await.unwrap();
+            match resolved.documentation {
+                Some(Documentation::MarkupContent(markup)) => {
+                    assert!(markup.value.contains("single_flight_cmd"));
+                }
+                other => panic!("Expected MarkupContent, got {other:?}"),
+            }
+        }
+
+        // Exactly one background fetch task must execute despite 20 concurrent requests
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(cache.contains_key("single_flight_cmd"));
+        assert!(!is_in_flight("single_flight_cmd"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_single_flight_not_found() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        let cache = Arc::new(ManCache::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count = 10;
+        let barrier = Arc::new(Barrier::new(count));
+
+        let mut handles = Vec::new();
+        for _ in 0..count {
+            let cache_clone = Arc::clone(&cache);
+            let barrier_clone = Arc::clone(&barrier);
+            let count_clone = Arc::clone(&call_count);
+            handles.push(tokio::spawn(async move {
+                barrier_clone.wait().await;
+                let item = CompletionItem {
+                    label: "nonexistent_single_flight_cmd".to_string(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    ..Default::default()
+                };
+                resolve_completion_item_async_with_fetcher(
+                    item,
+                    &cache_clone,
+                    Duration::from_millis(2000),
+                    move |_cmd, _dur| {
+                        let cnt = count_clone;
+                        async move {
+                            cnt.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            ManPageResult::NotFound
+                        }
+                    },
+                )
+                .await
+            }));
+        }
+
+        for handle in handles {
+            let resolved = handle.await.unwrap();
+            assert_eq!(resolved.documentation, None);
+        }
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(cache.contains_key("nonexistent_single_flight_cmd"));
+        assert_eq!(*cache.get("nonexistent_single_flight_cmd").unwrap(), None);
+        assert!(!is_in_flight("nonexistent_single_flight_cmd"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_single_flight_timeout_does_not_poison_cache() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        let cache = Arc::new(ManCache::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count = 10;
+        let barrier = Arc::new(Barrier::new(count));
+
+        let mut handles = Vec::new();
+        for _ in 0..count {
+            let cache_clone = Arc::clone(&cache);
+            let barrier_clone = Arc::clone(&barrier);
+            let count_clone = Arc::clone(&call_count);
+            handles.push(tokio::spawn(async move {
+                barrier_clone.wait().await;
+                let item = CompletionItem {
+                    label: "timeout_single_flight_cmd".to_string(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    ..Default::default()
+                };
+                resolve_completion_item_async_with_fetcher(
+                    item,
+                    &cache_clone,
+                    Duration::from_millis(2000),
+                    move |_cmd, _dur| {
+                        let cnt = count_clone;
+                        async move {
+                            cnt.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            ManPageResult::Timeout
+                        }
+                    },
+                )
+                .await
+            }));
+        }
+
+        for handle in handles {
+            let resolved = handle.await.unwrap();
+            assert_eq!(resolved.documentation, None);
+        }
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(!cache.contains_key("timeout_single_flight_cmd"));
+        assert!(!is_in_flight("timeout_single_flight_cmd"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completion_item_async_timeout_protection() {
+        let cache = ManCache::new();
+        let item = CompletionItem {
+            label: "timeout_protection_isolated_cmd".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+
+        // Pass 0 duration timeout
+        let resolved =
+            resolve_completion_item_async_with_timeout(item, &cache, Duration::from_millis(0))
+                .await;
+        // Zero timeout aborts immediately without caching transient timeouts, returns unmodified item
+        assert_eq!(resolved.documentation, None);
+        assert!(!cache.contains_key("timeout_protection_isolated_cmd"));
+        assert!(!is_in_flight("timeout_protection_isolated_cmd"));
+    }
+
+    #[rstest]
+    // Valid commands
+    #[case(Some(CompletionItemKind::FUNCTION), "git", true)]
+    #[case(Some(CompletionItemKind::TEXT), "cargo", true)]
+    #[case(None, "grep", true)]
+    #[case(Some(CompletionItemKind::FUNCTION), "python3.11", true)]
+    #[case(Some(CompletionItemKind::FUNCTION), "git-commit", true)]
+    #[case(Some(CompletionItemKind::FUNCTION), "7z", true)]
+    #[case(Some(CompletionItemKind::FUNCTION), "my_cmd_1", true)]
+    // Ineligible labels: flags, dots, colons, punctuation-only, path slashes
+    #[case(Some(CompletionItemKind::FUNCTION), "-v", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "--help", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), ".", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "..", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "...", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), ".gitignore", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), ".zshrc", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "::", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), ":wq", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "git.", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "test:", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "_", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "__", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "   ", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "foo/bar", false)]
+    #[case(Some(CompletionItemKind::FUNCTION), "/usr/bin/git", false)]
+    // Ineligible kinds
+    #[case(Some(CompletionItemKind::FILE), "git", false)]
+    #[case(Some(CompletionItemKind::FOLDER), "git", false)]
+    #[case(Some(CompletionItemKind::KEYWORD), "git", false)]
+    #[case(Some(CompletionItemKind::VARIABLE), "git", false)]
+    fn test_is_eligible_for_external_command_cases(
+        #[case] kind: Option<CompletionItemKind>,
+        #[case] label: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(is_eligible_for_external_command(kind, label), expected);
     }
 }

@@ -832,10 +832,7 @@ pub fn merge_local_completions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::syntax::detect_heredoc_delimiter;
-    use crate::analysis::workspace::{MAX_SOURCED_FILE_BYTES, MAX_SOURCED_FILES};
     use rstest::rstest;
-    use tokio::sync::{mpsc, oneshot};
 
     #[rstest]
     // 1. Only candidate without tab
@@ -1227,80 +1224,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_completion_daemon_skips_cancelled_request() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let script_path = temp_dir.path().join("mock_daemon.zsh");
-        std::fs::write(
-            &script_path,
-            "#!/bin/zsh\nwhile read -r line; do\n  if [[ \"$line\" == input:* ]]; then\n    echo \"success\\x01EOC\\x01\"\n  fi\ndone\n",
-        )
-        .unwrap();
-
-        let (tx, rx) = mpsc::channel(16);
-        let mut client_opt = None;
-        let (_service, _socket) = tower_lsp::LspService::new(|client| {
-            client_opt = Some(client.clone());
-            crate::Backend::new(client).unwrap()
-        });
-        let client = client_opt.unwrap();
-
-        let daemon_handle = tokio::spawn(run_completion_daemon(script_path, None, rx, client));
-
-        // 1. Send cancelled request (drop receiver immediately)
-        let (tx_resp1, rx_resp1) = oneshot::channel();
-        drop(rx_resp1);
-        tx.send(CompletionRequest::Complete {
-            prefix: "cancelled".to_string(),
-            cwd: None,
-            responder: tx_resp1,
-        })
-        .await
-        .unwrap();
-
-        // 2. Send active request
-        let (tx_resp2, rx_resp2) = oneshot::channel();
-        tx.send(CompletionRequest::Complete {
-            prefix: "active".to_string(),
-            cwd: None,
-            responder: tx_resp2,
-        })
-        .await
-        .unwrap();
-
-        let result = tokio::time::timeout(Duration::from_secs(3), rx_resp2)
-            .await
-            .expect("Did not timeout waiting for active request")
-            .expect("Channel not closed")
-            .expect("Daemon returned success");
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].label, "success");
-
-        drop(tx);
-        let _ = daemon_handle.await;
-    }
-
-    #[test]
-    fn test_parse_candidate_line_throughput() {
-        let sample_line = "status\tshow working tree status";
-        let iterations = 50_000;
-        let mut items = Vec::with_capacity(1000);
-
-        let start = std::time::Instant::now();
-        for _ in 0..iterations {
-            items.clear();
-            parse_candidate_line(sample_line, &mut items);
-        }
-        let elapsed = start.elapsed();
-
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "status");
-        assert_eq!(items[0].detail.as_deref(), Some("show working tree status"));
-        assert_eq!(items[0].insert_text, None);
-        assert!(elapsed.as_secs() < 5);
-    }
-
     #[test]
     fn test_resolve_completion_item_builtins() {
         let cases = vec![
@@ -1390,188 +1313,24 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_completion_item_all_53_builtins_and_20_reserved_words() {
-        let builtins = [
-            "cd",
-            "echo",
-            "export",
-            "set",
-            "setopt",
-            "unsetopt",
-            "autoload",
-            "compadd",
-            "typeset",
-            "print",
-            "printf",
-            "source",
-            ".",
-            "eval",
-            "alias",
-            "unalias",
-            "read",
-            "return",
-            "exit",
-            "shift",
-            "test",
-            "trap",
-            "unset",
-            "local",
-            "declare",
-            "which",
-            "where",
-            "whence",
-            "type",
-            "bindkey",
-            "zstyle",
-            "zmodload",
-            "zpty",
-            "zparseopts",
-            "pushd",
-            "popd",
-            "dirs",
-            "pwd",
-            "history",
-            "fc",
-            "bg",
-            "fg",
-            "jobs",
-            "kill",
-            "wait",
-            "disown",
-            "exec",
-            "hash",
-            "rehash",
-            "umask",
-            "true",
-            "false",
-            ":",
-        ];
-        assert_eq!(builtins.len(), 53);
-
-        for b in builtins {
-            let kind = if b == "." {
-                CompletionItemKind::FOLDER
-            } else if b == ":" {
-                CompletionItemKind::TEXT
-            } else {
-                CompletionItemKind::FUNCTION
-            };
+    fn test_resolve_completion_item_special_kinds_and_omitted_kind() {
+        for (label, kind) in [
+            (".", Some(CompletionItemKind::FOLDER)),
+            (":", Some(CompletionItemKind::TEXT)),
+            ("cd", Some(CompletionItemKind::TEXT)),
+            ("cd", None),
+            ("if", Some(CompletionItemKind::TEXT)),
+            ("if", None),
+        ] {
             let item = CompletionItem {
-                label: b.to_string(),
-                kind: Some(kind),
+                label: label.to_string(),
+                kind,
                 ..Default::default()
             };
             let resolved = resolve_completion_item(item);
-            let doc = resolved
-                .documentation
-                .unwrap_or_else(|| panic!("Builtin '{b}' must be resolved with documentation"));
-            match doc {
-                Documentation::MarkupContent(markup) => {
-                    assert_eq!(markup.kind, MarkupKind::Markdown);
-                    assert!(
-                        markup.value.contains("Builtin") || markup.value.contains("Module"),
-                        "Doc for '{b}' should mention Builtin or Module"
-                    );
-                    assert!(
-                        markup.value.contains("```zsh"),
-                        "Doc for '{b}' should contain zsh syntax block"
-                    );
-                }
-                Documentation::String(_) => panic!("Expected MarkupContent documentation"),
-            }
-
-            // Verify resolution with CompletionItemKind::TEXT (default inferred kind without detail)
-            let text_item = CompletionItem {
-                label: b.to_string(),
-                kind: Some(CompletionItemKind::TEXT),
-                ..Default::default()
-            };
             assert!(
-                resolve_completion_item(text_item).documentation.is_some(),
-                "Builtin '{b}' with TEXT kind must resolve documentation"
-            );
-
-            // Verify resolution with kind: None (client omitted kind)
-            let none_item = CompletionItem {
-                label: b.to_string(),
-                kind: None,
-                ..Default::default()
-            };
-            assert!(
-                resolve_completion_item(none_item).documentation.is_some(),
-                "Builtin '{b}' with kind: None must resolve documentation"
-            );
-        }
-
-        let reserved = [
-            "if",
-            "then",
-            "elif",
-            "else",
-            "fi",
-            "for",
-            "do",
-            "done",
-            "while",
-            "until",
-            "case",
-            "esac",
-            "select",
-            "function",
-            "repeat",
-            "time",
-            "coproc",
-            "nocorrect",
-            "foreach",
-            "end",
-        ];
-        assert_eq!(reserved.len(), 20);
-
-        for r in reserved {
-            let item = CompletionItem {
-                label: r.to_string(),
-                kind: Some(CompletionItemKind::KEYWORD),
-                ..Default::default()
-            };
-            let resolved = resolve_completion_item(item);
-            let doc = resolved.documentation.unwrap_or_else(|| {
-                panic!("Reserved word '{r}' must be resolved with documentation")
-            });
-            match doc {
-                Documentation::MarkupContent(markup) => {
-                    assert_eq!(markup.kind, MarkupKind::Markdown);
-                    assert!(
-                        markup.value.contains("Reserved Word"),
-                        "Doc for '{r}' should mention Reserved Word"
-                    );
-                    assert!(
-                        markup.value.contains("```zsh"),
-                        "Doc for '{r}' should contain zsh syntax block"
-                    );
-                }
-                Documentation::String(_) => panic!("Expected MarkupContent documentation"),
-            }
-
-            // Verify resolution with CompletionItemKind::TEXT (default inferred kind without detail)
-            let text_item = CompletionItem {
-                label: r.to_string(),
-                kind: Some(CompletionItemKind::TEXT),
-                ..Default::default()
-            };
-            assert!(
-                resolve_completion_item(text_item).documentation.is_some(),
-                "Reserved word '{r}' with TEXT kind must resolve documentation"
-            );
-
-            // Verify resolution with kind: None (client omitted kind)
-            let none_item = CompletionItem {
-                label: r.to_string(),
-                kind: None,
-                ..Default::default()
-            };
-            assert!(
-                resolve_completion_item(none_item).documentation.is_some(),
-                "Reserved word '{r}' with kind: None must resolve documentation"
+                resolved.documentation.is_some(),
+                "Expected documentation for {label} ({kind:?})"
             );
         }
     }
@@ -2088,308 +1847,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_completion_item_async_single_flight_deduplication() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::sync::Barrier;
-
-        let cache = Arc::new(ManCache::new());
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let count = 20;
-        let barrier = Arc::new(Barrier::new(count));
-
-        let mut handles = Vec::new();
-        for _ in 0..count {
-            let cache_clone = Arc::clone(&cache);
-            let barrier_clone = Arc::clone(&barrier);
-            let count_clone = Arc::clone(&call_count);
-            handles.push(tokio::spawn(async move {
-                barrier_clone.wait().await;
-                let item = CompletionItem {
-                    label: "single_flight_cmd".to_string(),
-                    kind: Some(CompletionItemKind::FUNCTION),
-                    ..Default::default()
-                };
-                resolve_completion_item_async_with_fetcher(
-                    item,
-                    &cache_clone,
-                    Duration::from_millis(2000),
-                    move |_cmd, _dur| {
-                        let cnt = count_clone;
-                        async move {
-                            cnt.fetch_add(1, Ordering::SeqCst);
-                            tokio::time::sleep(Duration::from_millis(30)).await;
-                            ManPageResult::Found(
-                                "single_flight_cmd(1) - single flight documentation".to_string(),
-                            )
-                        }
-                    },
-                )
-                .await
-            }));
-        }
-
-        for handle in handles {
-            let resolved = handle.await.unwrap();
-            match resolved.documentation {
-                Some(Documentation::MarkupContent(markup)) => {
-                    assert!(markup.value.contains("single_flight_cmd"));
-                }
-                other => panic!("Expected MarkupContent, got {other:?}"),
-            }
-        }
-
-        // Exactly one background fetch task must execute despite 20 concurrent requests
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
-        assert!(cache.contains_key("single_flight_cmd"));
-        assert!(!crate::runtime::man::is_in_flight("single_flight_cmd"));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_completion_item_async_single_flight_not_found() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::sync::Barrier;
-
-        let cache = Arc::new(ManCache::new());
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let count = 10;
-        let barrier = Arc::new(Barrier::new(count));
-
-        let mut handles = Vec::new();
-        for _ in 0..count {
-            let cache_clone = Arc::clone(&cache);
-            let barrier_clone = Arc::clone(&barrier);
-            let count_clone = Arc::clone(&call_count);
-            handles.push(tokio::spawn(async move {
-                barrier_clone.wait().await;
-                let item = CompletionItem {
-                    label: "nonexistent_single_flight_cmd".to_string(),
-                    kind: Some(CompletionItemKind::FUNCTION),
-                    ..Default::default()
-                };
-                resolve_completion_item_async_with_fetcher(
-                    item,
-                    &cache_clone,
-                    Duration::from_millis(2000),
-                    move |_cmd, _dur| {
-                        let cnt = count_clone;
-                        async move {
-                            cnt.fetch_add(1, Ordering::SeqCst);
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                            ManPageResult::NotFound
-                        }
-                    },
-                )
-                .await
-            }));
-        }
-
-        for handle in handles {
-            let resolved = handle.await.unwrap();
-            assert_eq!(resolved.documentation, None);
-        }
-
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
-        assert!(cache.contains_key("nonexistent_single_flight_cmd"));
-        assert_eq!(*cache.get("nonexistent_single_flight_cmd").unwrap(), None);
-        assert!(!crate::runtime::man::is_in_flight(
-            "nonexistent_single_flight_cmd"
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_completion_item_async_single_flight_timeout_does_not_poison_cache() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::sync::Barrier;
-
-        let cache = Arc::new(ManCache::new());
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let count = 10;
-        let barrier = Arc::new(Barrier::new(count));
-
-        let mut handles = Vec::new();
-        for _ in 0..count {
-            let cache_clone = Arc::clone(&cache);
-            let barrier_clone = Arc::clone(&barrier);
-            let count_clone = Arc::clone(&call_count);
-            handles.push(tokio::spawn(async move {
-                barrier_clone.wait().await;
-                let item = CompletionItem {
-                    label: "timeout_single_flight_cmd".to_string(),
-                    kind: Some(CompletionItemKind::FUNCTION),
-                    ..Default::default()
-                };
-                resolve_completion_item_async_with_fetcher(
-                    item,
-                    &cache_clone,
-                    Duration::from_millis(2000),
-                    move |_cmd, _dur| {
-                        let cnt = count_clone;
-                        async move {
-                            cnt.fetch_add(1, Ordering::SeqCst);
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                            ManPageResult::Timeout
-                        }
-                    },
-                )
-                .await
-            }));
-        }
-
-        for handle in handles {
-            let resolved = handle.await.unwrap();
-            assert_eq!(resolved.documentation, None);
-        }
-
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
-        assert!(!cache.contains_key("timeout_single_flight_cmd"));
-        assert!(!crate::runtime::man::is_in_flight(
-            "timeout_single_flight_cmd"
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_completion_item_async_timeout_protection() {
-        let cache = ManCache::new();
-        let item = CompletionItem {
-            label: "timeout_protection_isolated_cmd".to_string(),
-            kind: Some(CompletionItemKind::FUNCTION),
-            ..Default::default()
-        };
-
-        // Pass 0 duration timeout
-        let resolved =
-            resolve_completion_item_async_with_timeout(item, &cache, Duration::from_millis(0))
-                .await;
-        // Zero timeout aborts immediately without caching transient timeouts, returns unmodified item
-        assert_eq!(resolved.documentation, None);
-        assert!(!cache.contains_key("timeout_protection_isolated_cmd"));
-        assert!(!crate::runtime::man::is_in_flight(
-            "timeout_protection_isolated_cmd"
-        ));
-    }
-
-    #[test]
-    fn test_is_eligible_for_external_command_comprehensive() {
-        // Valid commands
-        assert!(is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "git"
-        ));
-        assert!(is_eligible_for_external_command(
-            Some(CompletionItemKind::TEXT),
-            "cargo"
-        ));
-        assert!(is_eligible_for_external_command(None, "grep"));
-        assert!(is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "python3.11"
-        ));
-        assert!(is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "git-commit"
-        ));
-        assert!(is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "7z"
-        ));
-        assert!(is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "my_cmd_1"
-        ));
-
-        // Ineligible labels: flags, dots, colons, punctuation-only, path slashes
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "-v"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "--help"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "."
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            ".."
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "..."
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            ".gitignore"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            ".zshrc"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "::"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            ":wq"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "git."
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "test:"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "_"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "__"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            ""
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "   "
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "foo/bar"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FUNCTION),
-            "/usr/bin/git"
-        ));
-
-        // Ineligible kinds
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FILE),
-            "git"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::FOLDER),
-            "git"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::KEYWORD),
-            "git"
-        ));
-        assert!(!is_eligible_for_external_command(
-            Some(CompletionItemKind::VARIABLE),
-            "git"
-        ));
-    }
-
-    #[tokio::test]
     async fn test_resolve_completion_item_async_empty_doc_is_resolved_for_external_command() {
         let cache = ManCache::new();
 
@@ -2890,63 +2347,52 @@ local \
         assert!(names.contains(&"VAR_TWO"));
     }
 
-    #[test]
-    fn test_detect_heredoc_delimiter_with_length_expansion_and_hash_words() {
-        let line1 = "echo ${#ARRAY} <<EOF";
-        assert_eq!(detect_heredoc_delimiter(line1), Some("EOF".to_string()));
-
-        let line2 = "echo foo#bar <<MY_DELIM";
-        assert_eq!(
-            detect_heredoc_delimiter(line2),
-            Some("MY_DELIM".to_string())
-        );
+    #[rstest]
+    #[case("", true)]
+    #[case("   ", true)]
+    #[case("echo foo; ", true)]
+    #[case("echo foo | ", true)]
+    #[case("echo foo && ", true)]
+    #[case("echo foo || ", true)]
+    #[case("echo $( ", true)]
+    #[case("if true; then ", true)]
+    #[case("for x in 1 2; do ", true)]
+    #[case("if true; then :; else ", true)]
+    // Negative cases: words ending in "do", "then", "else" must NOT trigger command position
+    #[case("echo todo ", false)]
+    #[case("echo pseudo ", false)]
+    #[case("cat /path/to/something_else ", false)]
+    #[case("grep lengthen ", false)]
+    fn test_is_command_position_no_false_positives(#[case] prefix: &str, #[case] expected: bool) {
+        assert_eq!(is_command_position(prefix), expected);
     }
 
-    #[test]
-    fn test_is_command_position_no_false_positives() {
-        assert!(is_command_position(""));
-        assert!(is_command_position("   "));
-        assert!(is_command_position("echo foo; "));
-        assert!(is_command_position("echo foo | "));
-        assert!(is_command_position("echo foo && "));
-        assert!(is_command_position("echo foo || "));
-        assert!(is_command_position("echo $( "));
-        assert!(is_command_position("if true; then "));
-        assert!(is_command_position("for x in 1 2; do "));
-        assert!(is_command_position("if true; then :; else "));
-
-        // Negative cases: words ending in "do", "then", "else" must NOT trigger command position
-        assert!(!is_command_position("echo todo "));
-        assert!(!is_command_position("echo pseudo "));
-        assert!(!is_command_position("cat /path/to/something_else "));
-        assert!(!is_command_position("grep lengthen "));
-    }
-
-    #[test]
-    fn test_extract_completion_token() {
-        assert_eq!(extract_completion_token("echo $MY_"), "$MY_");
-        assert_eq!(extract_completion_token("echo ${MY_"), "${MY_");
-        assert_eq!(extract_completion_token("echo \"$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("echo \"${MY_"), "${MY_");
-        assert_eq!(extract_completion_token("FOO=$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("FOO=${MY_"), "${MY_");
-        assert_eq!(extract_completion_token("PATH=$PATH:$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("echo /path/to/$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("echo -Dprop=$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("arr[$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("echo foo,$MY_"), "$MY_");
-        assert_eq!(extract_completion_token("FOO=$"), "$");
-        assert_eq!(extract_completion_token("FOO=${"), "${");
-        assert_eq!(extract_completion_token("echo ${#MY_"), "${#MY_");
-        assert_eq!(extract_completion_token("echo /path/to/my_"), "");
-        assert_eq!(extract_completion_token("./my_"), "");
-        assert_eq!(extract_completion_token("my_func"), "my_func");
-        assert_eq!(extract_completion_token("cat file.txt | my_"), "my_");
-        assert_eq!(extract_completion_token("foo; my_"), "my_");
-        assert_eq!(extract_completion_token("echo $(my_"), "my_");
-        assert_eq!(extract_completion_token("echo "), "");
-        assert_eq!(extract_completion_token("# echo $MY_"), "");
-        assert_eq!(extract_completion_token("echo '$MY_"), "");
+    #[rstest]
+    #[case("echo $MY_", "$MY_")]
+    #[case("echo ${MY_", "${MY_")]
+    #[case("echo \"$MY_", "$MY_")]
+    #[case("echo \"${MY_", "${MY_")]
+    #[case("FOO=$MY_", "$MY_")]
+    #[case("FOO=${MY_", "${MY_")]
+    #[case("PATH=$PATH:$MY_", "$MY_")]
+    #[case("echo /path/to/$MY_", "$MY_")]
+    #[case("echo -Dprop=$MY_", "$MY_")]
+    #[case("arr[$MY_", "$MY_")]
+    #[case("echo foo,$MY_", "$MY_")]
+    #[case("FOO=$", "$")]
+    #[case("FOO=${", "${")]
+    #[case("echo ${#MY_", "${#MY_")]
+    #[case("echo /path/to/my_", "")]
+    #[case("./my_", "")]
+    #[case("my_func", "my_func")]
+    #[case("cat file.txt | my_", "my_")]
+    #[case("foo; my_", "my_")]
+    #[case("echo $(my_", "my_")]
+    #[case("echo ", "")]
+    #[case("# echo $MY_", "")]
+    #[case("echo '$MY_", "")]
+    fn test_extract_completion_token(#[case] prefix: &str, #[case] expected: &str) {
+        assert_eq!(extract_completion_token(prefix), expected);
     }
 
     #[test]
@@ -2962,17 +2408,6 @@ local \
         let func_items = filter_local_symbols(&syms, "my_");
         assert_eq!(func_items.len(), 1);
         assert_eq!(func_items[0].sort_text.as_deref(), Some("00_my_func"));
-    }
-
-    #[test]
-    fn test_daemon_label_matches_local_with_colon_description() {
-        assert!(daemon_label_matches_local("PATH:system path", "PATH"));
-        assert!(daemon_label_matches_local("$PATH:system path", "PATH"));
-        assert!(daemon_label_matches_local("${PATH}:system path", "PATH"));
-        assert!(daemon_label_matches_local(
-            "my_func:user function",
-            "my_func"
-        ));
     }
 
     #[test]
@@ -3483,22 +2918,24 @@ local \
         );
     }
 
-    #[test]
-    fn test_daemon_label_matches_local_variants() {
-        assert!(daemon_label_matches_local("MY_VAR", "MY_VAR"));
-        assert!(daemon_label_matches_local("$MY_VAR", "MY_VAR"));
-        assert!(daemon_label_matches_local("${MY_VAR}", "MY_VAR"));
-        assert!(daemon_label_matches_local("${MY_VAR", "MY_VAR"));
-        assert!(daemon_label_matches_local("MY_VAR:description", "MY_VAR"));
-        assert!(daemon_label_matches_local("$MY_VAR:description", "MY_VAR"));
-        assert!(daemon_label_matches_local(
-            "${MY_VAR}:description",
-            "MY_VAR"
-        ));
-        assert!(daemon_label_matches_local("${#MY_VAR}", "MY_VAR"));
-        assert!(daemon_label_matches_local("${#MY_VAR", "MY_VAR"));
-        assert!(daemon_label_matches_local("${#MY_VAR}:length", "MY_VAR"));
-        assert!(!daemon_label_matches_local("OTHER_VAR", "MY_VAR"));
+    #[rstest]
+    #[case("MY_VAR", "MY_VAR", true)]
+    #[case("$MY_VAR", "MY_VAR", true)]
+    #[case("${MY_VAR}", "MY_VAR", true)]
+    #[case("${MY_VAR", "MY_VAR", true)]
+    #[case("MY_VAR:description", "MY_VAR", true)]
+    #[case("$MY_VAR:description", "MY_VAR", true)]
+    #[case("${MY_VAR}:description", "MY_VAR", true)]
+    #[case("${#MY_VAR}", "MY_VAR", true)]
+    #[case("${#MY_VAR", "MY_VAR", true)]
+    #[case("${#MY_VAR}:length", "MY_VAR", true)]
+    #[case("OTHER_VAR", "MY_VAR", false)]
+    fn test_daemon_label_matches_local_variants(
+        #[case] label: &str,
+        #[case] name: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(daemon_label_matches_local(label, name), expected);
     }
 
     #[test]
@@ -3640,71 +3077,6 @@ local \
             !names.iter().any(|(n, _)| *n == "after_func"),
             "Symbols from files sourced after cursor must not be included: {names:?}"
         );
-    }
-
-    #[test]
-    fn test_resolve_sourced_script_skips_oversized_and_special_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let oversized_path = dir.path().join("oversized.zsh");
-        let mut oversized_content = String::from("oversized_func() { : }\n");
-        let pad_len =
-            (MAX_SOURCED_FILE_BYTES as usize + 64).saturating_sub(oversized_content.len());
-        oversized_content.push_str(&"#".repeat(pad_len));
-        std::fs::write(&oversized_path, oversized_content).unwrap();
-
-        let subdir_path = dir.path().join("subdir");
-        std::fs::create_dir(&subdir_path).unwrap();
-
-        let normal_path = dir.path().join("normal.zsh");
-        std::fs::write(&normal_path, "normal_func() { : }\n").unwrap();
-
-        let main_path = dir.path().join("main.zsh");
-        let main_uri = tower_lsp::lsp_types::Url::from_file_path(&main_path).unwrap();
-        let mut main_text = String::from("source ./oversized.zsh\nsource ./subdir\n");
-        if cfg!(unix) {
-            main_text.push_str("source /dev/null\n");
-        }
-        main_text.push_str("source ./normal.zsh\n");
-
-        let doc = DocumentState::new(main_uri, 1, main_text);
-        let syms = extract_local_symbols(&doc, Position::new(10, 0));
-        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
-
-        assert!(
-            names.contains(&"normal_func"),
-            "Expected normal_func from normal.zsh, got: {names:?}"
-        );
-        assert!(
-            !names.contains(&"oversized_func"),
-            "Oversized sourced file must be skipped, got: {names:?}"
-        );
-    }
-
-    #[test]
-    fn test_sourced_symbol_collector_enforces_max_files_limit() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let total = MAX_SOURCED_FILES + 5;
-        let mut main_text = String::new();
-        for i in 0..total {
-            let file_path = dir.path().join(format!("f_{i}.zsh"));
-            std::fs::write(&file_path, format!("sourced_fn_{i}() {{ : }}\n")).unwrap();
-            main_text.push_str(&format!("source ./f_{i}.zsh\n"));
-        }
-
-        let main_path = dir.path().join("main.zsh");
-        let main_uri = tower_lsp::lsp_types::Url::from_file_path(&main_path).unwrap();
-        let doc = DocumentState::new(main_uri, 1, main_text);
-        let syms = extract_local_symbols(&doc, Position::new(total as u32 + 1, 0));
-        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
-
-        assert!(names.contains(&"sourced_fn_0"));
-        assert!(names.contains(&"sourced_fn_63"));
-        assert!(
-            !names.contains(&"sourced_fn_64"),
-            "Files beyond MAX_SOURCED_FILES ({MAX_SOURCED_FILES}) must not be scanned"
-        );
-        assert!(!names.contains(&"sourced_fn_68"));
-        assert_eq!(syms.len(), MAX_SOURCED_FILES);
     }
 
     #[test]

@@ -106,6 +106,7 @@ pub fn extract_experimental_symbols(value: Option<&Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use serde_json::json;
 
     #[test]
@@ -121,141 +122,26 @@ mod tests {
         assert!(!config.experimental_symbols());
     }
 
-    #[test]
-    fn test_extract_diagnostics_none() {
-        assert!(!extract_experimental_diagnostics(None));
-    }
-
-    #[test]
-    fn test_extract_diagnostics_null() {
-        let val = json!(null);
-        assert!(!extract_experimental_diagnostics(Some(&val)));
-    }
-
-    #[test]
-    fn test_extract_diagnostics_empty_object() {
-        let val = json!({});
-        assert!(!extract_experimental_diagnostics(Some(&val)));
-    }
-
-    #[test]
-    fn test_extract_diagnostics_nested_zshcs_true() {
-        let val = json!({
-            "zshcs": {
-                "experimental": {
-                    "diagnostics": true
-                }
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(config.experimental_diagnostics());
-        assert!(extract_experimental_diagnostics(Some(&val)));
-    }
-
-    #[test]
-    fn test_extract_diagnostics_nested_zshcs_false() {
-        let val = json!({
-            "zshcs": {
-                "experimental": {
-                    "diagnostics": false
-                }
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(!config.experimental_diagnostics());
-        assert!(!extract_experimental_diagnostics(Some(&val)));
-    }
-
-    #[test]
-    fn test_extract_diagnostics_direct_experimental_true() {
-        let val = json!({
-            "experimental": {
-                "diagnostics": true
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(config.experimental_diagnostics());
-        assert!(extract_experimental_diagnostics(Some(&val)));
-    }
-
-    #[test]
-    fn test_extract_diagnostics_direct_experimental_false() {
-        let val = json!({
-            "experimental": {
-                "diagnostics": false
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(!config.experimental_diagnostics());
-        assert!(!extract_experimental_diagnostics(Some(&val)));
-    }
-
-    #[test]
-    fn test_extract_diagnostics_invalid_types() {
-        let val1 = json!("invalid string");
-        assert!(!extract_experimental_diagnostics(Some(&val1)));
-
-        let val2 = json!(12345);
-        assert!(!extract_experimental_diagnostics(Some(&val2)));
-
-        let val3 = json!({
-            "zshcs": "invalid string value"
-        });
-        assert!(!extract_experimental_diagnostics(Some(&val3)));
-
-        let val4 = json!({
-            "experimental": "invalid string value"
-        });
-        assert!(!extract_experimental_diagnostics(Some(&val4)));
-
-        let val5 = json!({
-            "zshcs": {
-                "experimental": {
-                    "diagnostics": "not a boolean"
-                }
-            }
-        });
-        assert!(!extract_experimental_diagnostics(Some(&val5)));
-    }
-
-    #[test]
-    fn test_extract_diagnostics_nested_settings_wrapper() {
-        let val = json!({
-            "settings": {
-                "zshcs": {
-                    "experimental": {
-                        "diagnostics": true
-                    }
-                }
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(config.experimental_diagnostics());
-        assert!(extract_experimental_diagnostics(Some(&val)));
-
-        let val_false = json!({
-            "settings": {
-                "zshcs": {
-                    "experimental": {
-                        "diagnostics": false
-                    }
-                }
-            }
-        });
-        let config_false = Config::from_value(Some(&val_false));
-        assert!(!config_false.experimental_diagnostics());
-        assert!(!extract_experimental_diagnostics(Some(&val_false)));
-
-        let val_direct = json!({
-            "settings": {
-                "experimental": {
-                    "diagnostics": true
-                }
-            }
-        });
-        let config_direct = Config::from_value(Some(&val_direct));
-        assert!(config_direct.experimental_diagnostics());
-        assert!(extract_experimental_diagnostics(Some(&val_direct)));
+    #[rstest]
+    #[case(None, false)]
+    #[case(Some(json!(null)), false)]
+    #[case(Some(json!({})), false)]
+    #[case(Some(json!({ "zshcs": { "experimental": { "diagnostics": true } } })), true)]
+    #[case(Some(json!({ "zshcs": { "experimental": { "diagnostics": false } } })), false)]
+    #[case(Some(json!({ "experimental": { "diagnostics": true } })), true)]
+    #[case(Some(json!({ "experimental": { "diagnostics": false } })), false)]
+    #[case(Some(json!({ "settings": { "zshcs": { "experimental": { "diagnostics": true } } } })), true)]
+    #[case(Some(json!({ "settings": { "zshcs": { "experimental": { "diagnostics": false } } } })), false)]
+    #[case(Some(json!({ "settings": { "experimental": { "diagnostics": true } } })), true)]
+    #[case(Some(json!("invalid string")), false)]
+    #[case(Some(json!(12345)), false)]
+    #[case(Some(json!({ "zshcs": "invalid string value" })), false)]
+    #[case(Some(json!({ "experimental": "invalid string value" })), false)]
+    #[case(Some(json!({ "zshcs": { "experimental": { "diagnostics": "not a boolean" } } })), false)]
+    fn test_extract_diagnostics_cases(#[case] input: Option<Value>, #[case] expected: bool) {
+        let config = Config::from_value(input.as_ref());
+        assert_eq!(config.experimental_diagnostics(), expected);
+        assert_eq!(extract_experimental_diagnostics(input.as_ref()), expected);
     }
 
     #[test]
@@ -278,309 +164,60 @@ mod tests {
         assert_eq!(config, deserialized);
     }
 
-    #[test]
-    fn test_extract_hover_none_and_null() {
-        assert!(!extract_experimental_hover(None));
-        let val_null = json!(null);
-        assert!(!extract_experimental_hover(Some(&val_null)));
-        let val_empty = json!({});
-        assert!(!extract_experimental_hover(Some(&val_empty)));
+    #[rstest]
+    #[case(None, false)]
+    #[case(Some(json!(null)), false)]
+    #[case(Some(json!({})), false)]
+    #[case(Some(json!({ "zshcs": { "experimental": { "hover": true } } })), true)]
+    #[case(Some(json!({ "zshcs": { "experimental": { "hover": false } } })), false)]
+    #[case(Some(json!({ "experimental": { "hover": true } })), true)]
+    #[case(Some(json!({ "experimental": { "hover": false } })), false)]
+    #[case(Some(json!({ "settings": { "zshcs": { "experimental": { "hover": true } } } })), true)]
+    #[case(Some(json!({ "settings": { "zshcs": { "experimental": { "hover": false } } } })), false)]
+    #[case(Some(json!("invalid string")), false)]
+    #[case(Some(json!(999)), false)]
+    #[case(Some(json!({ "zshcs": { "experimental": { "hover": "not a boolean" } } })), false)]
+    fn test_extract_hover_cases(#[case] input: Option<Value>, #[case] expected: bool) {
+        let config = Config::from_value(input.as_ref());
+        assert_eq!(config.experimental_hover(), expected);
+        assert_eq!(extract_experimental_hover(input.as_ref()), expected);
     }
 
-    #[test]
-    fn test_extract_hover_nested_zshcs() {
-        let val = json!({
-            "zshcs": {
-                "experimental": {
-                    "hover": true
-                }
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(config.experimental_hover());
-        assert!(extract_experimental_hover(Some(&val)));
-
-        let val_false = json!({
-            "zshcs": {
-                "experimental": {
-                    "hover": false
-                }
-            }
-        });
-        let config_false = Config::from_value(Some(&val_false));
-        assert!(!config_false.experimental_hover());
-        assert!(!extract_experimental_hover(Some(&val_false)));
+    #[rstest]
+    #[case(None, false)]
+    #[case(Some(json!(null)), false)]
+    #[case(Some(json!({})), false)]
+    #[case(Some(json!({ "zshcs": { "experimental": { "definition": true } } })), true)]
+    #[case(Some(json!({ "zshcs": { "experimental": { "definition": false } } })), false)]
+    #[case(Some(json!({ "experimental": { "definition": true } })), true)]
+    #[case(Some(json!({ "experimental": { "definition": false } })), false)]
+    #[case(Some(json!({ "settings": { "zshcs": { "experimental": { "definition": true } } } })), true)]
+    #[case(Some(json!({ "settings": { "zshcs": { "experimental": { "definition": false } } } })), false)]
+    #[case(Some(json!("invalid string")), false)]
+    #[case(Some(json!(123)), false)]
+    #[case(Some(json!({ "zshcs": { "experimental": { "definition": "not a boolean" } } })), false)]
+    fn test_extract_definition_cases(#[case] input: Option<Value>, #[case] expected: bool) {
+        let config = Config::from_value(input.as_ref());
+        assert_eq!(config.experimental_definition(), expected);
+        assert_eq!(extract_experimental_definition(input.as_ref()), expected);
     }
 
-    #[test]
-    fn test_extract_hover_direct_experimental() {
-        let val = json!({
-            "experimental": {
-                "hover": true
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(config.experimental_hover());
-        assert!(extract_experimental_hover(Some(&val)));
-
-        let val_false = json!({
-            "experimental": {
-                "hover": false
-            }
-        });
-        let config_false = Config::from_value(Some(&val_false));
-        assert!(!config_false.experimental_hover());
-        assert!(!extract_experimental_hover(Some(&val_false)));
-    }
-
-    #[test]
-    fn test_extract_hover_nested_settings_wrapper() {
-        let val = json!({
-            "settings": {
-                "zshcs": {
-                    "experimental": {
-                        "hover": true
-                    }
-                }
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(config.experimental_hover());
-        assert!(extract_experimental_hover(Some(&val)));
-
-        let val_false = json!({
-            "settings": {
-                "zshcs": {
-                    "experimental": {
-                        "hover": false
-                    }
-                }
-            }
-        });
-        let config_false = Config::from_value(Some(&val_false));
-        assert!(!config_false.experimental_hover());
-        assert!(!extract_experimental_hover(Some(&val_false)));
-    }
-
-    #[test]
-    fn test_extract_hover_invalid_types() {
-        let val1 = json!("invalid string");
-        assert!(!extract_experimental_hover(Some(&val1)));
-
-        let val2 = json!(999);
-        assert!(!extract_experimental_hover(Some(&val2)));
-
-        let val3 = json!({
-            "zshcs": {
-                "experimental": {
-                    "hover": "not a boolean"
-                }
-            }
-        });
-        assert!(!extract_experimental_hover(Some(&val3)));
-    }
-
-    #[test]
-    fn test_extract_definition_none_and_null() {
-        assert!(!extract_experimental_definition(None));
-        let val_null = json!(null);
-        assert!(!extract_experimental_definition(Some(&val_null)));
-        let val_empty = json!({});
-        assert!(!extract_experimental_definition(Some(&val_empty)));
-    }
-
-    #[test]
-    fn test_extract_definition_nested_zshcs() {
-        let val = json!({
-            "zshcs": {
-                "experimental": {
-                    "definition": true
-                }
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(config.experimental_definition());
-        assert!(extract_experimental_definition(Some(&val)));
-
-        let val_false = json!({
-            "zshcs": {
-                "experimental": {
-                    "definition": false
-                }
-            }
-        });
-        let config_false = Config::from_value(Some(&val_false));
-        assert!(!config_false.experimental_definition());
-        assert!(!extract_experimental_definition(Some(&val_false)));
-    }
-
-    #[test]
-    fn test_extract_definition_direct_experimental() {
-        let val = json!({
-            "experimental": {
-                "definition": true
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(config.experimental_definition());
-        assert!(extract_experimental_definition(Some(&val)));
-
-        let val_false = json!({
-            "experimental": {
-                "definition": false
-            }
-        });
-        let config_false = Config::from_value(Some(&val_false));
-        assert!(!config_false.experimental_definition());
-        assert!(!extract_experimental_definition(Some(&val_false)));
-    }
-
-    #[test]
-    fn test_extract_definition_nested_settings_wrapper() {
-        let val = json!({
-            "settings": {
-                "zshcs": {
-                    "experimental": {
-                        "definition": true
-                    }
-                }
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(config.experimental_definition());
-        assert!(extract_experimental_definition(Some(&val)));
-
-        let val_false = json!({
-            "settings": {
-                "zshcs": {
-                    "experimental": {
-                        "definition": false
-                    }
-                }
-            }
-        });
-        let config_false = Config::from_value(Some(&val_false));
-        assert!(!config_false.experimental_definition());
-        assert!(!extract_experimental_definition(Some(&val_false)));
-    }
-
-    #[test]
-    fn test_extract_definition_invalid_types() {
-        let val1 = json!("invalid string");
-        assert!(!extract_experimental_definition(Some(&val1)));
-
-        let val2 = json!(123);
-        assert!(!extract_experimental_definition(Some(&val2)));
-
-        let val3 = json!({
-            "zshcs": {
-                "experimental": {
-                    "definition": "not a boolean"
-                }
-            }
-        });
-        assert!(!extract_experimental_definition(Some(&val3)));
-    }
-
-    #[test]
-    fn test_extract_symbols_none_and_null() {
-        assert!(!extract_experimental_symbols(None));
-        let val_null = json!(null);
-        assert!(!extract_experimental_symbols(Some(&val_null)));
-        let val_empty = json!({});
-        assert!(!extract_experimental_symbols(Some(&val_empty)));
-    }
-
-    #[test]
-    fn test_extract_symbols_nested_zshcs() {
-        let val = json!({
-            "zshcs": {
-                "experimental": {
-                    "symbols": true
-                }
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(config.experimental_symbols());
-        assert!(extract_experimental_symbols(Some(&val)));
-
-        let val_false = json!({
-            "zshcs": {
-                "experimental": {
-                    "symbols": false
-                }
-            }
-        });
-        let config_false = Config::from_value(Some(&val_false));
-        assert!(!config_false.experimental_symbols());
-        assert!(!extract_experimental_symbols(Some(&val_false)));
-    }
-
-    #[test]
-    fn test_extract_symbols_direct_experimental() {
-        let val = json!({
-            "experimental": {
-                "symbols": true
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(config.experimental_symbols());
-        assert!(extract_experimental_symbols(Some(&val)));
-
-        let val_false = json!({
-            "experimental": {
-                "symbols": false
-            }
-        });
-        let config_false = Config::from_value(Some(&val_false));
-        assert!(!config_false.experimental_symbols());
-        assert!(!extract_experimental_symbols(Some(&val_false)));
-    }
-
-    #[test]
-    fn test_extract_symbols_nested_settings_wrapper() {
-        let val = json!({
-            "settings": {
-                "zshcs": {
-                    "experimental": {
-                        "symbols": true
-                    }
-                }
-            }
-        });
-        let config = Config::from_value(Some(&val));
-        assert!(config.experimental_symbols());
-        assert!(extract_experimental_symbols(Some(&val)));
-
-        let val_false = json!({
-            "settings": {
-                "zshcs": {
-                    "experimental": {
-                        "symbols": false
-                    }
-                }
-            }
-        });
-        let config_false = Config::from_value(Some(&val_false));
-        assert!(!config_false.experimental_symbols());
-        assert!(!extract_experimental_symbols(Some(&val_false)));
-    }
-
-    #[test]
-    fn test_extract_symbols_invalid_types() {
-        let val1 = json!("invalid string");
-        assert!(!extract_experimental_symbols(Some(&val1)));
-
-        let val2 = json!(456);
-        assert!(!extract_experimental_symbols(Some(&val2)));
-
-        let val3 = json!({
-            "zshcs": {
-                "experimental": {
-                    "symbols": "not a boolean"
-                }
-            }
-        });
-        assert!(!extract_experimental_symbols(Some(&val3)));
+    #[rstest]
+    #[case(None, false)]
+    #[case(Some(json!(null)), false)]
+    #[case(Some(json!({})), false)]
+    #[case(Some(json!({ "zshcs": { "experimental": { "symbols": true } } })), true)]
+    #[case(Some(json!({ "zshcs": { "experimental": { "symbols": false } } })), false)]
+    #[case(Some(json!({ "experimental": { "symbols": true } })), true)]
+    #[case(Some(json!({ "experimental": { "symbols": false } })), false)]
+    #[case(Some(json!({ "settings": { "zshcs": { "experimental": { "symbols": true } } } })), true)]
+    #[case(Some(json!({ "settings": { "zshcs": { "experimental": { "symbols": false } } } })), false)]
+    #[case(Some(json!("invalid string")), false)]
+    #[case(Some(json!(456)), false)]
+    #[case(Some(json!({ "zshcs": { "experimental": { "symbols": "not a boolean" } } })), false)]
+    fn test_extract_symbols_cases(#[case] input: Option<Value>, #[case] expected: bool) {
+        let config = Config::from_value(input.as_ref());
+        assert_eq!(config.experimental_symbols(), expected);
+        assert_eq!(extract_experimental_symbols(input.as_ref()), expected);
     }
 }

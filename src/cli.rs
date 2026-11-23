@@ -38,58 +38,31 @@ pub enum Commands {
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+    use rstest::rstest;
 
-    #[test]
-    fn test_cli_default_arguments() {
-        let args = ["zshcs"];
-        let cli = Cli::try_parse_from(args).expect("Should parse with no arguments");
-        assert!(!cli.stdio);
-        assert!(cli.command.is_none());
+    #[rstest]
+    #[case(&["zshcs"], false, None)]
+    #[case(&["zshcs", "--stdio"], true, None)]
+    #[case(&["zshcs", "doctor"], false, Some(Commands::Doctor))]
+    fn test_cli_valid_arguments(
+        #[case] args: &[&str],
+        #[case] expected_stdio: bool,
+        #[case] expected_command: Option<Commands>,
+    ) {
+        let cli = Cli::try_parse_from(args).expect("Should parse valid CLI arguments");
+        assert_eq!(cli.stdio, expected_stdio);
+        assert_eq!(cli.command, expected_command);
     }
 
-    #[test]
-    fn test_cli_stdio_flag() {
-        let args = ["zshcs", "--stdio"];
-        let cli = Cli::try_parse_from(args).expect("Should parse with --stdio");
-        assert!(cli.stdio);
-        assert!(cli.command.is_none());
-    }
-
-    #[test]
-    fn test_cli_doctor_subcommand() {
-        let args = ["zshcs", "doctor"];
-        let cli = Cli::try_parse_from(args).expect("Should parse doctor subcommand");
-        assert!(!cli.stdio);
-        assert_eq!(cli.command, Some(Commands::Doctor));
-    }
-
-    #[test]
-    fn test_cli_help_flag() {
-        let err = Cli::try_parse_from(["zshcs", "--help"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
-
-        let err_short = Cli::try_parse_from(["zshcs", "-h"]).unwrap_err();
-        assert_eq!(err_short.kind(), ErrorKind::DisplayHelp);
-    }
-
-    #[test]
-    fn test_cli_version_flag() {
-        let err = Cli::try_parse_from(["zshcs", "--version"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
-
-        let err_short = Cli::try_parse_from(["zshcs", "-V"]).unwrap_err();
-        assert_eq!(err_short.kind(), ErrorKind::DisplayVersion);
-    }
-
-    #[test]
-    fn test_cli_invalid_argument() {
-        let err = Cli::try_parse_from(["zshcs", "--invalid-option"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
-    }
-
-    #[test]
-    fn test_cli_unexpected_positional_argument() {
-        let err = Cli::try_parse_from(["zshcs", "invalid-subcommand"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidSubcommand);
+    #[rstest]
+    #[case(&["zshcs", "--help"], ErrorKind::DisplayHelp)]
+    #[case(&["zshcs", "-h"], ErrorKind::DisplayHelp)]
+    #[case(&["zshcs", "--version"], ErrorKind::DisplayVersion)]
+    #[case(&["zshcs", "-V"], ErrorKind::DisplayVersion)]
+    #[case(&["zshcs", "--invalid-option"], ErrorKind::UnknownArgument)]
+    #[case(&["zshcs", "invalid-subcommand"], ErrorKind::InvalidSubcommand)]
+    fn test_cli_error_arguments(#[case] args: &[&str], #[case] expected_kind: ErrorKind) {
+        let err = Cli::try_parse_from(args).unwrap_err();
+        assert_eq!(err.kind(), expected_kind);
     }
 }

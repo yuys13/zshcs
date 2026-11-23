@@ -233,12 +233,114 @@ mod tests {
 
     #[test]
     fn test_builtins_and_reserved_words() {
-        for b in ["cd", "echo", "export", "setopt", "zpty", "local", "."] {
-            assert!(get_builtin_or_reserved_doc(b).is_some(), "missing {b}");
+        let builtins = [
+            "cd",
+            "echo",
+            "export",
+            "set",
+            "setopt",
+            "unsetopt",
+            "autoload",
+            "compadd",
+            "typeset",
+            "print",
+            "printf",
+            "source",
+            ".",
+            "eval",
+            "alias",
+            "unalias",
+            "read",
+            "return",
+            "exit",
+            "shift",
+            "test",
+            "trap",
+            "unset",
+            "local",
+            "declare",
+            "which",
+            "where",
+            "whence",
+            "type",
+            "bindkey",
+            "zstyle",
+            "zmodload",
+            "zpty",
+            "zparseopts",
+            "pushd",
+            "popd",
+            "dirs",
+            "pwd",
+            "history",
+            "fc",
+            "bg",
+            "fg",
+            "jobs",
+            "kill",
+            "wait",
+            "disown",
+            "exec",
+            "hash",
+            "rehash",
+            "umask",
+            "true",
+            "false",
+            ":",
+        ];
+        for b in builtins {
+            let doc = get_builtin_or_reserved_doc(b);
+            assert!(doc.is_some(), "Builtin '{b}' should have documentation");
+            let doc_str = doc.unwrap();
+            assert!(
+                doc_str.contains("Builtin") || doc_str.contains("Module"),
+                "Doc for '{b}' should mention Builtin or Module"
+            );
+            assert!(
+                doc_str.contains("```zsh"),
+                "Doc for '{b}' should contain zsh syntax block"
+            );
         }
-        for r in ["if", "for", "while", "case", "function", "foreach"] {
-            assert!(get_builtin_or_reserved_doc(r).is_some(), "missing {r}");
+
+        let reserved = [
+            "if",
+            "then",
+            "elif",
+            "else",
+            "fi",
+            "for",
+            "do",
+            "done",
+            "while",
+            "until",
+            "case",
+            "esac",
+            "select",
+            "function",
+            "repeat",
+            "time",
+            "coproc",
+            "nocorrect",
+            "foreach",
+            "end",
+        ];
+        for r in reserved {
+            let doc = get_builtin_or_reserved_doc(r);
+            assert!(
+                doc.is_some(),
+                "Reserved word '{r}' should have documentation"
+            );
+            let doc_str = doc.unwrap();
+            assert!(
+                doc_str.contains("Reserved Word"),
+                "Doc for '{r}' should mention Reserved Word"
+            );
+            assert!(
+                doc_str.contains("```zsh"),
+                "Doc for '{r}' should contain zsh syntax block"
+            );
         }
+
         assert!(get_builtin_or_reserved_doc("non_existent_command_xyz").is_none());
     }
 }

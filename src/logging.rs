@@ -63,6 +63,7 @@ pub fn try_init_logging() -> Result<(), Box<dyn std::error::Error + Send + Sync>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -129,52 +130,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_create_env_filter_default() {
-        let filter = create_env_filter_from(None, None);
-        assert_eq!(filter.to_string(), "info");
-    }
-
-    #[test]
-    fn test_create_env_filter_with_zshcs_log() {
-        let filter = create_env_filter_from(Some("debug"), None);
-        assert_eq!(filter.to_string(), "debug");
-    }
-
-    #[test]
-    fn test_create_env_filter_with_rust_log() {
-        let filter = create_env_filter_from(None, Some("warn"));
-        assert_eq!(filter.to_string(), "warn");
-    }
-
-    #[test]
-    fn test_create_env_filter_priority() {
-        let filter = create_env_filter_from(Some("trace"), Some("error"));
-        assert_eq!(filter.to_string(), "trace");
-    }
-
-    #[test]
-    fn test_create_env_filter_invalid_zshcs_log_falls_back_to_rust_log() {
-        let filter = create_env_filter_from(Some("invalid[filter"), Some("warn"));
-        assert_eq!(filter.to_string(), "warn");
-    }
-
-    #[test]
-    fn test_create_env_filter_both_invalid_falls_back_to_default() {
-        let filter = create_env_filter_from(Some("invalid[1"), Some("invalid[2"));
-        assert_eq!(filter.to_string(), "info");
-    }
-
-    #[test]
-    fn test_create_env_filter_empty_string_falls_back() {
-        let filter = create_env_filter_from(Some(""), Some("error"));
-        assert_eq!(filter.to_string(), "error");
-    }
-
-    #[test]
-    fn test_create_env_filter_whitespace_padded() {
-        let filter = create_env_filter_from(Some("  debug  "), None);
-        assert_eq!(filter.to_string(), "debug");
+    #[rstest]
+    #[case(None, None, "info")]
+    #[case(Some("debug"), None, "debug")]
+    #[case(None, Some("warn"), "warn")]
+    #[case(Some("trace"), Some("error"), "trace")]
+    #[case(Some("invalid[filter"), Some("warn"), "warn")]
+    #[case(Some("invalid[1"), Some("invalid[2"), "info")]
+    #[case(Some(""), Some("error"), "error")]
+    #[case(Some("  debug  "), None, "debug")]
+    fn test_create_env_filter_from_cases(
+        #[case] zshcs_log: Option<&str>,
+        #[case] rust_log: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let filter = create_env_filter_from(zshcs_log, rust_log);
+        assert_eq!(filter.to_string(), expected);
     }
 
     #[test]
