@@ -8,12 +8,20 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tower_lsp::jsonrpc::{Id, Response as JsonRpcResponse, Result};
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionResponse, DidOpenTextDocumentParams, InitializeParams,
-    InitializedParams, TextDocumentItem, Url,
+    CompletionItem, CompletionParams, CompletionResponse, DidChangeConfigurationParams,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverParams, InitializeParams, InitializeResult, InitializedParams, Position,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
     notification::{
-        DidOpenTextDocument, Initialized, LogMessage, Notification as LspNotificationTrait,
+        DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
+        Initialized, LogMessage, Notification as LspNotificationTrait,
     },
-    request::{Initialize, Request as LspRequestTrait},
+    request::{
+        Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Initialize,
+        Request as LspRequestTrait,
+    },
 };
 use tower_lsp::{LspService, Server};
 use zshcs::Backend;
@@ -223,28 +231,154 @@ impl<'a> TestClient<'a> {
         }
     }
 
-    pub async fn init_and_open(&mut self, file_uri: &Url, initial_text: &str) {
-        // Initialize
-        let initialize_params = InitializeParams::default();
+    pub async fn initialize(&mut self, initialization_options: Option<Value>) -> InitializeResult {
+        let initialize_params = InitializeParams {
+            process_id: Some(123),
+            initialization_options,
+            ..Default::default()
+        };
         self.send_request::<Initialize>(initialize_params)
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    pub async fn init(&mut self) -> InitializeResult {
+        self.init_with_options(None).await
+    }
+
+    pub async fn init_with_options(
+        &mut self,
+        initialization_options: Option<Value>,
+    ) -> InitializeResult {
+        let result = self.initialize(initialization_options).await;
         self.send_notification::<Initialized>(InitializedParams {})
             .await;
         self.read_notification::<LogMessage>().await; // init
         self.read_notification::<LogMessage>().await; // version
+        result
+    }
 
-        // Open document
+    pub async fn open_document(&mut self, uri: &Url, text: &str) {
         self.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
-                uri: file_uri.clone(),
+                uri: uri.clone(),
                 language_id: "zsh".to_string(),
                 version: 1,
-                text: initial_text.to_string(),
+                text: text.to_string(),
             },
         })
         .await;
         self.read_notification::<LogMessage>().await; // didOpen
+    }
+
+    pub async fn init_with_options_and_open(
+        &mut self,
+        initialization_options: Option<Value>,
+        file_uri: &Url,
+        initial_text: &str,
+    ) {
+        self.init_with_options(initialization_options).await;
+        self.open_document(file_uri, initial_text).await;
+    }
+
+    pub async fn init_and_open(&mut self, file_uri: &Url, initial_text: &str) {
+        self.init_with_options_and_open(None, file_uri, initial_text)
+            .await;
+    }
+
+    pub async fn change_document(
+        &mut self,
+        uri: &Url,
+        version: i32,
+        changes: Vec<TextDocumentContentChangeEvent>,
+    ) {
+        self.send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(uri.clone(), version),
+            content_changes: changes,
+        })
+        .await;
+        self.read_notification::<LogMessage>().await; // didChange
+    }
+
+    pub async fn change_document_full(&mut self, uri: &Url, version: i32, text: &str) {
+        self.change_document(
+            uri,
+            version,
+            vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: text.to_string(),
+            }],
+        )
+        .await;
+    }
+
+    pub async fn close_document(&mut self, uri: &Url) {
+        self.send_notification::<DidCloseTextDocument>(DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+        })
+        .await;
+        self.read_notification::<LogMessage>().await; // didClose
+    }
+
+    pub async fn change_configuration(&mut self, settings: Value) {
+        self.send_notification::<DidChangeConfiguration>(DidChangeConfigurationParams { settings })
+            .await;
+    }
+
+    pub async fn complete(
+        &mut self,
+        uri: &Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<CompletionResponse>> {
+        self.send_request::<Completion>(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(line, character),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        })
+        .await
+    }
+
+    pub async fn hover(&mut self, uri: &Url, line: u32, character: u32) -> Result<Option<Hover>> {
+        self.send_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(line, character),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+    }
+
+    pub async fn goto_definition(
+        &mut self,
+        uri: &Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.send_request::<GotoDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(line, character),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+    }
+
+    pub async fn document_symbols(&mut self, uri: &Url) -> Result<Option<DocumentSymbolResponse>> {
+        self.send_request::<DocumentSymbolRequest>(DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
     }
 }
 

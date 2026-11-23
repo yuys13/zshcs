@@ -55,41 +55,13 @@ async fn test_completion_consecutive() {
     test_client.init_and_open(&doc_uri, "git ").await;
 
     // 1. First completion
-    let res1 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res1 = test_client.complete(&doc_uri, 0, 4).await.unwrap().unwrap();
 
     let items1 = get_completion_items(res1);
     assert!(items1.iter().any(|i| i.label == "status"));
 
     // 2. Second completion (at the same position)
-    let res2 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res2 = test_client.complete(&doc_uri, 0, 4).await.unwrap().unwrap();
 
     let items2 = get_completion_items(res2);
     assert!(items2.iter().any(|i| i.label == "status"));
@@ -116,21 +88,7 @@ async fn test_completion_after_change() {
         .await;
     test_client.read_notification::<LogMessage>().await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 7),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 7).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert!(items.iter().any(|i| i.label == "status"));
@@ -144,21 +102,7 @@ async fn test_completion_with_description() {
     let doc_uri = Url::parse("file:///description.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "ls -").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 5),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 5).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
 
@@ -177,19 +121,7 @@ async fn test_daemon_crash_tolerance() {
     let doc_uri = Url::parse("file:///crash.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await;
+    let res = test_client.complete(&doc_uri, 0, 4).await;
 
     assert!(res.is_ok());
     assert!(res.unwrap().is_none());
@@ -207,19 +139,7 @@ async fn test_daemon_timeout() {
     test_client.init_and_open(&doc_uri, "git ").await;
 
     let start = std::time::Instant::now();
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await;
+    let res = test_client.complete(&doc_uri, 0, 4).await;
 
     let elapsed = start.elapsed().as_millis();
     assert!(elapsed >= 5000, "Completion should wait for the timeout");
@@ -263,39 +183,14 @@ done
     test_client.init_and_open(&doc_uri, "git ").await;
 
     // 1. First request hangs and should time out
-    let res1 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await;
+    let res1 = test_client.complete(&doc_uri, 0, 4).await;
 
     assert!(res1.is_ok());
     assert!(res1.unwrap().is_none());
 
     // 2. Second request immediately after: Supervisor must kill the hung child and spawn a new one!
     let start2 = std::time::Instant::now();
-    let res2 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap();
+    let res2 = test_client.complete(&doc_uri, 0, 4).await.unwrap();
 
     let elapsed2 = start2.elapsed().as_millis();
     assert!(
@@ -321,19 +216,7 @@ done
     let doc_uri = Url::parse("file:///empty_cand.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "some_cmd ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(0, 9),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 9).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert!(items.is_empty(), "Expected empty candidates list");
@@ -356,19 +239,7 @@ done
     let doc_uri = Url::parse("file:///mixed_formats.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 4).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert_eq!(items.len(), 4);
@@ -399,19 +270,7 @@ done
     let doc_uri = Url::parse("file:///inline_eoc.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 4).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert_eq!(items.len(), 2);
@@ -439,19 +298,7 @@ done
     let doc_uri = Url::parse("file:///crlf_mock.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 4).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert_eq!(items.len(), 2);
@@ -477,19 +324,7 @@ done
     let doc_uri = Url::parse("file:///unicode_mock.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "test ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(0, 5),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 5).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert_eq!(items.len(), 3);
@@ -517,19 +352,7 @@ done
     let doc_uri = Url::parse("file:///special_mock.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "test ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(0, 5),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 5).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert_eq!(items.len(), 3);
@@ -556,19 +379,7 @@ done
     let doc_uri = Url::parse("file:///stderr_mock.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 4).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert_eq!(items.len(), 1);
@@ -599,17 +410,7 @@ exit 1
     let doc_uri = Url::parse("file:///crash_mid.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await;
+    let res = test_client.complete(&doc_uri, 0, 4).await;
 
     assert!(res.is_ok());
     assert!(res.unwrap().is_none());
@@ -631,19 +432,7 @@ done
     let doc_uri = Url::parse("file:///large_cand.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "test ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(0, 5),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 5).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert_eq!(items.len(), 500);
@@ -673,17 +462,7 @@ async fn test_completion_unopened_document() {
         .await;
 
     let doc_uri = Url::parse("file:///unopened.zsh").unwrap();
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(0, 0),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await;
+    let res = test_client.complete(&doc_uri, 0, 0).await;
 
     assert!(res.is_ok());
     assert!(res.unwrap().is_none());
@@ -700,17 +479,7 @@ async fn test_completion_out_of_bounds_position() {
     let doc_uri = Url::parse("file:///out_of_bounds.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(100, 0),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await;
+    let res = test_client.complete(&doc_uri, 100, 0).await;
 
     assert!(res.is_ok());
     assert!(res.unwrap().is_none());
@@ -726,59 +495,19 @@ async fn test_completion_multiline_document() {
     test_client.init_and_open(&doc_uri, doc_content).await;
 
     // Line 1, char 5: "git s" -> completion on "git s"
-    let res1 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 5),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res1 = test_client.complete(&doc_uri, 1, 5).await.unwrap().unwrap();
 
     let items1 = get_completion_items(res1);
     assert!(items1.iter().any(|i| i.label == "status"));
 
     // Line 2, char 4: "ls -" -> completion on "ls -"
-    let res2 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(2, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res2 = test_client.complete(&doc_uri, 2, 4).await.unwrap().unwrap();
 
     let items2 = get_completion_items(res2);
     assert!(items2.iter().any(|i| i.label.starts_with('-')));
 
     // Line 1, char 0: line start -> prefix ""
-    let res3 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 0),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await;
+    let res3 = test_client.complete(&doc_uri, 1, 0).await;
     assert!(res3.is_ok());
 }
 
@@ -792,21 +521,7 @@ async fn test_completion_multibyte_prefix() {
     let doc_content = "# 日本語コメント\ngit s";
     test_client.init_and_open(&doc_uri, doc_content).await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 5),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 1, 5).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert!(items.iter().any(|i| i.label == "status"));
@@ -827,15 +542,7 @@ async fn test_completion_multibyte_prefix() {
     test_client.read_notification::<LogMessage>().await;
 
     let res2 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(0, 22),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&doc_uri, 0, 22)
         .await
         .unwrap()
         .unwrap();
@@ -855,19 +562,7 @@ async fn test_completion_middle_of_word() {
         .await;
 
     // Position (0, 6) -> prefix is "git st"
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(0, 6),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 6).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert!(items.iter().any(|i| i.label == "status"));
@@ -883,19 +578,7 @@ async fn test_completion_crlf_document() {
     test_client.init_and_open(&doc_uri, doc_content).await;
 
     // Line 1, char 5: "git s"
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(1, 5),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 1, 5).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert!(items.iter().any(|i| i.label == "status"));
@@ -916,19 +599,7 @@ done
                 let doc_uri = Url::parse(&format!("file:///concurrent_{i}.zsh")).unwrap();
                 test_client.init_and_open(&doc_uri, "git s").await;
 
-                let res = test_client
-                    .send_request::<request::Completion>(CompletionParams {
-                        text_document_position: TextDocumentPositionParams {
-                            text_document: TextDocumentIdentifier { uri: doc_uri },
-                            position: Position::new(0, 5),
-                        },
-                        work_done_progress_params: Default::default(),
-                        partial_result_params: Default::default(),
-                        context: None,
-                    })
-                    .await
-                    .unwrap()
-                    .unwrap();
+                let res = test_client.complete(&doc_uri, 0, 5).await.unwrap().unwrap();
 
                 let items = get_completion_items(res);
                 assert!(items.iter().any(|item| item.label == "status"));
@@ -964,58 +635,20 @@ done
     test_client.init_and_open(&doc_uri, "git ").await;
 
     // 1. First request succeeds
-    let res1 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap();
+    let res1 = test_client.complete(&doc_uri, 0, 4).await.unwrap();
 
     let items1 = get_completion_items(res1.expect("First request should succeed"));
     assert_eq!(items1[0].label, "recovered_status");
 
     // 2. Second request causes the daemon to exit 1 (crash)
-    let res2 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await;
+    let res2 = test_client.complete(&doc_uri, 0, 4).await;
 
     // Res2 is None (or handled error)
     assert!(res2.is_ok());
     assert!(res2.unwrap().is_none());
 
     // 3. Third request: Supervisor should automatically restart the daemon and succeed
-    let res3 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap();
+    let res3 = test_client.complete(&doc_uri, 0, 4).await.unwrap();
 
     let items3 =
         get_completion_items(res3.expect("Third request should succeed after auto-restart"));
@@ -1040,20 +673,7 @@ done
     test_client.init_and_open(&doc_uri, "git ").await;
 
     // 1. First request
-    let res1 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap();
+    let res1 = test_client.complete(&doc_uri, 0, 4).await.unwrap();
 
     let items1 = get_completion_items(res1.expect("First request should succeed"));
     assert_eq!(items1[0].label, "resp_item");
@@ -1062,20 +682,7 @@ done
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // 2. Second request: Process already exited between requests. Supervisor must detect and restart!
-    let res2 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap();
+    let res2 = test_client.complete(&doc_uri, 0, 4).await.unwrap();
 
     let items2 =
         get_completion_items(res2.expect("Second request should succeed via supervisor restart"));
@@ -1105,17 +712,7 @@ done
 
     // 1. First request for dir_one -> should receive chdir:/project/dir_one
     let res1 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri_1.clone(),
-                },
-                position: Position::new(0, 3),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&doc_uri_1, 0, 3)
         .await
         .unwrap()
         .unwrap();
@@ -1125,17 +722,7 @@ done
 
     // 2. Second request for the same document in dir_one -> cwd hasn't changed, still dir_one
     let res2 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri_1.clone(),
-                },
-                position: Position::new(0, 3),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&doc_uri_1, 0, 3)
         .await
         .unwrap()
         .unwrap();
@@ -1161,17 +748,7 @@ done
         .await;
 
     let res3 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri_2.clone(),
-                },
-                position: Position::new(0, 3),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&doc_uri_2, 0, 3)
         .await
         .unwrap()
         .unwrap();
@@ -1202,19 +779,7 @@ async fn test_completion_relative_path_and_working_directory_real() {
     // 1. Open script in dir A and complete `cat alp`
     test_client.init_and_open(&uri_a, "cat alp").await;
 
-    let res_a = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri_a.clone() },
-                position: Position::new(0, 7),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res_a = test_client.complete(&uri_a, 0, 7).await.unwrap().unwrap();
 
     let items_a = get_completion_items(res_a);
     let has_alpha = items_a
@@ -1249,19 +814,7 @@ async fn test_completion_relative_path_and_working_directory_real() {
         .read_notification::<tower_lsp::lsp_types::notification::LogMessage>()
         .await;
 
-    let res_b = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri_b.clone() },
-                position: Position::new(0, 7),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res_b = test_client.complete(&uri_b, 0, 7).await.unwrap().unwrap();
 
     let items_b = get_completion_items(res_b);
     let has_beta = items_b
@@ -1298,17 +851,7 @@ async fn test_completion_chdir_spaces_and_special_path() {
     test_client.init_and_open(&script_uri, "cat spe").await;
 
     let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: script_uri.clone(),
-                },
-                position: Position::new(0, 7),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&script_uri, 0, 7)
         .await
         .unwrap()
         .unwrap();
@@ -1329,21 +872,7 @@ async fn test_completion_chdir_non_file_uri() {
     let doc_uri = Url::parse("untitled:untitled-1").unwrap();
     test_client.init_and_open(&doc_uri, "git s").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 5),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 5).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert!(items.iter().any(|i| i.label == "status"));
@@ -1379,56 +908,16 @@ done
     test_client.init_and_open(&doc_uri, "git ").await;
 
     // 1. First request receives chdir and succeeds
-    let res1 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res1 = test_client.complete(&doc_uri, 0, 4).await.unwrap().unwrap();
 
     let items1 = get_completion_items(res1);
     assert_eq!(items1[0].label, "item_ok");
 
     // 2. Second request causes crash
-    let _ = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await;
+    let _ = test_client.complete(&doc_uri, 0, 4).await;
 
     // 3. Third request after supervisor restart: new daemon must receive chdir again
-    let res3 = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res3 = test_client.complete(&doc_uri, 0, 4).await.unwrap().unwrap();
 
     let items3 = get_completion_items(res3);
     assert_eq!(items3[0].label, "item_ok");
@@ -1442,21 +931,7 @@ async fn test_completion_chdir_non_existent_directory() {
     let doc_uri = Url::parse("file:///non/existent/path/dir/script.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "git s").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 5),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 5).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert!(items.iter().any(|i| i.label == "status"));
@@ -1481,17 +956,7 @@ async fn test_completion_chdir_unusual_characters_and_symbols() {
     test_client.init_and_open(&script_uri, "cat comp").await;
 
     let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: script_uri.clone(),
-                },
-                position: Position::new(0, 8),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&script_uri, 0, 8)
         .await
         .unwrap()
         .unwrap();
@@ -1548,19 +1013,7 @@ async fn test_completion_rapid_directory_switching_stress() {
     // Rapidly alternate requests between directories
     for cycle in 0..3 {
         for (i, (uri, marker)) in dir_uris.iter().enumerate() {
-            let res = test_client
-                .send_request::<request::Completion>(CompletionParams {
-                    text_document_position: TextDocumentPositionParams {
-                        text_document: TextDocumentIdentifier { uri: uri.clone() },
-                        position: Position::new(0, 8),
-                    },
-                    work_done_progress_params: Default::default(),
-                    partial_result_params: Default::default(),
-                    context: None,
-                })
-                .await
-                .unwrap()
-                .unwrap();
+            let res = test_client.complete(uri, 0, 8).await.unwrap().unwrap();
 
             let items = get_completion_items(res);
             let has_own_marker = items.iter().any(|item| item.label.contains(marker));
@@ -1621,21 +1074,7 @@ done
     let doc_uri = Url::parse("file:///cache_test.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "echo ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 5),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 5).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert_eq!(items.len(), 1);
@@ -1748,21 +1187,7 @@ done
     let doc_uri = Url::parse("file:///kinds_test.zsh").unwrap();
     test_client.init_and_open(&doc_uri, "cmd ").await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 4).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert_eq!(items.len(), 6);
@@ -2042,21 +1467,7 @@ done
     test_client.init_and_open(&doc_uri, "ec").await;
 
     // 1. Request completion candidates
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 2),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 2).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert_eq!(items.len(), 2);
@@ -2149,21 +1560,7 @@ async fn test_completion_resolve_real_zsh_daemon_e2e() {
         .await;
     test_client.read_notification::<LogMessage>().await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 3),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 3).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     assert!(
@@ -2347,21 +1744,7 @@ async fn test_completion_resolve_real_zsh_daemon_external_command_e2e() {
         )
         .await;
 
-    let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 2),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    let res = test_client.complete(&doc_uri, 0, 2).await.unwrap().unwrap();
 
     let items = get_completion_items(res);
     let git_item = items
@@ -2913,17 +2296,7 @@ async fn test_completion_deduplication_builtin_resword() {
 
     // 1. Completion for 'exp' at line 0, char 3
     let res_exp = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 3),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&doc_uri, 0, 3)
         .await
         .unwrap()
         .expect("Expected completion response for exp");
@@ -2938,17 +2311,7 @@ async fn test_completion_deduplication_builtin_resword() {
 
     // 2. Completion for 'loc' at line 1, char 3
     let res_loc = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 3),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&doc_uri, 1, 3)
         .await
         .unwrap()
         .expect("Expected completion response for loc");
@@ -2984,15 +2347,7 @@ done
     test_client.init_and_open(&doc_uri, text).await;
 
     let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(1, 4),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&doc_uri, 1, 4)
         .await
         .unwrap()
         .expect("Expected completion response");
@@ -3025,15 +2380,7 @@ done
     test_client.init_and_open(&doc_uri, text).await;
 
     let res = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(1, 10),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&doc_uri, 1, 10)
         .await
         .unwrap()
         .expect("Expected completion response");
@@ -3079,17 +2426,7 @@ done
 
     // 1. Function & alias from sourced helper.zsh on disk
     let res_cmd = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: main_uri.clone(),
-                },
-                position: Position::new(1, 8),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&main_uri, 1, 8)
         .await
         .unwrap()
         .expect("Expected completion response");
@@ -3112,17 +2449,7 @@ done
 
     // 2. Variable from sourced helper.zsh on disk
     let res_var = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: main_uri.clone(),
-                },
-                position: Position::new(2, 14),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&main_uri, 2, 14)
         .await
         .unwrap()
         .expect("Expected completion response");
@@ -3149,15 +2476,7 @@ done
         .await;
 
     let res_unsaved = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: main_uri },
-                position: Position::new(1, 8),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&main_uri, 1, 8)
         .await
         .unwrap()
         .expect("Expected completion response");
@@ -3196,17 +2515,7 @@ done
 
     // 1. Inside `helper_fn()`: both `SCOPED_LOCAL_ONLY` and `SCOPED_GLOBAL_VAR` are suggested
     let res_inside = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(3, 15),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&doc_uri, 3, 15)
         .await
         .unwrap()
         .expect("Expected completion response inside helper_fn");
@@ -3222,15 +2531,7 @@ done
 
     // 2. Outside `helper_fn()`: `SCOPED_LOCAL_ONLY` must NOT be suggested
     let res_outside = test_client
-        .send_request::<request::Completion>(CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(5, 13),
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
+        .complete(&doc_uri, 5, 13)
         .await
         .unwrap()
         .expect("Expected completion response outside helper_fn");

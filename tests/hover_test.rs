@@ -3,11 +3,10 @@ mod common;
 use common::setup_server_mock as setup_server;
 use serde_json::json;
 use tower_lsp::lsp_types::{
-    ClientCapabilities, DidChangeConfigurationParams, DidOpenTextDocumentParams, HoverContents,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializedParams, LogMessageParams,
-    Position, Range, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
-    notification::{DidChangeConfiguration, DidOpenTextDocument, Initialized, LogMessage},
-    request::{HoverRequest, Initialize},
+    ClientCapabilities, DidOpenTextDocumentParams, HoverContents, HoverProviderCapability,
+    InitializeParams, LogMessageParams, Position, Range, TextDocumentItem, Url,
+    notification::{DidOpenTextDocument, LogMessage},
+    request::Initialize,
 };
 
 #[tokio::test]
@@ -39,50 +38,18 @@ async fn test_hover_disabled_by_default() {
     let mut test_client = harness.client();
 
     // Initialize with default options (hover = false)
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    test_client.init().await;
 
     let doc_uri = Url::parse("file:///default_hover.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "setopt promptsubst\nif [[ -f foo ]]; then\nls -la\n".to_string(),
-            },
-        })
+        .open_document(
+            &doc_uri,
+            "setopt promptsubst\nif [[ -f foo ]]; then\nls -la\n",
+        )
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     // Hover request on builtin "setopt"
-    let hover_res = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 3),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_res = test_client.hover(&doc_uri, 0, 3).await.unwrap();
 
     assert!(
         hover_res.is_none(),
@@ -90,18 +57,7 @@ async fn test_hover_disabled_by_default() {
     );
 
     // Hover request on reserved word "if"
-    let hover_if = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 0),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_if = test_client.hover(&doc_uri, 1, 0).await.unwrap();
 
     assert!(
         hover_if.is_none(),
@@ -115,30 +71,15 @@ async fn test_hover_enabled_builtin_and_reserved_word() {
     let mut test_client = harness.client();
 
     // Initialize with experimental hover enabled
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        initialization_options: Some(json!({
+    test_client
+        .init_with_options(Some(json!({
             "zshcs": {
                 "experimental": {
                     "hover": true
                 }
             }
-        })),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
+        })))
         .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     let doc_uri = Url::parse("file:///enabled_hover.zsh").unwrap();
     test_client
@@ -155,18 +96,7 @@ async fn test_hover_enabled_builtin_and_reserved_word() {
     let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     // 1. Builtin "setopt" at line 0, char 2
-    let hover_setopt = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 2),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_setopt = test_client.hover(&doc_uri, 0, 2).await.unwrap();
 
     assert!(hover_setopt.is_some());
     let hover_setopt_val = hover_setopt.unwrap();
@@ -185,18 +115,7 @@ async fn test_hover_enabled_builtin_and_reserved_word() {
     }
 
     // 2. Reserved word "if" at line 1, char 0
-    let hover_if = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 0),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_if = test_client.hover(&doc_uri, 1, 0).await.unwrap();
 
     assert!(hover_if.is_some());
     let hover_if_val = hover_if.unwrap();
@@ -214,18 +133,7 @@ async fn test_hover_enabled_builtin_and_reserved_word() {
     }
 
     // 3. Builtin "autoload" at line 2, char 4
-    let hover_autoload = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(2, 4),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_autoload = test_client.hover(&doc_uri, 2, 4).await.unwrap();
 
     assert!(hover_autoload.is_some());
     let hover_autoload_val = hover_autoload.unwrap();
@@ -248,57 +156,21 @@ async fn test_hover_enabled_man_page_fallback() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        initialization_options: Some(json!({
+    test_client
+        .init_with_options(Some(json!({
             "zshcs": {
                 "experimental": {
                     "hover": true
                 }
             }
-        })),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
+        })))
         .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     let doc_uri = Url::parse("file:///man_hover.zsh").unwrap();
-    test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "git status\n".to_string(),
-            },
-        })
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    test_client.open_document(&doc_uri, "git status\n").await;
 
     // Hover on 'git' (external command with man page)
-    let hover_git = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 1),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_git = test_client.hover(&doc_uri, 0, 1).await.unwrap();
 
     assert!(
         hover_git.is_some(),
@@ -329,132 +201,45 @@ async fn test_hover_whitespace_and_boundary_conditions() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        initialization_options: Some(json!({
+    test_client
+        .init_with_options(Some(json!({
             "experimental": {
                 "hover": true
             }
-        })),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
+        })))
         .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     let doc_uri = Url::parse("file:///boundaries.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "   \n   cd   /tmp\n".to_string(),
-            },
-        })
+        .open_document(&doc_uri, "   \n   cd   /tmp\n")
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     // 1. Hover on blank line (line 0, char 1)
-    let hover_blank = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 1),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_blank = test_client.hover(&doc_uri, 0, 1).await.unwrap();
     assert!(hover_blank.is_none());
 
     // 2. Hover on leading space of line 1 (line 1, char 0)
-    let hover_space = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 0),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_space = test_client.hover(&doc_uri, 1, 0).await.unwrap();
     assert!(hover_space.is_none());
 
     // 3. Hover on space immediately after 'cd' (line 1, char 5)
-    let hover_after_word = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 5),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_after_word = test_client.hover(&doc_uri, 1, 5).await.unwrap();
     assert!(
         hover_after_word.is_none(),
         "Hover on space immediately following a word must return None"
     );
 
     // 4. Hover on gap between cd and /tmp (line 1, char 6)
-    let hover_gap = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 6),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_gap = test_client.hover(&doc_uri, 1, 6).await.unwrap();
     assert!(hover_gap.is_none());
 
     // 5. Hover out of line bounds (line 10, char 0)
-    let hover_oob_line = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(10, 0),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_oob_line = test_client.hover(&doc_uri, 10, 0).await.unwrap();
     assert!(hover_oob_line.is_none());
 
     // 6. Hover on unopened document
     let unopened_uri = Url::parse("file:///not_opened.zsh").unwrap();
-    let hover_unopened = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: unopened_uri },
-                position: Position::new(0, 0),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_unopened = test_client.hover(&unopened_uri, 0, 0).await.unwrap();
     assert!(hover_unopened.is_none());
 }
 
@@ -464,113 +249,52 @@ async fn test_hover_dynamic_toggle_via_did_change_configuration() {
     let mut test_client = harness.client();
 
     // Initialize with default (disabled)
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    test_client.init().await;
 
     let doc_uri = Url::parse("file:///dynamic_toggle.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "echo 'hello'\nsetopt promptsubst\n".to_string(),
-            },
-        })
+        .open_document(&doc_uri, "echo 'hello'\nsetopt promptsubst\n")
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     // Hover is disabled initially
-    let hover_init = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 2),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_init = test_client.hover(&doc_uri, 1, 2).await.unwrap();
     assert!(hover_init.is_none());
 
     // Dynamically enable hover
     test_client
-        .send_notification::<DidChangeConfiguration>(DidChangeConfigurationParams {
-            settings: json!({
-                "settings": {
-                    "zshcs": {
-                        "experimental": {
-                            "hover": true
-                        }
+        .change_configuration(json!({
+            "settings": {
+                "zshcs": {
+                    "experimental": {
+                        "hover": true
                     }
                 }
-            }),
-        })
+            }
+        }))
         .await;
 
     // Small yield to let configuration update propagate
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Hover should now succeed
-    let hover_enabled = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 2),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_enabled = test_client.hover(&doc_uri, 1, 2).await.unwrap();
     assert!(hover_enabled.is_some());
 
     // Dynamically disable hover
     test_client
-        .send_notification::<DidChangeConfiguration>(DidChangeConfigurationParams {
-            settings: json!({
-                "zshcs": {
-                    "experimental": {
-                        "hover": false
-                    }
+        .change_configuration(json!({
+            "zshcs": {
+                "experimental": {
+                    "hover": false
                 }
-            }),
-        })
+            }
+        }))
         .await;
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Hover should now be disabled again
-    let hover_disabled = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 2),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_disabled = test_client.hover(&doc_uri, 1, 2).await.unwrap();
     assert!(hover_disabled.is_none());
 }
 
@@ -579,57 +303,21 @@ async fn test_hover_path_qualified_and_special_builtins() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        initialization_options: Some(json!({
+    test_client
+        .init_with_options(Some(json!({
             "zshcs": {
                 "experimental": {
                     "hover": true
                 }
             }
-        })),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
+        })))
         .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     let doc_uri = Url::parse("file:///special_builtins.zsh").unwrap();
-    test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "/bin/echo 'hello'\n/usr/bin/git status\n: 'noop'\n. ./script.sh\nnonexistent_xyz123 --flag\n".to_string(),
-            },
-        })
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    test_client.open_document(&doc_uri, "/bin/echo 'hello'\n/usr/bin/git status\n: 'noop'\n. ./script.sh\nnonexistent_xyz123 --flag\n").await;
 
     // 1. Hover on `/bin/echo` (line 0, char 6 on 'echo') -> resolves to `echo` builtin doc
-    let hover_echo = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(0, 6),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_echo = test_client.hover(&doc_uri, 0, 6).await.unwrap();
     assert!(hover_echo.is_some());
     let hover_echo_val = hover_echo.unwrap();
     assert_eq!(
@@ -646,18 +334,7 @@ async fn test_hover_path_qualified_and_special_builtins() {
     }
 
     // 2. Hover on `/usr/bin/git` (line 1, char 10 on 'git') -> resolves to `git` man page
-    let hover_git = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 10),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_git = test_client.hover(&doc_uri, 1, 10).await.unwrap();
     assert!(
         hover_git.is_some(),
         "Expected hover info for '/usr/bin/git' via man page"
@@ -682,18 +359,7 @@ async fn test_hover_path_qualified_and_special_builtins() {
     }
 
     // 3. Hover on `:` builtin (line 2, char 0)
-    let hover_colon = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(2, 0),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_colon = test_client.hover(&doc_uri, 2, 0).await.unwrap();
     assert!(hover_colon.is_some());
     let hover_colon_val = hover_colon.unwrap();
     assert_eq!(
@@ -710,18 +376,7 @@ async fn test_hover_path_qualified_and_special_builtins() {
     }
 
     // 4. Hover on `.` builtin (line 3, char 0)
-    let hover_dot = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(3, 0),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_dot = test_client.hover(&doc_uri, 3, 0).await.unwrap();
     assert!(hover_dot.is_some());
     let hover_dot_val = hover_dot.unwrap();
     assert_eq!(
@@ -738,33 +393,11 @@ async fn test_hover_path_qualified_and_special_builtins() {
     }
 
     // 5. Hover on nonexistent command (line 4, char 2) -> None
-    let hover_nonexistent = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(4, 2),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_nonexistent = test_client.hover(&doc_uri, 4, 2).await.unwrap();
     assert!(hover_nonexistent.is_none());
 
     // 6. Hover on flag `--flag` (line 4, char 20) -> None
-    let hover_flag = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(4, 20),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_flag = test_client.hover(&doc_uri, 4, 20).await.unwrap();
     assert!(hover_flag.is_none());
 }
 
@@ -773,57 +406,23 @@ async fn test_hover_unicode_and_multibyte_document() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        initialization_options: Some(json!({
+    test_client
+        .init_with_options(Some(json!({
             "zshcs": {
                 "experimental": {
                     "hover": true
                 }
             }
-        })),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
+        })))
         .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     let doc_uri = Url::parse("file:///unicode_doc.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "echo 'こんにちは' # テスト 𩸽 🎉\nprint '成功'\n".to_string(),
-            },
-        })
+        .open_document(&doc_uri, "echo 'こんにちは' # テスト 𩸽 🎉\nprint '成功'\n")
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     // Hover on 'print' at line 1, char 2
-    let hover_print = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(1, 2),
-            },
-            work_done_progress_params: Default::default(),
-        })
-        .await
-        .unwrap();
+    let hover_print = test_client.hover(&doc_uri, 1, 2).await.unwrap();
     assert!(hover_print.is_some());
     let hover_print_val = hover_print.unwrap();
     assert_eq!(
@@ -845,30 +444,15 @@ async fn test_hover_local_function_variable_and_alias() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        initialization_options: Some(json!({
+    test_client
+        .init_with_options(Some(json!({
             "zshcs": {
                 "experimental": {
                     "hover": true
                 }
             }
-        })),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
+        })))
         .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     let doc_uri = Url::parse("file:///local_symbols_hover.zsh").unwrap();
     let text = concat!(
@@ -882,29 +466,11 @@ async fn test_hover_local_function_variable_and_alias() {
         "deploy_app \"$DEPLOY_ENV\"\n",
         "dlog\n",
     );
-    test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: text.to_string(),
-            },
-        })
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    test_client.open_document(&doc_uri, text).await;
 
     // 1. Hover on local function call `deploy_app` (line 7, char 2)
     let hover_fn = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(7, 2),
-            },
-            work_done_progress_params: Default::default(),
-        })
+        .hover(&doc_uri, 7, 2)
         .await
         .unwrap()
         .expect("Expected hover for local function deploy_app");
@@ -917,15 +483,7 @@ async fn test_hover_local_function_variable_and_alias() {
 
     // 2. Hover on local variable reference `$DEPLOY_ENV` (line 7, char 14)
     let hover_var = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(7, 14),
-            },
-            work_done_progress_params: Default::default(),
-        })
+        .hover(&doc_uri, 7, 14)
         .await
         .unwrap()
         .expect("Expected hover for local variable DEPLOY_ENV");
@@ -939,13 +497,7 @@ async fn test_hover_local_function_variable_and_alias() {
 
     // 3. Hover on local alias `dlog` (line 8, char 1)
     let hover_alias = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(8, 1),
-            },
-            work_done_progress_params: Default::default(),
-        })
+        .hover(&doc_uri, 8, 1)
         .await
         .unwrap()
         .expect("Expected hover for local alias dlog");
@@ -962,30 +514,15 @@ async fn test_hover_function_local_variable_scoping() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        initialization_options: Some(json!({
+    test_client
+        .init_with_options(Some(json!({
             "zshcs": {
                 "experimental": {
                     "hover": true
                 }
             }
-        })),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
+        })))
         .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     let doc_uri = Url::parse("file:///hover_scoping.zsh").unwrap();
     let text = concat!(
@@ -998,29 +535,11 @@ async fn test_hover_function_local_variable_scoping() {
         "}\n",
         "echo \"$MODE\"\n",
     );
-    test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: text.to_string(),
-            },
-        })
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    test_client.open_document(&doc_uri, text).await;
 
     // 1. Inside `worker()`: shows `local MODE="worker"`
     let hover_local = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: doc_uri.clone(),
-                },
-                position: Position::new(5, 10),
-            },
-            work_done_progress_params: Default::default(),
-        })
+        .hover(&doc_uri, 5, 10)
         .await
         .unwrap()
         .expect("Expected hover inside worker()");
@@ -1033,13 +552,7 @@ async fn test_hover_function_local_variable_scoping() {
 
     // 2. Top-level: shows `MODE="global"`
     let hover_global = test_client
-        .send_request::<HoverRequest>(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: doc_uri },
-                position: Position::new(7, 9),
-            },
-            work_done_progress_params: Default::default(),
-        })
+        .hover(&doc_uri, 7, 9)
         .await
         .unwrap()
         .expect("Expected hover at top-level");

@@ -5,16 +5,9 @@ use std::time::Duration;
 use common::setup_server_mock as setup_server;
 use serde_json::json;
 use tower_lsp::lsp_types::{
-    ClientCapabilities, DiagnosticSeverity, DidChangeConfigurationParams,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, InitializeParams, InitializedParams, LogMessageParams,
-    PublishDiagnosticsParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, Url, VersionedTextDocumentIdentifier,
-    notification::{
-        DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
-        DidSaveTextDocument, Initialized, LogMessage, PublishDiagnostics,
-    },
-    request::Initialize,
+    DiagnosticSeverity, DidSaveTextDocumentParams, PublishDiagnosticsParams,
+    TextDocumentIdentifier, Url,
+    notification::{DidSaveTextDocument, PublishDiagnostics},
 };
 
 #[tokio::test]
@@ -22,38 +15,10 @@ async fn test_diagnostics_disabled_by_default() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    // Initialize with default params (diagnostics disabled)
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
-    // Open document with obvious syntax error
     let doc_uri = Url::parse("file:///syntax_error.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "if [[ ; then\n  echo bad\nfi\n".to_string(),
-            },
-        })
+        .init_and_open(&doc_uri, "if [[ ; then\n  echo bad\nfi\n")
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     // Verify NO PublishDiagnostics is sent within 300ms
     let diag_result = tokio::time::timeout(
@@ -73,45 +38,20 @@ async fn test_diagnostics_enabled_via_initialization_options() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    // Initialize with experimental diagnostics enabled
-    let initialize_params = InitializeParams {
-        process_id: Some(123),
-        root_uri: None,
-        capabilities: ClientCapabilities::default(),
-        initialization_options: Some(json!({
-            "zshcs": {
-                "experimental": {
-                    "diagnostics": true
-                }
-            }
-        })),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
-    // Open document with syntax error
     let doc_uri = Url::parse("file:///syntax_error.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "if [[ ; then\n  echo bad\nfi\n".to_string(),
-            },
-        })
+        .init_with_options_and_open(
+            Some(json!({
+                "zshcs": {
+                    "experimental": {
+                        "diagnostics": true
+                    }
+                }
+            })),
+            &doc_uri,
+            "if [[ ; then\n  echo bad\nfi\n",
+        )
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     // Should receive PublishDiagnostics with 1 error
     let diag_params: Option<PublishDiagnosticsParams> =
@@ -130,16 +70,8 @@ async fn test_diagnostics_enabled_via_initialization_options() {
 
     // Fix syntax via didChange
     test_client
-        .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
-            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 2),
-            content_changes: vec![TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: "if true; then\n  echo ok\nfi\n".to_string(),
-            }],
-        })
+        .change_document_full(&doc_uri, 2, "if true; then\n  echo ok\nfi\n")
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     // Should receive empty diagnostics clearing error
     let fixed_diags = test_client
@@ -159,31 +91,10 @@ async fn test_diagnostics_dynamic_enable_and_disable_via_did_change_configuratio
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    // Initialize with default (disabled)
-    let initialize_params = InitializeParams::default();
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
-    // Open document with syntax error
     let doc_uri = Url::parse("file:///dynamic.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "echo \"unclosed quote".to_string(),
-            },
-        })
+        .init_and_open(&doc_uri, "echo \"unclosed quote")
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     // Verify no diagnostics while disabled
     let initial_check = tokio::time::timeout(
@@ -195,15 +106,13 @@ async fn test_diagnostics_dynamic_enable_and_disable_via_did_change_configuratio
 
     // 1. Enable dynamically via workspace/didChangeConfiguration
     test_client
-        .send_notification::<DidChangeConfiguration>(DidChangeConfigurationParams {
-            settings: json!({
-                "zshcs": {
-                    "experimental": {
-                        "diagnostics": true
-                    }
+        .change_configuration(json!({
+            "zshcs": {
+                "experimental": {
+                    "diagnostics": true
                 }
-            }),
-        })
+            }
+        }))
         .await;
 
     // Should receive diagnostics for open document
@@ -217,15 +126,13 @@ async fn test_diagnostics_dynamic_enable_and_disable_via_did_change_configuratio
 
     // 2. Disable dynamically via workspace/didChangeConfiguration
     test_client
-        .send_notification::<DidChangeConfiguration>(DidChangeConfigurationParams {
-            settings: json!({
-                "zshcs": {
-                    "experimental": {
-                        "diagnostics": false
-                    }
+        .change_configuration(json!({
+            "zshcs": {
+                "experimental": {
+                    "diagnostics": false
                 }
-            }),
-        })
+            }
+        }))
         .await;
 
     // Should receive empty diagnostics clearing markers
@@ -242,39 +149,20 @@ async fn test_diagnostics_cleared_on_did_close() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    // Initialize with diagnostics enabled
-    let initialize_params = InitializeParams {
-        initialization_options: Some(json!({
-            "zshcs": {
-                "experimental": {
-                    "diagnostics": true
-                }
-            }
-        })),
-        ..Default::default()
-    };
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
     let doc_uri = Url::parse("file:///closing_doc.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "if [[ ; then".to_string(),
-            },
-        })
+        .init_with_options_and_open(
+            Some(json!({
+                "zshcs": {
+                    "experimental": {
+                        "diagnostics": true
+                    }
+                }
+            })),
+            &doc_uri,
+            "if [[ ; then",
+        )
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     // Receive initial error diagnostics
     let diags = test_client
@@ -284,14 +172,7 @@ async fn test_diagnostics_cleared_on_did_close() {
     assert_eq!(diags.diagnostics.len(), 1);
 
     // Close document
-    test_client
-        .send_notification::<DidCloseTextDocument>(DidCloseTextDocumentParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc_uri.clone(),
-            },
-        })
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    test_client.close_document(&doc_uri).await;
 
     // Receive empty diagnostics to clear editor state
     let closed_diags = test_client
@@ -307,38 +188,20 @@ async fn test_diagnostics_did_save_triggers_diagnostics() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        initialization_options: Some(json!({
-            "zshcs": {
-                "experimental": {
-                    "diagnostics": true
-                }
-            }
-        })),
-        ..Default::default()
-    };
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
     let doc_uri = Url::parse("file:///save_test.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "echo valid".to_string(),
-            },
-        })
+        .init_with_options_and_open(
+            Some(json!({
+                "zshcs": {
+                    "experimental": {
+                        "diagnostics": true
+                    }
+                }
+            })),
+            &doc_uri,
+            "echo valid",
+        )
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
     let open_diags = test_client
         .read_notification::<PublishDiagnostics>()
         .await
@@ -368,68 +231,34 @@ async fn test_diagnostics_debounce_rapid_changes() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        initialization_options: Some(json!({
-            "zshcs": {
-                "experimental": {
-                    "diagnostics": true
-                }
-            }
-        })),
-        ..Default::default()
-    };
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
     let doc_uri = Url::parse("file:///rapid_edits.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "echo start".to_string(),
-            },
-        })
+        .init_with_options_and_open(
+            Some(json!({
+                "zshcs": {
+                    "experimental": {
+                        "diagnostics": true
+                    }
+                }
+            })),
+            &doc_uri,
+            "echo start",
+        )
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
     let _ = test_client.read_notification::<PublishDiagnostics>().await;
 
     // Send 5 rapid changes in 10ms intervals
     for ver in 2..=5 {
         test_client
-            .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
-                text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), ver),
-                content_changes: vec![TextDocumentContentChangeEvent {
-                    range: None,
-                    range_length: None,
-                    text: format!("echo step {ver}"),
-                }],
-            })
+            .change_document_full(&doc_uri, ver, &format!("echo step {ver}"))
             .await;
-        let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     // Final change has syntax error
     test_client
-        .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
-            text_document: VersionedTextDocumentIdentifier::new(doc_uri.clone(), 6),
-            content_changes: vec![TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: "if [[ ; then".to_string(),
-            }],
-        })
+        .change_document_full(&doc_uri, 6, "if [[ ; then")
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     // Wait for debounced diagnostic to arrive
     let final_diag = test_client
@@ -446,38 +275,20 @@ async fn test_diagnostics_did_save_with_syntax_error() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams {
-        initialization_options: Some(json!({
-            "zshcs": {
-                "experimental": {
-                    "diagnostics": true
-                }
-            }
-        })),
-        ..Default::default()
-    };
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
     let doc_uri = Url::parse("file:///save_err.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "if [[ ; then".to_string(),
-            },
-        })
+        .init_with_options_and_open(
+            Some(json!({
+                "zshcs": {
+                    "experimental": {
+                        "diagnostics": true
+                    }
+                }
+            })),
+            &doc_uri,
+            "if [[ ; then",
+        )
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
     let _open_diags = test_client
         .read_notification::<PublishDiagnostics>()
         .await
@@ -507,55 +318,25 @@ async fn test_diagnostics_multiple_documents_dynamic_toggle() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    let initialize_params = InitializeParams::default();
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
+    test_client.init().await;
 
     let doc1_uri = Url::parse("file:///doc1.zsh").unwrap();
     let doc2_uri = Url::parse("file:///doc2.zsh").unwrap();
 
+    test_client.open_document(&doc1_uri, "if [[ ; then").await;
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc1_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "if [[ ; then".to_string(),
-            },
-        })
+        .open_document(&doc2_uri, "echo \"unclosed quote")
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
-    test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc2_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "echo \"unclosed quote".to_string(),
-            },
-        })
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     // Dynamically enable
     test_client
-        .send_notification::<DidChangeConfiguration>(DidChangeConfigurationParams {
-            settings: json!({
-                "zshcs": {
-                    "experimental": {
-                        "diagnostics": true
-                    }
+        .change_configuration(json!({
+            "zshcs": {
+                "experimental": {
+                    "diagnostics": true
                 }
-            }),
-        })
+            }
+        }))
         .await;
 
     // Both documents should receive diagnostics
@@ -574,15 +355,13 @@ async fn test_diagnostics_multiple_documents_dynamic_toggle() {
 
     // Dynamically disable
     test_client
-        .send_notification::<DidChangeConfiguration>(DidChangeConfigurationParams {
-            settings: json!({
-                "zshcs": {
-                    "experimental": {
-                        "diagnostics": false
-                    }
+        .change_configuration(json!({
+            "zshcs": {
+                "experimental": {
+                    "diagnostics": false
                 }
-            }),
-        })
+            }
+        }))
         .await;
 
     let clear_a = test_client
@@ -603,38 +382,18 @@ async fn test_diagnostics_flat_initialization_options() {
     let mut harness = setup_server();
     let mut test_client = harness.client();
 
-    // Initialize with flat experimental options
-    let initialize_params = InitializeParams {
-        initialization_options: Some(json!({
-            "experimental": {
-                "diagnostics": true
-            }
-        })),
-        ..Default::default()
-    };
-
-    test_client
-        .send_request::<Initialize>(initialize_params)
-        .await
-        .unwrap();
-    test_client
-        .send_notification::<Initialized>(InitializedParams {})
-        .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
-
     let doc_uri = Url::parse("file:///flat_opt.zsh").unwrap();
     test_client
-        .send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: doc_uri.clone(),
-                language_id: "zsh".to_string(),
-                version: 1,
-                text: "if [[ ; then".to_string(),
-            },
-        })
+        .init_with_options_and_open(
+            Some(json!({
+                "experimental": {
+                    "diagnostics": true
+                }
+            })),
+            &doc_uri,
+            "if [[ ; then",
+        )
         .await;
-    let _: Option<LogMessageParams> = test_client.read_notification::<LogMessage>().await;
 
     let diag = test_client
         .read_notification::<PublishDiagnostics>()
