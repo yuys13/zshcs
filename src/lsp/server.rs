@@ -499,13 +499,17 @@ impl LanguageServer for Backend {
                     count = items.len(),
                     "Completion items retrieved successfully"
                 );
-                let local_symbols = if let Some(doc) =
-                    self.document_manager.get(&uri).map(|d| d.clone())
-                {
-                    extract_local_symbols_with_manager(&doc, position, Some(&self.document_manager))
-                } else {
-                    Vec::new()
-                };
+                let local_symbols =
+                    if let Some(doc) = self.document_manager.get(&uri).map(|d| d.clone()) {
+                        let doc_manager = self.document_manager.clone();
+                        tokio::task::spawn_blocking(move || {
+                            extract_local_symbols_with_manager(&doc, position, Some(&doc_manager))
+                        })
+                        .await
+                        .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                 let merged = merge_local_completions(items, &local_symbols, &prefix);
                 Ok(Some(CompletionResponse::Array(merged)))
             }
@@ -1159,5 +1163,72 @@ mod tests {
             .await;
         assert!(res.is_ok());
         assert!(res.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_backend_completion_extracts_local_and_sourced_symbols_on_blocking_thread() {
+        let mock_capture = r#"#!/usr/bin/env zsh
+while IFS= read -r msg; do
+    case "$msg" in
+        chdir:*) ;;
+        input:*)
+            printf 'daemon_cmd\n\x01EOC\x01\n'
+            ;;
+    esac
+done
+"#;
+        let (service, _socket) = LspService::new(|client| {
+            Backend::new_with_scripts(client, mock_capture, "# mock zptyrc\n").unwrap()
+        });
+        let backend = service.inner();
+
+        let dir = tempfile::tempdir().unwrap();
+        let sourced_path = dir.path().join("sourced.zsh");
+        let main_path = dir.path().join("main.zsh");
+        std::fs::write(&sourced_path, "my_sourced_fn() { : }\n").unwrap();
+        let main_text = "source ./sourced.zsh\nmy_local_fn() { : }\nmy_\n";
+        std::fs::write(&main_path, main_text).unwrap();
+
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: main_uri.clone(),
+                    language_id: "zsh".to_string(),
+                    version: 1,
+                    text: main_text.to_string(),
+                },
+            })
+            .await;
+
+        let caller_thread = std::thread::current().id();
+        let res = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: main_uri.clone(),
+                    },
+                    position: Position::new(2, 3),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap()
+            .expect("Expected completion response");
+
+        let labels: Vec<String> = match res {
+            CompletionResponse::Array(items) => items.into_iter().map(|i| i.label).collect(),
+            CompletionResponse::List(list) => list.items.into_iter().map(|i| i.label).collect(),
+        };
+        assert_eq!(labels, vec!["my_local_fn", "my_sourced_fn", "daemon_cmd"]);
+
+        let extract_thread = crate::lsp::completion::last_extract_thread_id(&main_uri)
+            .expect("Expected extract_local_symbols_with_manager to be recorded");
+        assert_ne!(
+            extract_thread, caller_thread,
+            "extract_local_symbols_with_manager should run on tokio blocking thread pool"
+        );
     }
 }

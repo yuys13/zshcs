@@ -368,6 +368,26 @@ pub fn extract_local_symbols(doc: &DocumentState, position: Position) -> Vec<Loc
     extract_local_symbols_with_manager(doc, position, None)
 }
 
+#[cfg(test)]
+static EXTRACT_THREAD_IDS: std::sync::OnceLock<
+    dashmap::DashMap<tower_lsp::lsp_types::Url, std::thread::ThreadId>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn record_extract_thread(uri: &tower_lsp::lsp_types::Url) {
+    let map = EXTRACT_THREAD_IDS.get_or_init(dashmap::DashMap::new);
+    map.insert(uri.clone(), std::thread::current().id());
+}
+
+#[cfg(test)]
+pub(crate) fn last_extract_thread_id(
+    uri: &tower_lsp::lsp_types::Url,
+) -> Option<std::thread::ThreadId> {
+    EXTRACT_THREAD_IDS
+        .get()
+        .and_then(|map| map.get(uri).map(|entry| *entry.value()))
+}
+
 /// Extracts locally defined variables, functions, and aliases from an open document state
 /// and any scripts sourced at or before `position`, preferring open buffers in `doc_manager`
 /// and falling back to disk reads.
@@ -376,6 +396,9 @@ pub fn extract_local_symbols_with_manager(
     position: Position,
     doc_manager: Option<&DocumentManager>,
 ) -> Vec<LocalSymbol> {
+    #[cfg(test)]
+    record_extract_thread(doc.uri());
+
     let index = doc.index();
     let mut symbols: Vec<LocalSymbol> = visible_symbols_at(&index, position)
         .into_iter()
