@@ -7,9 +7,7 @@ edition = "2024"
 tower-lsp = "0.20.0"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] } # Add serde and enable the derive feature
-serde_json = "1.0" # Added to create JSON RPC messages in test code
-lsp-types = "0.97" # Added to reference types in test code
-futures = "0.3" # Added for asynchronous processing in tests
+serde_json = "1.0"
 dashmap = "6.2.1"
 tempfile = "3.27.0"
 thiserror = "2.0"
@@ -18,8 +16,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
-rstest = "0.28.0"
 criterion = "0.8"
+futures = "0.3"
+rstest = "0.28.0"
 
 [[bench]]
 name = "parser_benchmark"
