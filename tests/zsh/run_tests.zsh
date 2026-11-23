@@ -321,6 +321,93 @@ test_chdir_with_spaces_and_quotes() {
 }
 
 # ------------------------------------------------------------------------------
+# Test 11: compadd Inline Descriptions, Affixes (-P/-p/-S/-s), -f/-default-, Empty
+# ------------------------------------------------------------------------------
+test_compadd_inline_descriptions_affixes_and_dirs() {
+    local zptyrc="$ZPTYRC_SCRIPT"
+    local sample_dir="$TEST_TMPDIR/compadd_dir"
+    mkdir -p "$sample_dir"
+
+    ZSHCS_CACHE_DIR="$TEST_TMPDIR/cache" zsh --no-rcs -c '
+        source "$1"
+        local sample_dir="$2"
+
+        # 1. Inline -d "(...)" descriptions
+        builtin() {
+            if [[ "$1" == "compadd" && "$*" == *"-A __hits"* ]]; then
+                __hits=("alpha" "beta")
+            fi
+        }
+        local out_inline
+        out_inline=$(compadd -d "(First_desc Second_desc)" -- "alpha" "beta")
+        [[ "$out_inline" == *alpha*$'\t'*First_desc* ]] || exit 1
+        [[ "$out_inline" == *beta*$'\t'*Second_desc* ]] || exit 2
+
+        # 2. Prefix/suffix affixes (-P/-p/-S/-s)
+        builtin() {
+            if [[ "$1" == "compadd" && "$*" == *"-A __hits"* ]]; then
+                __hits=("core")
+                __dscr=()
+            fi
+        }
+        local out_affix
+        out_affix=$(compadd -P "P_" -p "p_" -S "_S" -s "_s" -- "core")
+        [[ "$out_affix" == "P_p_core_s_S" ]] || exit 3
+
+        # 3. -f appends / to directories, while -default- does not trigger dirsuf
+        builtin() {
+            if [[ "$1" == "compadd" && "$*" == *"-A __hits"* ]]; then
+                __hits=("$sample_dir")
+                __dscr=()
+            fi
+        }
+        local out_dir out_default
+        out_dir=$(compadd -f -- "$sample_dir")
+        [[ "$out_dir" == "${sample_dir}/" ]] || exit 4
+
+        out_default=$(compadd -default- -- "$sample_dir")
+        [[ "$out_default" == "$sample_dir" ]] || exit 5
+
+        # 4. Empty $__hits returns early with no output
+        builtin() {
+            __hits=()
+            __dscr=()
+        }
+        local out_empty
+        out_empty=$(compadd -- "anything")
+        [[ -z "$out_empty" ]] || exit 6
+
+        exit 0
+    ' _zshcs_subshell "$zptyrc" "$sample_dir"
+}
+
+# ------------------------------------------------------------------------------
+# Test 12: capture.zsh Missing rcfile, Empty input:, and Clean EOF Exit
+# ------------------------------------------------------------------------------
+test_capture_script_missing_rc_empty_input_and_eof() {
+    # 1. Missing zptyrc.zsh next to capture.zsh must fail with exit 1
+    local isolated_dir="$TEST_TMPDIR/isolated_capture"
+    mkdir -p "$isolated_dir"
+    cp "$CAPTURE_SCRIPT" "$isolated_dir/capture.zsh"
+
+    local err_out rc=0
+    err_out=$(zsh --no-rcs "$isolated_dir/capture.zsh" 2>&1) || rc=$?
+    [[ $rc -eq 1 ]] || { print -u2 "Expected exit 1 when zptyrc.zsh missing, got $rc"; return 1; }
+    [[ "$err_out" == *"rcfile not found"* ]] || { print -u2 "Expected rcfile not found error, got: $err_out"; return 1; }
+
+    # 2. Empty input: returns EOC and EOF on stdin exits cleanly (0)
+    local eof_cache="$TEST_TMPDIR/eof_cache"
+    mkdir -p "$eof_cache"
+    local out_eof
+    out_eof=$(ZSHCS_CACHE_DIR="$eof_cache" zsh --no-rcs "$CAPTURE_SCRIPT" <<< "input:") || {
+        print -u2 "Expected clean exit 0 on EOF after empty input:"
+        return 1
+    }
+    [[ "$out_eof" == *$'\x01EOC\x01'* ]] || { print -u2 "Expected EOC for empty input:, got: $out_eof"; return 1; }
+    return 0
+}
+
+# ------------------------------------------------------------------------------
 # Main Runner
 # ------------------------------------------------------------------------------
 main() {
@@ -340,6 +427,8 @@ main() {
     run_test_case "Sequential queries over pty" test_capture_script_sequential_queries
     run_test_case "compadd delegation and interception" test_compadd_hook_delegation
     run_test_case "Directory sync with spaces and quotes" test_chdir_with_spaces_and_quotes
+    run_test_case "compadd inline descriptions, affixes, -f/-default-, and empty hits" test_compadd_inline_descriptions_affixes_and_dirs
+    run_test_case "capture.zsh missing rcfile, empty input, and clean EOF exit" test_capture_script_missing_rc_empty_input_and_eof
 
     print -P "%F{cyan}-----------------------------------------------------%f"
     print -P "Total:  $TESTS_RUN"
