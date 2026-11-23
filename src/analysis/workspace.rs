@@ -630,4 +630,82 @@ pub(crate) mod tests {
             "Short-circuiting visitor should load only a.zsh and skip nested.zsh and b.zsh"
         );
     }
+
+    #[test]
+    fn test_collect_sourced_documents_skips_oversized_and_special_files() {
+        let dir = tempdir().expect("tempdir");
+        let oversized_path = dir.path().join("oversized.zsh");
+        let mut oversized_content = String::from("oversized_func() { : }\n");
+        let pad_len =
+            (MAX_SOURCED_FILE_BYTES as usize + 64).saturating_sub(oversized_content.len());
+        oversized_content.push_str(&"#".repeat(pad_len));
+        std::fs::write(&oversized_path, oversized_content).unwrap();
+
+        let subdir_path = dir.path().join("subdir");
+        std::fs::create_dir(&subdir_path).unwrap();
+
+        let normal_path = dir.path().join("normal.zsh");
+        std::fs::write(&normal_path, "normal_func() { : }\n").unwrap();
+
+        let main_path = dir.path().join("main.zsh");
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let mut main_text = String::from("source ./oversized.zsh\nsource ./subdir\n");
+        if cfg!(unix) {
+            main_text.push_str("source /dev/null\n");
+        }
+        main_text.push_str("source ./normal.zsh\n");
+
+        let main_idx = parse_document(&main_text);
+        let sourced =
+            collect_sourced_documents(&main_idx, &main_uri, Position::new(10, 0), None, false);
+        let names: Vec<&str> = sourced
+            .iter()
+            .flat_map(|s| s.index.functions.iter().map(|f| f.name.as_str()))
+            .collect();
+
+        assert!(
+            names.contains(&"normal_func"),
+            "Expected normal_func from normal.zsh, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"oversized_func"),
+            "Oversized sourced file must be skipped, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_collect_sourced_documents_enforces_max_files_limit() {
+        let dir = tempdir().expect("tempdir");
+        let total = MAX_SOURCED_FILES + 5;
+        let mut main_text = String::new();
+        for i in 0..total {
+            let file_path = dir.path().join(format!("f_{i}.zsh"));
+            std::fs::write(&file_path, format!("sourced_fn_{i}() {{ : }}\n")).unwrap();
+            main_text.push_str(&format!("source ./f_{i}.zsh\n"));
+        }
+
+        let main_path = dir.path().join("main.zsh");
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let main_idx = parse_document(&main_text);
+        let sourced = collect_sourced_documents(
+            &main_idx,
+            &main_uri,
+            Position::new(total as u32 + 1, 0),
+            None,
+            false,
+        );
+        let names: Vec<&str> = sourced
+            .iter()
+            .flat_map(|s| s.index.functions.iter().map(|f| f.name.as_str()))
+            .collect();
+
+        assert!(names.contains(&"sourced_fn_0"));
+        assert!(names.contains(&"sourced_fn_63"));
+        assert!(
+            !names.contains(&"sourced_fn_64"),
+            "Files beyond MAX_SOURCED_FILES ({MAX_SOURCED_FILES}) must not be scanned"
+        );
+        assert!(!names.contains(&"sourced_fn_68"));
+        assert_eq!(sourced.len(), MAX_SOURCED_FILES);
+    }
 }

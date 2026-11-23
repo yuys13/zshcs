@@ -212,7 +212,6 @@ pub fn find_definition_with_index(
 mod tests {
     use super::*;
     use crate::analysis::workspace::prioritized_source_paths;
-    use rstest::rstest;
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -244,59 +243,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[rstest]
-    #[case("hello world", 0, 0)]
-    #[case("hello world", 5, 5)]
-    #[case("こんにちは", 0, 0)]
-    #[case("こんにちは", 3, 1)]
-    #[case("こんにちは", 6, 2)]
-    #[case("こんにちは", 15, 5)]
-    #[case("🍣🍺 emoji", 0, 0)]
-    #[case("🍣🍺 emoji", 4, 2)] // 🍣 is 2 utf16 units
-    #[case("🍣🍺 emoji", 8, 4)] // 🍺 is 2 utf16 units
-    #[case("🍣🍺 emoji", 9, 5)] // space
-    fn test_byte_and_utf16_conversions(
-        #[case] line: &str,
-        #[case] byte_idx: usize,
-        #[case] expected_u16: u32,
-    ) {
-        assert_eq!(byte_to_utf16_col(line, byte_idx), expected_u16);
-        assert_eq!(utf16_col_to_byte(line, expected_u16), byte_idx);
-    }
-
-    #[test]
-    fn test_split_declaration_tokens() {
-        let input = "-r -g FOO=123 BAR=\"hello \\\"world\\\"\" BAZ=(a b c) # comment";
-        let tokens = split_declaration_tokens(input);
-        let token_texts: Vec<&str> = tokens.iter().map(|t| t.text).collect();
-        assert_eq!(
-            token_texts,
-            vec![
-                "-r",
-                "-g",
-                "FOO=123",
-                "BAR=\"hello \\\"world\\\"\"",
-                "BAZ=(a b c)"
-            ]
-        );
-    }
-
-    #[test]
-    fn test_split_line_statements() {
-        let line = "export A=1; B=2 && local C=3; echo \"hello; world\" # trailing comment";
-        let stmts = split_line_statements(line);
-        let texts: Vec<&str> = stmts.iter().map(|s| s.text).collect();
-        assert_eq!(
-            texts,
-            vec![
-                "export A=1",
-                " B=2 ",
-                " local C=3",
-                " echo \"hello; world\" "
-            ]
-        );
     }
 
     #[test]

@@ -385,4 +385,58 @@ done
             ]
         );
     }
+
+    #[tokio::test]
+    async fn test_completion_daemon_skips_cancelled_request() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let script_path = temp_dir.path().join("mock_daemon.zsh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/zsh\nwhile read -r line; do\n  if [[ \"$line\" == input:* ]]; then\n    echo \"success\\x01EOC\\x01\"\n  fi\ndone\n",
+        )
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel(16);
+        let mut client_opt = None;
+        let (_service, _socket) = tower_lsp::LspService::new(|client| {
+            client_opt = Some(client.clone());
+            crate::Backend::new(client).unwrap()
+        });
+        let client = client_opt.unwrap();
+
+        let daemon_handle = tokio::spawn(run_completion_daemon(script_path, None, rx, client));
+
+        // 1. Send cancelled request (drop receiver immediately)
+        let (tx_resp1, rx_resp1) = oneshot::channel();
+        drop(rx_resp1);
+        tx.send(CompletionRequest::Complete {
+            prefix: "cancelled".to_string(),
+            cwd: None,
+            responder: tx_resp1,
+        })
+        .await
+        .unwrap();
+
+        // 2. Send active request
+        let (tx_resp2, rx_resp2) = oneshot::channel();
+        tx.send(CompletionRequest::Complete {
+            prefix: "active".to_string(),
+            cwd: None,
+            responder: tx_resp2,
+        })
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(3), rx_resp2)
+            .await
+            .expect("Did not timeout waiting for active request")
+            .expect("Channel not closed")
+            .expect("Daemon returned success");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].label, "success");
+
+        drop(tx);
+        let _ = daemon_handle.await;
+    }
 }
