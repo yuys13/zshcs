@@ -1,6 +1,6 @@
 mod common;
 
-use common::{TestClient, setup_server_mock as setup_server};
+use common::setup_server_mock as setup_server;
 use serde_json::json;
 use tower_lsp::lsp_types::{
     ClientCapabilities, DidChangeConfigurationParams, DidOpenTextDocumentParams,
@@ -12,8 +12,8 @@ use tower_lsp::lsp_types::{
 
 #[tokio::test]
 async fn test_symbols_capability_registered_on_initialize() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -35,8 +35,8 @@ async fn test_symbols_capability_registered_on_initialize() {
 
 #[tokio::test]
 async fn test_symbols_disabled_by_default() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -92,8 +92,8 @@ alias ll='ls -la'
 
 #[tokio::test]
 async fn test_symbols_enabled_via_initialization_options() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -178,8 +178,8 @@ alias gs='git status'
 
 #[tokio::test]
 async fn test_symbols_hierarchy_nested_functions_and_locals() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -272,8 +272,8 @@ outer() {
 
 #[tokio::test]
 async fn test_symbols_dynamic_toggle_via_did_change_configuration() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     // 1. Initialize with default (disabled)
     let initialize_params = InitializeParams {
@@ -383,8 +383,8 @@ test_func() {
 
 #[tokio::test]
 async fn test_symbols_unopened_document_returns_none() {
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),
@@ -427,8 +427,8 @@ async fn test_symbols_unopened_document_returns_none() {
 #[tokio::test]
 async fn test_symbols_flat_and_nested_settings_variants() {
     // Flat experimental format
-    let (mut client_stream, _server_handle) = setup_server();
-    let mut test_client = TestClient::new(&mut client_stream);
+    let mut harness = setup_server();
+    let mut test_client = harness.client();
 
     let initialize_params = InitializeParams {
         process_id: Some(123),

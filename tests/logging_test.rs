@@ -31,8 +31,46 @@ impl std::io::Write for InMemoryWriter {
 
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set<V: AsRef<std::ffi::OsStr>>(key: &'static str, value: V) -> Self {
+        let original = std::env::var_os(key);
+        // SAFETY: Tests calling this hold ENV_MUTEX.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let original = std::env::var_os(key);
+        // SAFETY: Tests calling this hold ENV_MUTEX.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: Tests calling this hold ENV_MUTEX.
+        unsafe {
+            match &self.original {
+                Some(val) => std::env::set_var(self.key, val),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 #[test]
 fn test_init_logging_idempotency() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     init_logging();
     init_logging();
     let _ = try_init_logging();
@@ -41,23 +79,20 @@ fn test_init_logging_idempotency() {
 #[test]
 fn test_create_env_filter_logic() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    unsafe {
-        std::env::set_var("ZSHCS_LOG", "debug");
-        std::env::set_var("RUST_LOG", "error");
-    }
+    let _zshcs_guard = EnvVarGuard::set("ZSHCS_LOG", "debug");
+    let _rust_guard = EnvVarGuard::set("RUST_LOG", "error");
     let filter = create_env_filter();
     assert_eq!(filter.to_string(), "debug");
 
-    unsafe {
-        std::env::remove_var("ZSHCS_LOG");
-        std::env::set_var("RUST_LOG", "warn");
-    }
+    drop(_zshcs_guard);
+    let _zshcs_removed = EnvVarGuard::remove("ZSHCS_LOG");
+    drop(_rust_guard);
+    let _rust_warn = EnvVarGuard::set("RUST_LOG", "warn");
     let filter2 = create_env_filter();
     assert_eq!(filter2.to_string(), "warn");
 
-    unsafe {
-        std::env::remove_var("RUST_LOG");
-    }
+    drop(_rust_warn);
+    let _rust_removed = EnvVarGuard::remove("RUST_LOG");
     let filter3 = create_env_filter();
     assert_eq!(filter3.to_string(), "info");
 }
@@ -65,40 +100,39 @@ fn test_create_env_filter_logic() {
 #[test]
 fn test_create_env_filter_invalid_and_empty_edge_cases() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _zshcs_base = EnvVarGuard::remove("ZSHCS_LOG");
+    let _rust_base = EnvVarGuard::remove("RUST_LOG");
+
     // Invalid ZSHCS_LOG falls back to RUST_LOG
-    unsafe {
-        std::env::set_var("ZSHCS_LOG", "invalid[filter");
-        std::env::set_var("RUST_LOG", "warn");
+    {
+        let _z = EnvVarGuard::set("ZSHCS_LOG", "invalid[filter");
+        let _r = EnvVarGuard::set("RUST_LOG", "warn");
+        let filter = create_env_filter();
+        assert_eq!(filter.to_string(), "warn");
     }
-    let filter = create_env_filter();
-    assert_eq!(filter.to_string(), "warn");
 
     // Both invalid falls back to default info
-    unsafe {
-        std::env::set_var("ZSHCS_LOG", "invalid[1");
-        std::env::set_var("RUST_LOG", "invalid[2");
+    {
+        let _z = EnvVarGuard::set("ZSHCS_LOG", "invalid[1");
+        let _r = EnvVarGuard::set("RUST_LOG", "invalid[2");
+        let filter2 = create_env_filter();
+        assert_eq!(filter2.to_string(), "info");
     }
-    let filter2 = create_env_filter();
-    assert_eq!(filter2.to_string(), "info");
 
     // Empty string falls back to default info
-    unsafe {
-        std::env::set_var("ZSHCS_LOG", "");
-        std::env::remove_var("RUST_LOG");
+    {
+        let _z = EnvVarGuard::set("ZSHCS_LOG", "");
+        let _r = EnvVarGuard::remove("RUST_LOG");
+        let filter3 = create_env_filter();
+        assert_eq!(filter3.to_string(), "info");
     }
-    let filter3 = create_env_filter();
-    assert_eq!(filter3.to_string(), "info");
 
     // Whitespace padded string is trimmed
-    unsafe {
-        std::env::set_var("ZSHCS_LOG", "  trace  ");
-        std::env::remove_var("RUST_LOG");
-    }
-    let filter4 = create_env_filter();
-    assert_eq!(filter4.to_string(), "trace");
-
-    unsafe {
-        std::env::remove_var("ZSHCS_LOG");
+    {
+        let _z = EnvVarGuard::set("ZSHCS_LOG", "  trace  ");
+        let _r = EnvVarGuard::remove("RUST_LOG");
+        let filter4 = create_env_filter();
+        assert_eq!(filter4.to_string(), "trace");
     }
 }
 

@@ -16,14 +16,20 @@ use tracing_subscriber::EnvFilter;
 /// 2. `RUST_LOG` environment variable
 /// 3. Default fallback: `"info"`
 pub fn create_env_filter() -> EnvFilter {
-    if let Ok(val) = std::env::var("ZSHCS_LOG")
+    let zshcs_log = std::env::var("ZSHCS_LOG").ok();
+    let rust_log = std::env::var("RUST_LOG").ok();
+    create_env_filter_from(zshcs_log.as_deref(), rust_log.as_deref())
+}
+
+pub(crate) fn create_env_filter_from(zshcs_log: Option<&str>, rust_log: Option<&str>) -> EnvFilter {
+    if let Some(val) = zshcs_log
         && !val.trim().is_empty()
         && let Ok(filter) = EnvFilter::try_new(val.trim())
     {
         return filter;
     }
 
-    if let Ok(val) = std::env::var("RUST_LOG")
+    if let Some(val) = rust_log
         && !val.trim().is_empty()
         && let Ok(filter) = EnvFilter::try_new(val.trim())
     {
@@ -62,6 +68,43 @@ mod tests {
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set<V: AsRef<std::ffi::OsStr>>(key: &'static str, value: V) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: Tests calling this hold ENV_MUTEX.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: Tests calling this hold ENV_MUTEX.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: Tests calling this hold ENV_MUTEX.
+            unsafe {
+                match &self.original {
+                    Some(val) => std::env::set_var(self.key, val),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[derive(Clone)]
     struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -88,127 +131,64 @@ mod tests {
 
     #[test]
     fn test_create_env_filter_default() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::remove_var("ZSHCS_LOG");
-            std::env::remove_var("RUST_LOG");
-        }
-        let filter = create_env_filter();
-        let filter_str = filter.to_string();
-        assert_eq!(filter_str, "info");
+        let filter = create_env_filter_from(None, None);
+        assert_eq!(filter.to_string(), "info");
     }
 
     #[test]
     fn test_create_env_filter_with_zshcs_log() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::remove_var("RUST_LOG");
-            std::env::set_var("ZSHCS_LOG", "debug");
-        }
-        let filter = create_env_filter();
-        let filter_str = filter.to_string();
-        assert_eq!(filter_str, "debug");
-        unsafe {
-            std::env::remove_var("ZSHCS_LOG");
-        }
+        let filter = create_env_filter_from(Some("debug"), None);
+        assert_eq!(filter.to_string(), "debug");
     }
 
     #[test]
     fn test_create_env_filter_with_rust_log() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::remove_var("ZSHCS_LOG");
-            std::env::set_var("RUST_LOG", "warn");
-        }
-        let filter = create_env_filter();
-        let filter_str = filter.to_string();
-        assert_eq!(filter_str, "warn");
-        unsafe {
-            std::env::remove_var("RUST_LOG");
-        }
+        let filter = create_env_filter_from(None, Some("warn"));
+        assert_eq!(filter.to_string(), "warn");
     }
 
     #[test]
     fn test_create_env_filter_priority() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("ZSHCS_LOG", "trace");
-            std::env::set_var("RUST_LOG", "error");
-        }
-        let filter = create_env_filter();
-        let filter_str = filter.to_string();
-        assert_eq!(filter_str, "trace");
-        unsafe {
-            std::env::remove_var("ZSHCS_LOG");
-            std::env::remove_var("RUST_LOG");
-        }
+        let filter = create_env_filter_from(Some("trace"), Some("error"));
+        assert_eq!(filter.to_string(), "trace");
     }
 
     #[test]
     fn test_create_env_filter_invalid_zshcs_log_falls_back_to_rust_log() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("ZSHCS_LOG", "invalid[filter");
-            std::env::set_var("RUST_LOG", "warn");
-        }
-        let filter = create_env_filter();
-        let filter_str = filter.to_string();
-        assert_eq!(filter_str, "warn");
-        unsafe {
-            std::env::remove_var("ZSHCS_LOG");
-            std::env::remove_var("RUST_LOG");
-        }
+        let filter = create_env_filter_from(Some("invalid[filter"), Some("warn"));
+        assert_eq!(filter.to_string(), "warn");
     }
 
     #[test]
     fn test_create_env_filter_both_invalid_falls_back_to_default() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("ZSHCS_LOG", "invalid[1");
-            std::env::set_var("RUST_LOG", "invalid[2");
-        }
-        let filter = create_env_filter();
-        let filter_str = filter.to_string();
-        assert_eq!(filter_str, "info");
-        unsafe {
-            std::env::remove_var("ZSHCS_LOG");
-            std::env::remove_var("RUST_LOG");
-        }
+        let filter = create_env_filter_from(Some("invalid[1"), Some("invalid[2"));
+        assert_eq!(filter.to_string(), "info");
     }
 
     #[test]
     fn test_create_env_filter_empty_string_falls_back() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("ZSHCS_LOG", "");
-            std::env::set_var("RUST_LOG", "error");
-        }
-        let filter = create_env_filter();
-        let filter_str = filter.to_string();
-        assert_eq!(filter_str, "error");
-        unsafe {
-            std::env::remove_var("ZSHCS_LOG");
-            std::env::remove_var("RUST_LOG");
-        }
+        let filter = create_env_filter_from(Some(""), Some("error"));
+        assert_eq!(filter.to_string(), "error");
     }
 
     #[test]
     fn test_create_env_filter_whitespace_padded() {
+        let filter = create_env_filter_from(Some("  debug  "), None);
+        assert_eq!(filter.to_string(), "debug");
+    }
+
+    #[test]
+    fn test_create_env_filter_reads_process_env() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("ZSHCS_LOG", "  debug  ");
-            std::env::remove_var("RUST_LOG");
-        }
+        let _zshcs_guard = EnvVarGuard::set("ZSHCS_LOG", "debug");
+        let _rust_guard = EnvVarGuard::remove("RUST_LOG");
         let filter = create_env_filter();
-        let filter_str = filter.to_string();
-        assert_eq!(filter_str, "debug");
-        unsafe {
-            std::env::remove_var("ZSHCS_LOG");
-        }
+        assert_eq!(filter.to_string(), "debug");
     }
 
     #[test]
     fn test_init_logging_idempotent() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Calling init_logging multiple times should not panic
         init_logging();
         init_logging();

@@ -213,7 +213,38 @@ mod tests {
     use super::*;
     use crate::analysis::workspace::prioritized_source_paths;
     use rstest::rstest;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    static HOME_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set<V: AsRef<std::ffi::OsStr>>(key: &'static str, value: V) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: Tests calling this hold HOME_ENV_MUTEX.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: Tests calling this hold HOME_ENV_MUTEX.
+            unsafe {
+                match &self.original {
+                    Some(val) => std::env::set_var(self.key, val),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[rstest]
     #[case("hello world", 0, 0)]
@@ -671,15 +702,13 @@ echo "$VAR"
 
     #[test]
     fn test_find_definition_tilde_source_path() {
-        let home_env = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let _guard = HOME_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let temp_home = tempdir().unwrap();
         let target_file = temp_home.path().join("tilde_test.zsh");
         std::fs::write(&target_file, "echo 'tilde'\n").unwrap();
 
         // Temporarily override HOME for this test
-        unsafe {
-            std::env::set_var("HOME", temp_home.path());
-        }
+        let _home_guard = EnvVarGuard::set("HOME", temp_home.path());
 
         let doc_uri = Url::parse("file:///main.zsh").unwrap();
         let text = "source ~/tilde_test.zsh\n";
@@ -692,11 +721,6 @@ echo "$VAR"
             );
         } else {
             panic!("Expected Scalar response for tilde source path");
-        }
-
-        // Restore HOME
-        unsafe {
-            std::env::set_var("HOME", home_env);
         }
     }
 
