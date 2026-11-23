@@ -1074,4 +1074,23 @@ fn_a() {
             assert_eq!(v.enclosing_fn, Some(0));
         }
     }
+
+    #[test]
+    fn test_parse_statements_after_mid_word_hash() {
+        let text = concat!(
+            "echo foo#bar; AFTER_VAR=1\n",
+            "TAG=v1#rc; after_fn() { : }\n",
+            "echo x#y; source ./after.zsh\n",
+        );
+        let index = parse_document(text);
+
+        let var_names: Vec<&str> = index.variables.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(var_names, vec!["AFTER_VAR", "TAG"]);
+
+        let fn_names: Vec<&str> = index.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(fn_names, vec!["after_fn"]);
+
+        let source_paths: Vec<&str> = index.sources.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(source_paths, vec!["./after.zsh"]);
+    }
 }

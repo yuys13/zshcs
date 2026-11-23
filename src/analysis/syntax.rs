@@ -295,16 +295,24 @@ pub fn split_line_statements(line: &str) -> Vec<StatementSpan<'_>> {
             param_brace_depth -= 1;
         } else if paren_depth == 0 && param_brace_depth == 0 {
             if b == b'#' {
-                // Comment starts; capture current statement and stop for the line
-                let candidate = &line[stmt_start..i];
-                if !candidate.trim().is_empty() {
-                    statements.push(StatementSpan {
-                        text: candidate,
-                        start_byte: stmt_start,
-                    });
+                let is_comment_start = i == 0
+                    || bytes[i - 1].is_ascii_whitespace()
+                    || matches!(
+                        bytes[i - 1],
+                        b';' | b'&' | b'|' | b'(' | b')' | b'`' | b'{' | b'}'
+                    );
+                if is_comment_start {
+                    // Comment starts; capture current statement and stop for the line
+                    let candidate = &line[stmt_start..i];
+                    if !candidate.trim().is_empty() {
+                        statements.push(StatementSpan {
+                            text: candidate,
+                            start_byte: stmt_start,
+                        });
+                    }
+                    stmt_start = len;
+                    break;
                 }
-                stmt_start = len;
-                break;
             } else if b == b';' || b == b'&' || b == b'|' {
                 let candidate = &line[stmt_start..i];
                 if !candidate.trim().is_empty() {
@@ -716,6 +724,25 @@ mod tests {
                 " echo \"hello; world\" "
             ]
         );
+    }
+
+    #[test]
+    fn test_split_line_statements_mid_word_hash_and_comment_boundaries() {
+        let stmts1 = split_line_statements("echo foo#bar; echo baz");
+        let texts1: Vec<&str> = stmts1.iter().map(|s| s.text).collect();
+        assert_eq!(texts1, vec!["echo foo#bar", " echo baz"]);
+
+        let stmts2 = split_line_statements("VAR=a#b && local NEXT=1 # trailing comment; ignored");
+        let texts2: Vec<&str> = stmts2.iter().map(|s| s.text).collect();
+        assert_eq!(texts2, vec!["VAR=a#b ", " local NEXT=1 "]);
+
+        let stmts3 = split_line_statements("echo a;#comment after semicolon");
+        let texts3: Vec<&str> = stmts3.iter().map(|s| s.text).collect();
+        assert_eq!(texts3, vec!["echo a"]);
+
+        let stmts4 = split_line_statements("echo ${#var}; echo after");
+        let texts4: Vec<&str> = stmts4.iter().map(|s| s.text).collect();
+        assert_eq!(texts4, vec!["echo ${#var}", " echo after"]);
     }
 
     #[test]
