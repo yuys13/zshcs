@@ -105,6 +105,13 @@ impl DaemonProcess {
     }
 }
 
+/// Sanitizes an input string (completion prefix or working directory path) before sending it
+/// to the completion daemon over its line-based stdin protocol, stripping ASCII control characters
+/// (`0x00..=0x1F`, `0x7F`) such as `\0`, `\r`, `\n`, `\t`, and ZLE/PTY control sequences.
+pub fn sanitize_daemon_input(input: &str) -> String {
+    input.chars().filter(|c| !c.is_ascii_control()).collect()
+}
+
 pub async fn run_completion_daemon(
     script_path: PathBuf,
     cache_dir: Option<PathBuf>,
@@ -189,15 +196,15 @@ pub async fn run_completion_daemon(
                 };
                 if need_chdir {
                     tracing::debug!(?target_cwd, "Changing daemon working directory");
-                    let sanitized_cwd = target_cwd.to_string_lossy().replace(['\r', '\n'], "");
+                    let sanitized_cwd = sanitize_daemon_input(&target_cwd.to_string_lossy());
                     let chdir_msg = format!("chdir:{sanitized_cwd}\n");
                     proc.stdin.write_all(chdir_msg.as_bytes()).await?;
                     proc.current_cwd = Some(target_cwd.clone());
                 }
             }
 
-            // Send input message to daemon (sanitizing newlines)
-            let sanitized_prefix = prefix.replace(['\r', '\n'], "");
+            // Send input message to daemon (sanitizing control characters)
+            let sanitized_prefix = sanitize_daemon_input(&prefix);
             tracing::trace!(prefix = %sanitized_prefix, "Sending input to completion daemon");
             let msg = format!("input:{sanitized_prefix}\n");
             proc.stdin.write_all(msg.as_bytes()).await?;
@@ -283,5 +290,99 @@ pub async fn run_completion_daemon(
 
     if let Some(mut p) = daemon.take() {
         let _ = p.child.start_kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_daemon_input_strips_ascii_control_chars_and_preserves_multibyte() {
+        // Control characters interfering with capture.zsh / zptyrc.zsh / PTY:
+        // \0 (null delimiter), \r, \n, \t (^I complete-word), \x15 (^U kill-buffer),
+        // \x02 (^B backward-char), \x01 (EOC marker), \x1b (ESC), \x7f (DEL)
+        let input = "git\0\r\n\t\x15\x02\x01\x1b\x7f status --short";
+        assert_eq!(sanitize_daemon_input(input), "git status --short");
+
+        // All ASCII control characters (0x00..=0x1F and 0x7F) must be stripped
+        let all_controls: String = (0x00u8..=0x1Fu8)
+            .chain(std::iter::once(0x7Fu8))
+            .map(char::from)
+            .collect();
+        assert_eq!(sanitize_daemon_input(&format!("a{all_controls}b")), "ab");
+
+        // Spaces, shell punctuation, Japanese, and emoji (including ZWJ) must be preserved
+        let normal = "echo $HOME/${VAR} '~/path/file name.zsh' \"こんにちは\" 🎉🚀👨‍👩‍👧‍👦";
+        assert_eq!(sanitize_daemon_input(normal), normal);
+    }
+
+    #[tokio::test]
+    async fn test_run_completion_daemon_sanitizes_control_chars_in_prefix_and_cwd() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log_path = temp_dir.path().join("received.log");
+        let script_path = temp_dir.path().join("mock_capture.zsh");
+        let log_path_str = log_path.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"#!/usr/bin/env zsh
+log_file='{log_path_str}'
+while IFS= read -r line; do
+    print -r -- "$line" >> "$log_file"
+    if [[ "$line" == input:* ]]; then
+        printf "ok\titem\n\x01EOC\x01\n"
+    fi
+done
+"#
+        );
+        std::fs::write(&script_path, script).unwrap();
+
+        let (tx, rx) = mpsc::channel(8);
+        let mut client_opt = None;
+        let (_service, _socket) = tower_lsp::LspService::new(|client| {
+            client_opt = Some(client.clone());
+            crate::Backend::new_with_scripts(client, "#!/bin/zsh\nexit 0\n", "").unwrap()
+        });
+        let client = client_opt.unwrap();
+
+        let daemon_handle = tokio::spawn(run_completion_daemon(script_path, None, rx, client));
+
+        let dirty_cwd = PathBuf::from("/tmp/dir\twith\x15ctrl\x02/こんにちは");
+        let dirty_prefix = "git\t\x15\x02\x01\r\n status '日本語' 🎉".to_string();
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(CompletionRequest::Complete {
+            prefix: dirty_prefix,
+            cwd: Some(dirty_cwd),
+            responder: resp_tx,
+        })
+        .await
+        .unwrap();
+
+        let items = tokio::time::timeout(Duration::from_secs(3), resp_rx)
+            .await
+            .expect("daemon response timeout")
+            .expect("responder channel")
+            .expect("daemon result");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "ok");
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        tx.send(CompletionRequest::Shutdown {
+            responder: shutdown_tx,
+        })
+        .await
+        .unwrap();
+        let _ = shutdown_rx.await;
+        let _ = daemon_handle.await;
+
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "chdir:/tmp/dirwithctrl/こんにちは",
+                "input:git status '日本語' 🎉",
+            ]
+        );
     }
 }
