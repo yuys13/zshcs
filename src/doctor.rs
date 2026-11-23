@@ -779,4 +779,38 @@ mod tests {
         assert!(rendered.contains(expected_line));
         assert!(rendered.contains(expected_summary));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_doctor_checks_handle_failing_mock_scripts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fail_bin = dir.path().join("fail_zsh.sh");
+        std::fs::write(&fail_bin, "#!/bin/sh\necho 'mock failure' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&fail_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fail_str = fail_bin.to_str().unwrap();
+
+        assert_eq!(
+            check_zsh_executable(Some(fail_str)).status,
+            CheckStatus::Fail
+        );
+        assert_eq!(check_zpty_module(Some(fail_str)).status, CheckStatus::Fail);
+        assert_eq!(check_zutil_module(Some(fail_str)).status, CheckStatus::Fail);
+        assert_eq!(
+            check_capture_dry_run(Some(fail_str), Some(dir.path())).status,
+            CheckStatus::Fail
+        );
+
+        // Mock script that exits 0 immediately without outputting EOC marker
+        let no_eoc_bin = dir.path().join("no_eoc.sh");
+        std::fs::write(&no_eoc_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&no_eoc_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let no_eoc_str = no_eoc_bin.to_str().unwrap();
+
+        assert_eq!(
+            check_capture_dry_run(Some(no_eoc_str), Some(dir.path())).status,
+            CheckStatus::Fail
+        );
+    }
 }

@@ -439,4 +439,140 @@ done
         drop(tx);
         let _ = daemon_handle.await;
     }
+
+    #[tokio::test]
+    async fn test_run_completion_daemon_spawn_failure_returns_io_and_continues() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let script_path = temp_dir.path().join("mock_daemon.zsh");
+        std::fs::write(&script_path, "#!/bin/zsh\nexit 0\n").unwrap();
+
+        // Block cache_dir creation by pointing cache_dir inside a regular file
+        let blocking_file = temp_dir.path().join("not_a_dir");
+        std::fs::write(&blocking_file, b"file").unwrap();
+        let invalid_cache_dir = blocking_file.join("nested_cache");
+
+        let (tx, rx) = mpsc::channel(16);
+        let mut client_opt = None;
+        let (_service, mut socket) = tower_lsp::LspService::new(|client| {
+            client_opt = Some(client.clone());
+            crate::Backend::new_with_scripts(client, "", "").unwrap()
+        });
+        let client = client_opt.unwrap();
+        let _drain_handle = tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
+        let daemon_handle = tokio::spawn(run_completion_daemon(
+            script_path,
+            Some(invalid_cache_dir),
+            rx,
+            client,
+        ));
+
+        for _ in 0..2 {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            tx.send(CompletionRequest::Complete {
+                prefix: "git ".to_string(),
+                cwd: None,
+                responder: resp_tx,
+            })
+            .await
+            .unwrap();
+
+            let err = tokio::time::timeout(Duration::from_secs(3), resp_rx)
+                .await
+                .expect("spawn failure timeout")
+                .expect("responder channel")
+                .unwrap_err();
+            assert!(
+                matches!(err, ZshcsError::Io(_)),
+                "Expected Io error, got {err:?}"
+            );
+        }
+
+        drop(tx);
+        let _ = daemon_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_run_completion_daemon_eof_without_eoc_respawns_on_next_request() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let count_file = temp_dir.path().join("count.txt");
+        let script_path = temp_dir.path().join("eof_then_ok.zsh");
+        let script = format!(
+            r#"#!/usr/bin/env zsh
+c=0
+[[ -f "{cf}" ]] && c=$(cat "{cf}")
+c=$((c + 1))
+echo "$c" > "{cf}"
+while IFS= read -r line; do
+  if [[ "$line" == input:* ]]; then
+    if [[ "$c" -eq 1 ]]; then
+      exit 0
+    fi
+    printf 'respawned_ok\tdesc\x01EOC\x01\n'
+  fi
+done
+"#,
+            cf = count_file.display()
+        );
+        std::fs::write(&script_path, script).unwrap();
+
+        let (tx, rx) = mpsc::channel(16);
+        let mut client_opt = None;
+        let (_service, mut socket) = tower_lsp::LspService::new(|client| {
+            client_opt = Some(client.clone());
+            crate::Backend::new_with_scripts(client, "", "").unwrap()
+        });
+        let client = client_opt.unwrap();
+        let _drain_handle = tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
+        let daemon_handle = tokio::spawn(run_completion_daemon(
+            script_path,
+            Some(temp_dir.path().to_path_buf()),
+            rx,
+            client,
+        ));
+
+        // 1. First request exits without EOC -> UnexpectedEof
+        let (tx1, rx1) = oneshot::channel();
+        tx.send(CompletionRequest::Complete {
+            prefix: "git ".to_string(),
+            cwd: None,
+            responder: tx1,
+        })
+        .await
+        .unwrap();
+        let err1 = tokio::time::timeout(Duration::from_secs(3), rx1)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(err1, ZshcsError::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "Expected UnexpectedEof, got {err1:?}"
+        );
+
+        // 2. Second request respawns daemon and succeeds
+        let (tx2, rx2) = oneshot::channel();
+        tx.send(CompletionRequest::Complete {
+            prefix: "git ".to_string(),
+            cwd: None,
+            responder: tx2,
+        })
+        .await
+        .unwrap();
+        let items = tokio::time::timeout(Duration::from_secs(3), rx2)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("Expected respawned completion");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "respawned_ok");
+
+        drop(tx);
+        let _ = daemon_handle.await;
+    }
 }

@@ -2,7 +2,7 @@ use std::time::Duration;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 pub use crate::runtime::syntax_check::DEFAULT_SYNTAX_CHECK_TIMEOUT;
-use crate::runtime::syntax_check::run_zsh_syntax_check;
+use crate::runtime::syntax_check::run_zsh_syntax_check_with_command;
 
 /// Runs syntax check on `text` using `zsh -n` with the default timeout.
 pub async fn check_syntax(text: &str) -> Vec<Diagnostic> {
@@ -11,7 +11,17 @@ pub async fn check_syntax(text: &str) -> Vec<Diagnostic> {
 
 /// Runs syntax check on `text` using `zsh -n` with a specified timeout.
 pub async fn check_syntax_with_timeout(text: &str, timeout_dur: Duration) -> Vec<Diagnostic> {
-    let Some(stderr) = run_zsh_syntax_check(text, timeout_dur).await else {
+    check_syntax_with_command(text, timeout_dur, "zsh", &["-n"]).await
+}
+
+pub(crate) async fn check_syntax_with_command(
+    text: &str,
+    timeout_dur: Duration,
+    program: &str,
+    args: &[&str],
+) -> Vec<Diagnostic> {
+    let Some(stderr) = run_zsh_syntax_check_with_command(text, timeout_dur, program, args).await
+    else {
         return Vec::new();
     };
     parse_diagnostics(&stderr, text)
@@ -266,10 +276,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_syntax_timeout_protection() {
-        // Testing with 0 duration timeout should immediately timeout and return empty safely
-        let diags = check_syntax_with_timeout("if [[ ; then", Duration::from_nanos(1)).await;
-        // Either it completed instantly or timed out; either way it shouldn't panic or hang
-        assert!(diags.len() <= 2);
+        // Slow command must deterministically time out and return empty diagnostics
+        let diags = check_syntax_with_command(
+            "if [[ ; then",
+            Duration::from_millis(20),
+            "zsh",
+            &["-c", "sleep 10"],
+        )
+        .await;
+        assert!(diags.is_empty());
     }
 
     #[tokio::test]

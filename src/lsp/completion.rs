@@ -229,7 +229,7 @@ pub fn resolve_completion_item(mut item: CompletionItem) -> CompletionItem {
 
 /// Resolves detailed documentation for a `CompletionItem` asynchronously using an underlying fetcher
 /// with single-flight request coalescing, negative caching, and timeout protection.
-pub(crate) async fn resolve_completion_item_async_with_fetcher<F, Fut>(
+pub async fn resolve_completion_item_async_with_fetcher<F, Fut>(
     mut item: CompletionItem,
     cache: &ManCache,
     timeout_dur: Duration,
@@ -3128,5 +3128,19 @@ local \
             !names_top.contains(&"LOCAL_B"),
             "LOCAL_B from fn_b must not leak to top-level: {names_top:?}"
         );
+    }
+
+    #[rstest]
+    #[case(r#"echo \$MY_"#, CompletionContext::Variable)]
+    #[case("echo $$", CompletionContext::CommandOrWord)]
+    #[case(r#"echo "hello \" $MY_"#, CompletionContext::Variable)]
+    #[case("echo 'a' $MY_", CompletionContext::Variable)]
+    #[case("$((1 + 2)) cmd", CompletionContext::CommandOrWord)]
+    fn test_determine_completion_context_escaping_and_quotes(
+        #[case] prefix: &str,
+        #[case] expected: CompletionContext,
+    ) {
+        let (ctx, _) = determine_completion_context(prefix);
+        assert_eq!(ctx, expected);
     }
 }

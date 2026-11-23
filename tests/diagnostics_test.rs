@@ -247,12 +247,11 @@ async fn test_diagnostics_debounce_rapid_changes() {
         .await;
     let _ = test_client.read_notification::<PublishDiagnostics>().await;
 
-    // Send 5 rapid changes in 10ms intervals
+    // Send rapid back-to-back changes within debounce window
     for ver in 2..=5 {
         test_client
             .change_document_full(&doc_uri, ver, &format!("echo step {ver}"))
             .await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     // Final change has syntax error

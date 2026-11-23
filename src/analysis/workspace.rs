@@ -708,4 +708,102 @@ pub(crate) mod tests {
         assert!(!names.contains(&"sourced_fn_68"));
         assert_eq!(sourced.len(), MAX_SOURCED_FILES);
     }
+
+    #[test]
+    fn test_collect_sourced_documents_enforces_max_source_depth() {
+        let dir = tempdir().expect("tempdir");
+        // Chain: main -> d1 (depth 0) -> d2 (depth 1) -> d3 (depth 2) -> d4 (depth 3) -> d5 (depth 4: stopped)
+        for i in 1..=5 {
+            let p = dir.path().join(format!("d{i}.zsh"));
+            let content = if i < 5 {
+                format!("source ./d{}.zsh\nfn_d{i}() {{ : }}\n", i + 1)
+            } else {
+                format!("fn_d{i}() {{ : }}\n")
+            };
+            std::fs::write(&p, content).unwrap();
+        }
+
+        let main_path = dir.path().join("main.zsh");
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let main_idx = parse_document("source ./d1.zsh\n");
+        let sourced =
+            collect_sourced_documents(&main_idx, &main_uri, Position::new(1, 0), None, true);
+        let names: Vec<&str> = sourced
+            .iter()
+            .flat_map(|s| s.index.functions.iter().map(|f| f.name.as_str()))
+            .collect();
+
+        assert_eq!(sourced.len(), MAX_SOURCE_DEPTH);
+        assert!(names.contains(&"fn_d1"));
+        assert!(names.contains(&"fn_d4"));
+        assert!(
+            !names.contains(&"fn_d5"),
+            "Depth >= MAX_SOURCE_DEPTH ({MAX_SOURCE_DEPTH}) must be cut off: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_sourced_file_bounded_rejects_non_utf8_binary() {
+        let dir = tempdir().expect("tempdir");
+        let bin_path = dir.path().join("binary.zsh");
+        std::fs::write(&bin_path, [0xff, 0xfe, 0x00, 0x80]).unwrap();
+        assert_eq!(read_sourced_file_bounded(&bin_path), None);
+    }
+
+    #[test]
+    fn test_normalize_lexical_path_cases() {
+        assert_eq!(
+            normalize_lexical_path(Path::new("/a/b/../c/./d")),
+            PathBuf::from("/a/c/d")
+        );
+        assert_eq!(
+            normalize_lexical_path(Path::new("/../../etc/passwd")),
+            PathBuf::from("/etc/passwd")
+        );
+        assert_eq!(
+            normalize_lexical_path(Path::new("../a/../../b")),
+            PathBuf::from("../../b")
+        );
+    }
+
+    #[test]
+    fn test_expand_and_normalize_source_path_home_variants() {
+        static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let orig = std::env::var_os("HOME");
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(v) => std::env::set_var("HOME", v),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(orig);
+        unsafe {
+            std::env::set_var("HOME", "/tmp/test_home");
+        }
+
+        let base_uri = Url::parse("file:///work/main.zsh").unwrap();
+        assert_eq!(
+            expand_and_normalize_source_path("~/lib.zsh", &base_uri),
+            Some(PathBuf::from("/tmp/test_home/lib.zsh"))
+        );
+        assert_eq!(
+            expand_and_normalize_source_path("$HOME/a/../b.zsh", &base_uri),
+            Some(PathBuf::from("/tmp/test_home/b.zsh"))
+        );
+        assert_eq!(
+            expand_and_normalize_source_path("${HOME}/c.zsh", &base_uri),
+            Some(PathBuf::from("/tmp/test_home/c.zsh"))
+        );
+        assert_eq!(
+            expand_and_normalize_source_path("./sub/../rel.zsh", &base_uri),
+            Some(PathBuf::from("/work/rel.zsh"))
+        );
+        assert_eq!(expand_and_normalize_source_path("", &base_uri), None);
+    }
 }

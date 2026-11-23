@@ -798,6 +798,10 @@ mod tests {
     #[case("# comment \\\ngit st", 1, 6, Some("git st"))]
     #[case("echo hi # inline comment \\\ngit st", 1, 6, Some("git st"))]
     #[case("echo 'literal \\\ngit st", 1, 6, Some("git st"))]
+    #[case("echo \"foo \\\nbar", 1, 3, Some("echo \"foo bar"))]
+    #[case("echo ${#var} \\\nnext", 1, 4, Some("echo ${#var} next"))]
+    #[case("echo a#b \\\nnext", 1, 4, Some("echo a#b next"))]
+    #[case("echo a \\\\\\\nnext", 1, 4, Some("echo a \\\\next"))]
     fn test_document_state_get_line_prefix_backslash_continuation(
         #[case] text: &str,
         #[case] line: u32,
@@ -1192,5 +1196,54 @@ mod tests {
         let idx2 = mgr.get_index(&uri).unwrap();
         assert!(Arc::ptr_eq(&idx1, &idx2));
         assert_eq!(idx1.variables[0].name, "FOO");
+    }
+
+    #[test]
+    fn test_document_state_apply_changes_reversed_range_and_split_surrogate() {
+        let uri = Url::parse("file:///edge_ranges.zsh").unwrap();
+
+        // 1. Reversed range on same line (start > end)
+        let mut state_same = DocumentState::new(uri.clone(), 1, "abcdef".to_string());
+        let err_same = state_same
+            .apply_changes(
+                2,
+                vec![TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 4), Position::new(0, 2))),
+                    range_length: None,
+                    text: "x".to_string(),
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err_same, DocumentError::InvalidRange(_)));
+        assert_eq!(state_same.text(), "abcdef");
+
+        // 2. Reversed range across lines (start.line > end.line)
+        let mut state_multi = DocumentState::new(uri.clone(), 1, "line1\nline2".to_string());
+        let err_multi = state_multi
+            .apply_changes(
+                2,
+                vec![TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(1, 0), Position::new(0, 2))),
+                    range_length: None,
+                    text: "x".to_string(),
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err_multi, DocumentError::InvalidRange(_)));
+        assert_eq!(state_multi.text(), "line1\nline2");
+
+        // 3. Split surrogate pair UTF-16 offset (🎉 is 2 UTF-16 code units; col 1 is mid-surrogate)
+        let mut state_surrogate = DocumentState::new(uri, 1, "🎉abc".to_string());
+        let res = state_surrogate.apply_changes(
+            2,
+            vec![TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 1), Position::new(0, 1))),
+                range_length: None,
+                text: "X".to_string(),
+            }],
+        );
+        // Should not panic and must produce valid UTF-8
+        assert!(res.is_ok() || matches!(res, Err(DocumentError::InvalidRange(_))));
+        assert!(std::str::from_utf8(state_surrogate.text().as_bytes()).is_ok());
     }
 }

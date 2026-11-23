@@ -756,4 +756,37 @@ mod tests {
         let line3 = "cat <<< 'here-string'";
         assert_eq!(detect_heredoc_delimiter(line3), None);
     }
+
+    #[test]
+    fn test_byte_and_utf16_col_out_of_bounds_and_mid_surrogate() {
+        let line = "🎉a";
+        // "🎉" is 4 UTF-8 bytes and 2 UTF-16 units
+        assert_eq!(byte_to_utf16_col(line, 100), 3);
+        assert_eq!(utf16_col_to_byte(line, 100), line.len());
+        // Mid-surrogate (UTF-16 col 1) clamps safely to a valid char boundary
+        let byte_mid = utf16_col_to_byte(line, 1);
+        assert!(line.is_char_boundary(byte_mid));
+    }
+
+    #[test]
+    fn test_find_opening_and_matching_closing_brace_edge_cases() {
+        let lines = vec![
+            r#"echo "\{not_a_brace\}""#,
+            "fn_a() {",
+            "  echo \"`echo {inner}`\"",
+            "  if true; then",
+            "    local x=\"a}b\"",
+            "  fi",
+            "}",
+            "unclosed() {",
+        ];
+        // Normal nested/quoted braces inside fn_a
+        assert_eq!(find_opening_brace(&lines, 1, 0), Some((1, 7)));
+        assert_eq!(find_matching_closing_brace(&lines, 1, 7), (6, 1));
+        // Escaped braces on line 0 are not treated as function opening braces
+        assert_eq!(find_opening_brace(&lines[..1], 0, 0), None);
+        // Unclosed brace falls back to last line end
+        assert_eq!(find_opening_brace(&lines, 7, 0), Some((7, 11)));
+        assert_eq!(find_matching_closing_brace(&lines, 7, 11), (7, 12));
+    }
 }

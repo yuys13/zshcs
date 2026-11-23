@@ -106,6 +106,15 @@ pub fn format_man_markdown(man_text: &str) -> String {
 
 /// Retrieves the manual page for an external command asynchronously with a timeout, returning a detailed result.
 pub async fn get_man_page_result(word: &str, timeout_dur: Duration) -> ManPageResult {
+    get_man_page_result_with_command(word, timeout_dur, "man", &["-P", "cat"]).await
+}
+
+pub(crate) async fn get_man_page_result_with_command(
+    word: &str,
+    timeout_dur: Duration,
+    program: &str,
+    args: &[&str],
+) -> ManPageResult {
     let target = if let Some(slash_idx) = word.rfind('/') {
         &word[slash_idx + 1..]
     } else {
@@ -124,9 +133,8 @@ pub async fn get_man_page_result(word: &str, timeout_dur: Duration) -> ManPageRe
         return ManPageResult::NotFound;
     }
 
-    let mut cmd = tokio::process::Command::new("man");
-    cmd.arg("-P")
-        .arg("cat")
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
         .arg(target)
         .stdin(std::process::Stdio::null())
         .env("MANPAGER", "cat")
@@ -393,6 +401,15 @@ mod tests {
         let raw_unicode = "grep \u{2212}v pattern";
         assert_eq!(clean_man_text(raw_unicode), "grep -v pattern");
 
+        // Truncated ANSI escape at end of input, NBSP, and Unicode dashes
+        assert_eq!(clean_man_text("abc\x1b[1"), "abc");
+        assert_eq!(
+            clean_man_text("foo\u{00a0}bar\u{2010}a\u{2011}b\u{2012}c\u{2013}d"),
+            "foo bar-a-b-c-d"
+        );
+        // Underscore overstrike boundary
+        assert_eq!(clean_man_text("a\x08_ _\x08b"), "a b");
+
         let raw_plain = "Simple line\nSecond line\n";
         assert_eq!(clean_man_text(raw_plain), "Simple line\nSecond line");
     }
@@ -657,5 +674,150 @@ mod tests {
         #[case] expected: bool,
     ) {
         assert_eq!(is_eligible_for_external_command(kind, label), expected);
+    }
+
+    #[tokio::test]
+    async fn test_single_flight_leader_drop_releases_in_flight_guard() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let cache = Arc::new(ManCache::new());
+        let label = "leader_drop_isolated_cmd";
+        let started = Arc::new(Notify::new());
+        let started_clone = Arc::clone(&started);
+        let cache_clone = Arc::clone(&cache);
+
+        let leader_handle = tokio::spawn(async move {
+            let item = CompletionItem {
+                label: label.to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                ..Default::default()
+            };
+            resolve_completion_item_async_with_fetcher(
+                item,
+                &cache_clone,
+                Duration::from_secs(5),
+                move |_cmd, _dur| async move {
+                    started_clone.notify_one();
+                    std::future::pending::<ManPageResult>().await
+                },
+            )
+            .await
+        });
+
+        started.notified().await;
+        assert!(is_in_flight(label));
+
+        // Abort leader task so InFlightGuard::drop runs
+        leader_handle.abort();
+        let _ = leader_handle.await;
+        assert!(!is_in_flight(label));
+
+        // Subsequent request can become leader and succeed
+        let item = CompletionItem {
+            label: label.to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+        let resolved = resolve_completion_item_async_with_fetcher(
+            item,
+            &cache,
+            Duration::from_secs(1),
+            |_cmd, _dur| async { ManPageResult::Found("recovered docs".to_string()) },
+        )
+        .await;
+        assert!(resolved.documentation.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_single_flight_waiter_timeout_and_error_does_not_poison_cache() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        let cache = Arc::new(ManCache::new());
+        let label = "waiter_timeout_error_isolated_cmd";
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let started_clone = Arc::clone(&started);
+        let release_clone = Arc::clone(&release);
+        let cache_clone = Arc::clone(&cache);
+
+        // 1. Leader blocks until released, then returns Error
+        let leader = tokio::spawn(async move {
+            let item = CompletionItem {
+                label: label.to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                ..Default::default()
+            };
+            resolve_completion_item_async_with_fetcher(
+                item,
+                &cache_clone,
+                Duration::from_secs(5),
+                move |_cmd, _dur| async move {
+                    started_clone.notify_one();
+                    release_clone.notified().await;
+                    ManPageResult::Error("mock failure".to_string())
+                },
+            )
+            .await
+        });
+
+        started.notified().await;
+
+        // 2. Waiter times out immediately (Duration::ZERO) and returns None
+        let waiter_item = CompletionItem {
+            label: label.to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+        let waiter_res = resolve_completion_item_async_with_fetcher(
+            waiter_item,
+            &cache,
+            Duration::ZERO,
+            |_cmd, _dur| async { unreachable!("waiter should not run fetcher") },
+        )
+        .await;
+        assert_eq!(waiter_res.documentation, None);
+
+        // Release leader and confirm Error did not poison cache
+        release.notify_one();
+        let leader_res = leader.await.unwrap();
+        assert_eq!(leader_res.documentation, None);
+        assert!(!cache.contains_key(label));
+        assert!(!is_in_flight(label));
+
+        // 3. Retry succeeds
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cnt = Arc::clone(&call_count);
+        let retry_item = CompletionItem {
+            label: label.to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        };
+        let retry_res = resolve_completion_item_async_with_fetcher(
+            retry_item,
+            &cache,
+            Duration::from_secs(1),
+            move |_cmd, _dur| async move {
+                cnt.fetch_add(1, Ordering::SeqCst);
+                ManPageResult::Found("fresh man docs".to_string())
+            },
+        )
+        .await;
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(retry_res.documentation.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_man_page_result_timeout() {
+        let res = get_man_page_result_with_command(
+            "ls",
+            Duration::from_millis(20),
+            "zsh",
+            &["-c", "sleep 10"],
+        )
+        .await;
+        assert_eq!(res, ManPageResult::Timeout);
     }
 }
