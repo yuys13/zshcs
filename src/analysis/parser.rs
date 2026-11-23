@@ -1093,4 +1093,29 @@ fn_a() {
         let source_paths: Vec<&str> = index.sources.iter().map(|s| s.path.as_str()).collect();
         assert_eq!(source_paths, vec!["./after.zsh"]);
     }
+
+    #[test]
+    fn test_parse_source_unclosed_quote_and_backslash_escaped_paths() {
+        let text = concat!(
+            "source \"./unclosed.zsh\n",
+            "source ./dir\\\\file.zsh\n",
+            ". './quoted\\ path.zsh'\n",
+        );
+        let index = parse_document(text);
+        let paths: Vec<&str> = index.sources.iter().map(|s| s.path.as_str()).collect();
+        assert!(
+            paths.contains(&"./unclosed.zsh"),
+            "Expected unclosed quoted source path, got: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"./dir"),
+            "Expected unquoted path stopped at backslash in current parser, got: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.contains("quoted") && p.contains("path.zsh")),
+            "Expected single-quoted path, got: {paths:?}"
+        );
+    }
 }

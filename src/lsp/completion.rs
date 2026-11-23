@@ -3129,4 +3129,18 @@ local \
             "LOCAL_B from fn_b must not leak to top-level: {names_top:?}"
         );
     }
+
+    #[rstest]
+    #[case(r#"echo \$MY_"#, CompletionContext::Variable)]
+    #[case("echo $$", CompletionContext::CommandOrWord)]
+    #[case(r#"echo "hello \" $MY_"#, CompletionContext::Variable)]
+    #[case("echo 'a' $MY_", CompletionContext::Variable)]
+    #[case("$((1 + 2)) cmd", CompletionContext::CommandOrWord)]
+    fn test_determine_completion_context_escaping_and_quotes(
+        #[case] prefix: &str,
+        #[case] expected: CompletionContext,
+    ) {
+        let (ctx, _) = determine_completion_context(prefix);
+        assert_eq!(ctx, expected);
+    }
 }

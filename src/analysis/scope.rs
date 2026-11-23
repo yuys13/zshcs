@@ -505,4 +505,19 @@ AFTER=4
             Some(CursorTarget::Word { text, .. }) if text == "my_func"
         ));
     }
+
+    #[test]
+    fn test_extract_cursor_target_complex_expansions_and_crlf() {
+        let text = "echo \"${VAR:-\"a}b\"}\"\r\necho ${UNCLOSED\r\n";
+        let index = parse_document(text);
+
+        assert!(matches!(
+            extract_cursor_target(text, &index, Position::new(0, 9)),
+            Some(CursorTarget::VariableRef { name, .. }) if name == "VAR"
+        ));
+        assert!(!matches!(
+            extract_cursor_target(text, &index, Position::new(1, 9)),
+            Some(CursorTarget::VariableRef { .. })
+        ));
+    }
 }
