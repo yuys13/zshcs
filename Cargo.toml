@@ -18,7 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [dev-dependencies]
 criterion = "0.8"
 futures = "0.3"
-rstest = "0.28.0"
+rstest = "0.29.0"
 
 [[bench]]
 name = "parser_benchmark"
