@@ -33,12 +33,12 @@ else
 fi
 
 echo "[2/4] Running Clippy linter (cargo clippy)..."
-cargo clippy --no-deps --all-targets -- -D warnings
+cargo clippy -q --no-deps --all-targets -- -D warnings
 
 echo "[3/4] Building project (cargo build)..."
-cargo build
+cargo build -q
 
 echo "[4/4] Running test suite (cargo test --all-targets)..."
-cargo test --all-targets
+cargo test -q --all-targets
 
 echo "=== All pre-commit checks passed successfully! ==="
