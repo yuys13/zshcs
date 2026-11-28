@@ -58,7 +58,13 @@ To conserve LLM context window and prevent redundant execution:
 
 All pre-commit verification (formatting, Clippy linting, build, Rust test suite,
 and Zsh script unit tests) is fully automated via the repository's native Git hook.
-Agents must ensure the hook is active:
+Before the first commit in a session, check whether the hook is already configured:
+
+```bash
+git config --get core.hooksPath
+```
+
+Only if it is unset or not `.githooks`, configure it:
 
 ```bash
 git config core.hooksPath .githooks
